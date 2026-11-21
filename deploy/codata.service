@@ -1,0 +1,23 @@
+[Unit]
+Description=Co-data panel and API
+After=network.target
+
+[Service]
+Type=simple
+User=codata
+Group=codata
+WorkingDirectory=/opt/codata
+EnvironmentFile=/opt/codata/.env
+Environment=CODATA_ROOT=/opt/codata
+ExecStart=/opt/codata/.venv/bin/codata-web --host 127.0.0.1 --port 8501
+Restart=always
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/codata
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,181 @@
+{
+  "billing": {
+    "token_cny": "0.001",
+    "usd_cny": "7.2"
+  },
+  "providers": {
+    "dataflow": {
+      "label": "DataFlow",
+      "adapter": "dataflow",
+      "base_url": "",
+      "base_url_env": "DATAFLOW_HOST",
+      "api_key_env": "DATAFLOW_TOKEN",
+      "allowed_hosts": ["dataflowserver.org"],
+      "allowed_hosts_env": "DATAFLOW_ALLOWED_HOSTS",
+      "auth_header": "Authorization",
+      "auth_prefix": "Token ",
+      "success_codes": [0],
+      "balance_path": "/user/callremain/count",
+      "balance_currency": "token"
+    },
+    "rnote": {
+      "label": "Rnote",
+      "adapter": "rnote",
+      "base_url": "https://rnote.dev",
+      "base_url_env": "RNOTE_HOST",
+      "api_key_env": "RNOTE_API_KEY",
+      "allowed_hosts": ["rnote.dev"],
+      "allowed_hosts_env": "RNOTE_ALLOWED_HOSTS",
+      "auth_header": "X-API-Key",
+      "auth_prefix": "",
+      "success_codes": [],
+      "balance_path": "/api/v1/account/balance",
+      "balance_currency": "USD"
+    },
+    "everyinfra": {
+      "label": "EveryInfra",
+      "adapter": "everyinfra",
+      "base_url": "https://api.everyinfra.com",
+      "base_url_env": "EVERYINFRA_HOST",
+      "api_key_env": "EVERYINFRA_API_KEY",
+      "allowed_hosts": ["api.everyinfra.com"],
+      "allowed_hosts_env": "EVERYINFRA_ALLOWED_HOSTS",
+      "auth_header": "Authorization",
+      "auth_prefix": "Bearer ",
+      "success_codes": [],
+      "balance_path": "/api/v1/account",
+      "balance_currency": "USD"
+    },
+    "tikhub": {
+      "label": "TikHub",
+      "adapter": "tikhub",
+      "base_url": "https://api.tikhub.io",
+      "base_url_env": "TIKHUB_HOST",
+      "api_key_env": "TIKHUB_API_KEY",
+      "allowed_hosts": ["api.tikhub.io"],
+      "allowed_hosts_env": "TIKHUB_ALLOWED_HOSTS",
+      "auth_header": "Authorization",
+      "auth_prefix": "Bearer ",
+      "success_codes": [200],
+      "balance_path": "/api/v1/tikhub/user/get_user_info",
+      "balance_currency": "USD"
+    },
+    "justoneapi": {
+      "label": "JustOneAPI",
+      "adapter": "justoneapi",
+      "base_url": "https://api.justoneapi.com",
+      "base_url_env": "JUSTONEAPI_HOST",
+      "api_key_env": "JUSTONEAPI_TOKEN",
+      "allowed_hosts": ["api.justoneapi.com"],
+      "allowed_hosts_env": "JUSTONEAPI_ALLOWED_HOSTS",
+      "auth_header": "",
+      "auth_prefix": "",
+      "auth_query": "token",
+      "success_codes": [0]
+    },
+    "socialdatax": {
+      "label": "SocialDataX",
+      "adapter": "socialdatax",
+      "base_url": "https://mcp.socialdatax.com",
+      "base_url_env": "SOCIALDATAX_HOST",
+      "api_key_env": "SOCIALDATAX_API_KEY",
+      "allowed_hosts": ["mcp.socialdatax.com"],
+      "allowed_hosts_env": "SOCIALDATAX_ALLOWED_HOSTS",
+      "auth_header": "Authorization",
+      "auth_prefix": "Bearer ",
+      "success_codes": [],
+      "balance_path": "/socialdatax/api/v1/points/balance",
+      "balance_currency": "points"
+    },
+    "redfox": {
+      "label": "RedFoxHub",
+      "adapter": "redfox",
+      "base_url": "https://redfox.hk",
+      "base_url_env": "REDFOX_HOST",
+      "api_key_env": "REDFOX_API_KEY",
+      "allowed_hosts": ["redfox.hk"],
+      "allowed_hosts_env": "REDFOX_ALLOWED_HOSTS",
+      "auth_header": "REDFOX_API_KEY",
+      "auth_prefix": "",
+      "success_codes": [2000],
+      "balance_path": "/story/web/points/api-key/balance",
+      "balance_currency": "points"
+    }
+  },
+  "platforms": {
+    "xhs": {
+      "label": "小红书",
+      "enabled": true,
+      "default_provider": "cheapest",
+      "providers": {
+        "dataflow": {
+          "enabled": true,
+          "search": {"path": "/api/xhs/v3/appsearch", "cost": "45", "currency": "token"},
+          "user": {"path": "/api/xhs/v3/appuserinfo", "cost": "45", "currency": "token"}
+        },
+        "rnote": {
+          "enabled": true,
+          "search": {"path": "/api/v2/crawler/search/notes", "cost": "0.01", "currency": "USD"},
+          "user": {"path": "/api/v2/crawler/user/info", "cost": "0.01", "currency": "USD"}
+        },
+        "everyinfra": {
+          "enabled": true,
+          "search": {"path": "/api/v1/social", "cost": "0.00556", "currency": "USD"},
+          "user": {"path": "/api/v1/social", "cost": "0.00556", "currency": "USD"}
+        },
+        "tikhub": {
+          "enabled": true,
+          "search": {"path": "/api/v1/xiaohongshu/app_v2/search_notes", "cost": "0.01", "currency": "USD"},
+          "user": {"path": "/api/v1/xiaohongshu/app_v2/get_user_info", "cost": "0.01", "currency": "USD"}
+        },
+        "justoneapi": {
+          "enabled": true,
+          "search": {"path": "/api/xiaohongshu/search-note/v2", "cost": "0.01", "currency": "USD"},
+          "user": {"path": "/api/xiaohongshu/get-user/v3", "cost": "0.01", "currency": "USD"}
+        },
+        "socialdatax": {
+          "enabled": true,
+          "search": {"path": "/socialdatax/api/v1/xhs/note/search", "cost": "0.1", "currency": "CNY"},
+          "user": {"path": "/socialdatax/api/v1/xhs/user/info", "cost": "0.1", "currency": "CNY"}
+        },
+        "redfox": {
+          "enabled": true,
+          "search": {"path": "/story/api/xhsUser/searchArticle", "cost": "0.04", "currency": "CNY"},
+          "user": {"path": "/story/api/xhsUser/queryAccountDetail", "cost": "0.04", "currency": "CNY"}
+        }
+      }
+    },
+    "douyin": {
+      "label": "抖音",
+      "enabled": true,
+      "default_provider": "cheapest",
+      "providers": {
+        "everyinfra": {
+          "enabled": true,
+          "search": {"path": "/api/v1/social", "cost": "0.008333", "currency": "USD"},
+          "user": {"path": "/api/v1/social", "cost": "0.000556", "currency": "USD"}
+        },
+        "tikhub": {
+          "enabled": true,
+          "search": {"path": "/api/v1/douyin/search/fetch_general_search_v2", "cost": "0.01", "currency": "USD"},
+          "user": {"path": "/api/v1/douyin/app/v3/handler_user_profile", "cost": "0.01", "currency": "USD"}
+        },
+        "justoneapi": {
+          "enabled": true,
+          "search": {"path": "/api/douyin/search-video/v4", "cost": "0.01", "currency": "USD"},
+          "user": {"path": "/api/douyin/get-user-detail/v3", "cost": "0.01", "currency": "USD"}
+        },
+        "socialdatax": {
+          "enabled": true,
+          "search": {"path": "/socialdatax/api/v1/douyin/video/search", "cost": "0.1", "currency": "CNY"},
+          "user": {"path": "/socialdatax/api/v1/douyin/user/info", "cost": "0.1", "currency": "CNY"}
+        },
+        "redfox": {
+          "enabled": true,
+          "search": {"path": "/story/api/dyData/searchArticle", "cost": "0.04", "currency": "CNY"},
+          "user": {"path": "/story/api/dyData/queryUser", "cost": "0.04", "currency": "CNY"}
+        }
+      }
+    }
+  }
+}
