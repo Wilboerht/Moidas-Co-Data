@@ -44,6 +44,11 @@ class Settings:
     max_login_attempts: int = 10
     login_window_minutes: int = 15
     max_active_jobs: int = 2
+    job_stale_minutes: int = 30
+    trusted_proxies: tuple[str, ...] = ("127.0.0.1", "localhost", "::1")
+    max_request_bytes: int = 5_000_000
+    audit_retention_days: int = 365
+    log_retention_days: int = 90
     rnote_host: str = ""
     rnote_api_key: str = ""
     dataflow_allowed_hosts: tuple[str, ...] = ()
@@ -105,6 +110,15 @@ def load_settings(require_credentials: bool = True) -> Settings:
         max_login_attempts=max(1, int(os.getenv("CODATA_MAX_LOGIN_ATTEMPTS", "10"))),
         login_window_minutes=max(1, int(os.getenv("CODATA_LOGIN_WINDOW_MINUTES", "15"))),
         max_active_jobs=max(1, int(os.getenv("CODATA_MAX_ACTIVE_JOBS", "2"))),
+        job_stale_minutes=max(1, int(os.getenv("CODATA_JOB_STALE_MINUTES", "30"))),
+        trusted_proxies=_env_csv(
+            "CODATA_TRUSTED_PROXIES", ("127.0.0.1", "localhost", "::1")
+        ),
+        max_request_bytes=max(
+            1024, int(os.getenv("CODATA_MAX_REQUEST_BYTES", "5000000"))
+        ),
+        audit_retention_days=max(1, int(os.getenv("CODATA_AUDIT_RETENTION_DAYS", "365"))),
+        log_retention_days=max(1, int(os.getenv("CODATA_LOG_RETENTION_DAYS", "90"))),
         rnote_host=rnote_host,
         rnote_api_key=rnote_api_key,
         dataflow_allowed_hosts=_env_csv("DATAFLOW_ALLOWED_HOSTS", ("dataflowserver.org",)),

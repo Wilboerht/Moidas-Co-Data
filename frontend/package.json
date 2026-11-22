@@ -1,6 +1,10 @@
 {
   "name": "codata-panel",
   "private": true,
+  "engines": {
+    "node": ">=22",
+    "npm": ">=10"
+  },
   "version": "0.2.0",
   "type": "module",
   "scripts": {

@@ -47,6 +47,14 @@ class RnoteError(ProviderError):
         super().__init__(code, msg, payload, provider="rnote", status=status)
 
 
+def _network_error_message(exc: Exception) -> str:
+    if isinstance(exc, httpx.TimeoutException):
+        return "请求服务商超时"
+    if isinstance(exc, httpx.ConnectError):
+        return "无法连接服务商"
+    return "网络请求失败"
+
+
 
 def _same_host_request(
     client: httpx.Client,
@@ -208,11 +216,11 @@ class DataFlowClient:
                 response.raise_for_status()
                 payload = _parse_json(response)
             except httpx.HTTPError as exc:
-                last_error = exc
+                last_error = _network_error_message(exc)
                 if attempt < retries:
                     delay = _retry_delay(attempt, delay, response)
                     continue
-                raise DataFlowError(None, f"请求失败: {exc}") from exc
+                raise DataFlowError(None, last_error) from exc
             except ProviderError as exc:
                 last_error = exc
                 if exc.retryable and attempt < retries:
@@ -305,11 +313,11 @@ class RnoteClient:
                 response.raise_for_status()
                 payload = _parse_json(response)
             except httpx.HTTPError as exc:
-                last_error = exc
+                last_error = _network_error_message(exc)
                 if attempt < retries:
                     delay = _retry_delay(attempt, delay, response)
                     continue
-                raise RnoteError(None, f"请求失败: {exc}") from exc
+                raise RnoteError(None, last_error) from exc
             except ProviderError as exc:
                 last_error = exc
                 if exc.status in RETRYABLE_STATUS and attempt < retries:
@@ -440,11 +448,11 @@ class JsonProviderClient:
                 response.raise_for_status()
                 payload = _parse_json(response)
             except httpx.HTTPError as exc:
-                last_error = exc
+                last_error = _network_error_message(exc)
                 if attempt < retries:
                     delay = _retry_delay(attempt, delay, response)
                     continue
-                raise ProviderError(None, f"请求失败: {exc}", provider=self.provider.id) from exc
+                raise ProviderError(None, last_error, provider=self.provider.id) from exc
             except ProviderError as exc:
                 last_error = exc
                 if exc.retryable and attempt < retries:

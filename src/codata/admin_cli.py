@@ -61,7 +61,11 @@ def main(argv: list[str] | None = None) -> None:
                 if not user:
                     raise ValueError("用户不存在")
                 password_hash = hash_password(_read_password(args.password))
-                db.update_user(user["id"], password_hash=password_hash)
+                db.update_user(
+                    user["id"],
+                    password_hash=password_hash,
+                    must_change_password=True,
+                )
                 db.delete_user_sessions(user["id"])
                 print(f"已重置 {username} 的密码，并注销其会话")
             elif args.command == "list-users":

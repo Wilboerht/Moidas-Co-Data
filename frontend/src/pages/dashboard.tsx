@@ -1,9 +1,10 @@
 import { useState } from "react";
-import { Link } from "react-router-dom";
-import { ArrowDown, CheckCircle2, Coins, UserCheck, Users } from "lucide-react";
+import { Link, useSearchParams } from "react-router-dom";
+import { ArrowDown, CheckCircle2, Coins, ContactRound, UserCheck, Users } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "@/shared/api";
 import { fmtDateTime, fmtNumber } from "@/shared/format";
+import { useAuth } from "@/shared/auth-context";
 import { useRound } from "@/shared/round-context";
 import type { Creator, Round } from "@/shared/types";
 import { EmptyState, ErrorState, Page, PageHeader } from "@/components/page";
@@ -35,8 +36,13 @@ type CreatorRow = Creator & Record<string, unknown>;
 type RoundRow = Round & Record<string, unknown>;
 
 export function DashboardPage() {
+  const { user } = useAuth();
   const { roundId, meta, rounds, setRoundId, job, activeJob } = useRound();
-  const [selectedRoundId, setSelectedRoundId] = useState<number | null>(null);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [selectedRoundId, setSelectedRoundId] = useState<number | null>(() => {
+    const value = Number(searchParams.get("round"));
+    return Number.isFinite(value) && value > 0 ? value : null;
+  });
   const selectedJob = selectedRoundId !== null && selectedRoundId === roundId ? job : null;
   const watchedJob = selectedRoundId === null ? activeJob : selectedJob;
   const jobActive = watchedJob?.status === "running" || watchedJob?.status === "pending";
@@ -50,6 +56,10 @@ export function DashboardPage() {
     const next = value === "all" ? null : Number(value);
     setSelectedRoundId(next);
     if (next !== null) setRoundId(next);
+    const params = new URLSearchParams(searchParams);
+    if (next === null) params.delete("round");
+    else params.set("round", String(next));
+    setSearchParams(params, { replace: true });
   };
 
   if (dashboard.isLoading) {
@@ -88,6 +98,14 @@ export function DashboardPage() {
 
   const round = data.round;
   const metrics = data.metrics;
+  const leadMetrics = data.lead_metrics ?? {
+    leads: 0,
+    unverified: 0,
+    verifying: 0,
+    converted: 0,
+    duplicate: 0,
+    discarded: 0,
+  };
   const total = metrics.creators;
   const keywordsText = round?.keywords ?? "";
   const keywordCount =
@@ -138,6 +156,7 @@ export function DashboardPage() {
     { label: "达人总数", value: fmtNumber(metrics.creators), hint: undefined, icon: Users },
     { label: "已补全", value: fmtNumber(metrics.enriched), hint: `${completion}% 完整`, icon: CheckCircle2 },
     { label: "已采用", value: fmtNumber(metrics.adopted), hint: undefined, icon: UserCheck },
+    { label: "线索", value: fmtNumber(leadMetrics.leads), hint: `待核实 ${fmtNumber(leadMetrics.unverified)}`, icon: ContactRound },
     { label: "总消耗", value: `${fmtNumber(metrics.cost ?? 0)} token`, hint: undefined, icon: Coins },
   ];
 
@@ -147,8 +166,8 @@ export function DashboardPage() {
         title="工作台"
         description={
           isAllRounds
-            ? `全部 ${data.counts.rounds} 个轮次 · ${fmtNumber(metrics.creators)} 位达人`
-            : `${round?.category ? `${round?.category} · ` : ""}${keywordCount} 个关键词 · 每词 ${round?.pages ?? 1} 页`
+            ? `全部 ${data.counts.rounds} 个轮次 · ${fmtNumber(metrics.creators)} 位达人 · ${fmtNumber(leadMetrics.leads)} 条线索`
+            : `${round?.category ? `${round?.category} · ` : ""}${keywordCount} 个关键词 · 每词 ${round?.pages ?? 1} 页 · ${fmtNumber(leadMetrics.leads)} 条线索`
         }
         actions={
           <Select value={isAllRounds ? "all" : String(selectedRoundId)} onValueChange={handleRoundChange}>
@@ -183,7 +202,7 @@ export function DashboardPage() {
         </div>
       ) : null}
 
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
         {kpis.map((item) => (
           <Card key={item.label} size="sm">
             <CardHeader className="gap-1">
@@ -336,7 +355,7 @@ export function DashboardPage() {
               <TableBody>
                 {recentRounds.map((item) => (
                   <TableRow key={item.id}>
-                    <TableCell className="font-medium">{item.name}</TableCell>
+                    <TableCell className="font-medium"><Link to={`/tasks/${item.id}`} className="underline-offset-4 hover:underline">{item.name}</Link></TableCell>
                     <TableCell><StatusBadge status={item.status} label={item.status_label} /></TableCell>
                     <TableCell className="text-right tabular-nums">{fmtNumber(item.cost_tokens)}</TableCell>
                     <TableCell className="text-muted-foreground">{fmtDateTime(item.created_at)}</TableCell>

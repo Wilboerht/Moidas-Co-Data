@@ -137,6 +137,13 @@ class AuthApiTests(unittest.TestCase):
         limited = self.login("limited-test", "limited-password-123")
         limited_headers = {"X-CSRF-Token": limited["csrf_token"]}
         self.assertTrue(limited["user"]["must_change_password"])
+        self.assertEqual(self.client.get("/api/rounds").status_code, 403)
+        changed = self.client.post(
+            "/api/auth/change-password",
+            json={"current_password": "limited-password-123", "new_password": "limited-password-456"},
+            headers=limited_headers,
+        )
+        self.assertEqual(changed.status_code, 200, changed.text)
         self.assertEqual(self.client.get("/api/rounds").status_code, 200)
         denied = self.client.post(
             "/api/rounds",
@@ -157,7 +164,7 @@ class AuthApiTests(unittest.TestCase):
         self.assertTrue(updated.json()["can_collect"])
         self.client.post("/api/auth/logout", headers=admin_headers)
 
-        limited = self.login("limited-test", "limited-password-123")
+        limited = self.login("limited-test", "limited-password-456")
         limited_headers = {"X-CSRF-Token": limited["csrf_token"]}
         allowed = self.client.post(
             "/api/rounds",

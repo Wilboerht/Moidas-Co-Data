@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { LoaderCircle, Lock, Trash2, TriangleAlert } from "lucide-react";
+import { LoaderCircle, Lock, Search, Trash2, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/shared/api";
 import { fmtDateOnly, fmtNumber } from "@/shared/format";
@@ -35,6 +35,7 @@ export function KeywordsPage() {
   const queryClient = useQueryClient();
   const keywordsQuery = useQuery({ queryKey: ["keywords"], queryFn: api.getKeywords });
   const [word, setWord] = useState("");
+  const [search, setSearch] = useState("");
   const [deleteTarget, setDeleteTarget] = useState<Keyword | null>(null);
   const [recentId, setRecentId] = useState<number | null>(null);
   const wordInput = useRef<HTMLInputElement>(null);
@@ -76,15 +77,32 @@ export function KeywordsPage() {
   const toggle = useMutation({
     mutationFn: ({ id, value }: { id: number; value: boolean }) =>
       api.updateKeyword(id, { enabled: value }),
-    onSuccess: async (_, variables) => {
-      await queryClient.invalidateQueries({ queryKey: ["keywords"] });
+    onMutate: async ({ id, value }) => {
+      await queryClient.cancelQueries({ queryKey: ["keywords"] });
+      const previous = queryClient.getQueryData<Keyword[]>(["keywords"]);
+      queryClient.setQueryData<Keyword[]>(["keywords"], (current) =>
+        current?.map((item) => (item.id === id ? { ...item, enabled: value ? 1 : 0 } : item)),
+      );
+      return { previous };
+    },
+    onError: (error, _variables, context) => {
+      if (context?.previous) queryClient.setQueryData(["keywords"], context.previous);
+      toast.error(error instanceof Error ? error.message : "更新失败");
+    },
+    onSuccess: (_data, variables) => {
       toast.success(variables.value ? "关键词已启用" : "关键词已停用");
     },
-    onError: (error) => toast.error(error instanceof Error ? error.message : "更新失败"),
+    onSettled: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["keywords"] });
+    },
   });
 
   const keywords = keywordsQuery.data ?? [];
   const enabledCount = keywords.filter((item) => item.enabled).length;
+  const filteredKeywords = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    return query ? keywords.filter((item) => item.word.toLowerCase().includes(query)) : keywords;
+  }, [keywords, search]);
   const enableAll = useMutation({
     mutationFn: () =>
       Promise.all(keywords.filter((item) => !item.enabled).map((item) => api.updateKeyword(item.id, { enabled: true }))),
@@ -143,7 +161,7 @@ export function KeywordsPage() {
           <div id="keyword-help" className="space-y-1 text-xs">
             {duplicateKeyword ? (
               <p className="text-destructive" role="status">
-                已存在该关键词{duplicateKeyword.enabled ? "" : "（当前为停用状态）"}，请在下方列表启用或编辑。
+                已存在该关键词{duplicateKeyword.enabled ? "" : "（当前为停用状态）"}，请在下方列表启用。
               </p>
             ) : (
               <p className="text-muted-foreground">
@@ -159,7 +177,31 @@ export function KeywordsPage() {
         </form>
       </Section>
 
-      <Section title="关键词列表" description="被轮次引用的关键词只能停用，不能删除。" contentClassName="px-0">
+      <Section
+        title="关键词列表"
+        description={
+          keywordsQuery.isLoading
+            ? "被轮次引用的关键词只能停用，不能删除。"
+            : `被轮次引用的关键词只能停用，不能删除。共 ${keywords.length} 个，启用 ${enabledCount} 个。`
+        }
+        contentClassName="px-0"
+        actions={
+          keywords.length > 0 ? (
+            <div className="relative">
+              <Search className="pointer-events-none absolute top-[9px] left-2 size-3.5 text-muted-foreground" />
+              <Input
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                placeholder="搜索关键词"
+                aria-label="搜索关键词"
+                className="h-8 w-48 pl-7 text-sm"
+                autoComplete="off"
+                spellCheck={false}
+              />
+            </div>
+          ) : null
+        }
+      >
         {keywordsQuery.isLoading ? (
           <Skeleton className="h-40 w-full" />
         ) : keywordsQuery.error ? (
@@ -195,22 +237,28 @@ export function KeywordsPage() {
               <TableHeader>
                 <TableRow>
                   <TableHead>关键词</TableHead>
-                  <TableHead className="w-[132px] text-center">启用</TableHead>
+                  <TableHead className="w-[120px]">启用</TableHead>
                   <TableHead className="w-[96px] text-right">使用轮次</TableHead>
                   <TableHead className="w-[120px]">创建时间</TableHead>
                   <TableHead className="w-[104px] text-right">操作</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {keywords.map((item) => (
+                {filteredKeywords.length === 0 ? (
+                  <TableRow>
+                    <TableCell colSpan={5} className="h-20 text-center text-muted-foreground">
+                      没有匹配「{search.trim()}」的关键词
+                    </TableCell>
+                  </TableRow>
+                ) : filteredKeywords.map((item) => (
                   <TableRow key={item.id} className={item.id === recentId ? "bg-muted/50" : undefined}>
                     <TableCell className="font-medium">{item.word}</TableCell>
                     <TableCell>
-                      <div className="flex items-center justify-center gap-2">
+                      <div className="flex items-center gap-2">
                         <Switch
                           aria-label={`${item.word}启用状态`}
                           checked={Boolean(item.enabled)}
-                          disabled={toggle.isPending}
+                          disabled={toggle.isPending && toggle.variables?.id === item.id}
                           onCheckedChange={(checked) => toggle.mutate({ id: item.id, value: checked })}
                         />
                         <span className={item.enabled ? "text-xs text-foreground" : "text-xs text-muted-foreground"}>
@@ -218,7 +266,9 @@ export function KeywordsPage() {
                         </span>
                       </div>
                     </TableCell>
-                    <TableCell className="text-right tabular-nums">{fmtNumber(item.rounds)}</TableCell>
+                    <TableCell className={`text-right tabular-nums ${item.rounds ? "" : "text-muted-foreground"}`}>
+                      {fmtNumber(item.rounds)}
+                    </TableCell>
                     <TableCell className="text-muted-foreground">{fmtDateOnly(item.created_at)}</TableCell>
                     <TableCell className="text-right">
                       {item.rounds > 0 ? (

@@ -187,7 +187,6 @@ class DatabaseTests(unittest.TestCase):
                         "data_round": "第1轮",
                         "tier_label": "腰部（30-100w）",
                         "account_id": "",
-                        "executor": "执行者A",
                         "cooperation_platform": "小红书",
                         "raw_title": "原始标题",
                     },
@@ -216,7 +215,8 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(row["account_id"], "")
         self.assertEqual(row["data_round"], "第1轮")
         self.assertEqual(row["tier_label"], "腰部")
-        self.assertEqual(row["executor"], "执行者A")
+        self.assertEqual(row["owner_user_id"], None)
+        self.assertEqual(row["owner_username"], "")
         self.assertEqual(row["cooperation_platform"], "小红书")
         self.assertEqual(row["raw_title"], "原始标题")
         self.assertEqual(row["status"], "adopted")
@@ -246,6 +246,92 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(rows["u1"]["status"], "shortlisted")
         self.assertEqual(rows["u2"]["match_direction"], "咖啡")
         self.assertEqual(rows["u2"]["remark"], "批量")
+
+    def test_stale_job_recovery_and_cancel(self) -> None:
+        round_id = self._seed_round()
+        job_id = self.db.claim_job(round_id)
+        self.db.update_job(
+            job_id,
+            status="running",
+            started_at="2000-01-01T00:00:00+00:00",
+            heartbeat_at="2000-01-01T00:00:00+00:00",
+        )
+        stale = self.db.reconcile_stale_jobs(1)
+        self.assertIn(job_id, stale)
+        self.assertEqual(self.db.get_job(job_id)["status"], "failed")
+        job2 = self.db.claim_job(round_id)
+        cancelled = self.db.cancel_job(job2)
+        self.assertEqual(cancelled["status"], "failed")
+        self.assertEqual(cancelled["stage"], "已取消")
+        self.assertEqual(self.db.get_round(round_id)["status"], "failed")
+
+    def test_prune_preserves_claimed_creator(self) -> None:
+        round_id = self._seed_round()
+        self.db.claim_creator(round_id, "xhs", "u2", 1)
+        deleted = self.db.prune_round_creators(round_id, 1)
+        self.assertEqual(deleted, 1)
+        rows = {row["user_id"]: row for row in self.db.creator_table(round_id)}
+        self.assertEqual(set(rows), {"u2"})
+        self.assertEqual(rows["u2"]["owner_user_id"], 1)
+
+    def test_delete_round_cleans_lead_references(self) -> None:
+        round_id = self._seed_round()
+        lead_id = self.db.create_lead(
+            platform="xhs", nickname="线索", source_round_id=round_id
+        )
+        self.assertTrue(self.db.lead_rounds(lead_id))
+        self.db.delete_round(round_id)
+        self.assertIsNone(self.db.get_lead(lead_id)["source_round_id"])
+        self.assertEqual(self.db.lead_rounds(lead_id), [])
+
+    def test_delete_round_rejects_active_job(self) -> None:
+        round_id = self._seed_round()
+        self.db.claim_job(round_id)
+        with self.assertRaises(ValueError):
+            self.db.delete_round(round_id)
+
+    def test_update_lead_source_round_sync(self) -> None:
+        first = self._seed_round()
+        second = self.db.create_round(
+            ["护肤"], pages=1, max_creators=None, name="LEAD-ROUND-2"
+        )
+        lead_id = self.db.create_lead(
+            platform="xhs", nickname="线索", source_round_id=first
+        )
+        self.db.update_lead(lead_id, source_round_id=second)
+        self.assertEqual(
+            [row["round_id"] for row in self.db.lead_rounds(lead_id)], [second]
+        )
+
+    def test_creator_claim(self) -> None:
+        round_id = self._seed_round()
+        first = self.db.claim_creator(round_id, "xhs", "u1", 1)
+        self.assertTrue(first["ok"])
+        self.assertFalse(first["already_mine"])
+        owner = self.db.creator_owner(round_id, "xhs", "u1")
+        self.assertEqual(owner["owner_user_id"], 1)
+        self.assertIsNotNone(owner["claimed_at"])
+
+        conflict = self.db.claim_creator(round_id, "xhs", "u1", 2)
+        self.assertFalse(conflict["ok"])
+        self.assertEqual(conflict["owner_user_id"], 1)
+
+        mine = self.db.claim_creators(round_id, [("xhs", "u1"), ("xhs", "u2")], 1)
+        self.assertEqual(mine["already_mine"], 1)
+        self.assertEqual(mine["claimed"], 1)
+        owned = self.db.query_creators(round_id, owner="1")["items"]
+        self.assertEqual({item["user_id"] for item in owned}, {"u1", "u2"})
+        unassigned = self.db.query_creators(round_id, owner="unassigned")["items"]
+        self.assertEqual(unassigned, [])
+
+        conflict_release = self.db.release_creator(
+            round_id, "xhs", "u1", expected_owner_user_id=2
+        )
+        self.assertFalse(conflict_release["ok"])
+        released = self.db.release_creator(round_id, "xhs", "u1", expected_owner_user_id=1)
+        self.assertTrue(released["released"])
+        self.assertEqual(released["previous"]["owner_user_id"], 1)
+        self.assertIsNone(self.db.creator_owner(round_id, "xhs", "u1")["owner_user_id"])
 
     def test_creator_cache_and_jobs(self) -> None:
         self.db.upsert_creator(normalize_user_info(user_payload("u1")))

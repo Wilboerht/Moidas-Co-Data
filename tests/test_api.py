@@ -86,6 +86,7 @@ class ApiTests(unittest.TestCase):
         )
         self.assertEqual(login.status_code, 200)
         self.csrf_token = login.json()["csrf_token"]
+        self.user_id = login.json()["user"]["id"]
         self.client.headers.update({"X-CSRF-Token": self.csrf_token})
 
     def tearDown(self) -> None:
@@ -99,7 +100,9 @@ class ApiTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_health_and_lists(self) -> None:
-        self.assertEqual(self.client.get("/api/health").json(), {"ok": True})
+        health = self.client.get("/api/health").json()
+        self.assertTrue(health["ok"])
+        self.assertEqual(health["database"], "ok")
         rounds = self.client.get("/api/rounds").json()
         self.assertEqual(len(rounds), 1)
         self.assertEqual(rounds[0]["category"], "咖啡")
@@ -137,7 +140,9 @@ class ApiTests(unittest.TestCase):
             "top_liked",
             "source",
             "platform_label",
-            "executor",
+            "owner_user_id",
+            "owner_username",
+            "claimed_at",
             "cooperation_platform",
             "raw_title",
             "remark",
@@ -170,6 +175,151 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(batch.status_code, 200)
         self.assertEqual(batch.json()["changed"], 1)
 
+    def test_creator_claim_and_release(self) -> None:
+        url = f"/api/rounds/{self.round_id}/creators/xhs/u1"
+        claimed = self.client.post(f"{url}/claim")
+        self.assertEqual(claimed.status_code, 200)
+        self.assertEqual(claimed.json()["owner_user_id"], self.user_id)
+        self.assertEqual(claimed.json()["owner_username"], "test-admin")
+        self.assertIsNotNone(claimed.json()["claimed_at"])
+
+        mine = self.client.get(
+            f"/api/rounds/{self.round_id}/creators?owner={self.user_id}"
+        ).json()
+        self.assertEqual(mine["total"], 1)
+        unassigned = self.client.get(
+            f"/api/rounds/{self.round_id}/creators?owner=unassigned"
+        ).json()
+        self.assertEqual(unassigned["total"], 0)
+
+        claimed_export = self.client.get(
+            f"/api/rounds/{self.round_id}/export?format=csv&owner={self.user_id}"
+        )
+        text = claimed_export.content.decode("utf-8-sig")
+        self.assertIn("经手人", text)
+        self.assertEqual(len([line for line in text.splitlines() if line.strip()]), 2)
+        unassigned_export = self.client.get(
+            f"/api/rounds/{self.round_id}/export?format=csv&owner=unassigned"
+        )
+        text = unassigned_export.content.decode("utf-8-sig")
+        self.assertEqual(len([line for line in text.splitlines() if line.strip()]), 1)
+
+        bulk = self.client.post(
+            f"/api/rounds/{self.round_id}/creators/claim",
+            json={"items": [{"platform": "xhs", "user_id": "u1"}]},
+        )
+        self.assertEqual(bulk.status_code, 200)
+        self.assertEqual(bulk.json()["already_mine"], 1)
+
+        released = self.client.post(f"{url}/release")
+        self.assertEqual(released.status_code, 200)
+        self.assertIsNone(released.json()["owner_user_id"])
+        self.assertEqual(released.json()["owner_username"], "")
+
+    def test_lead_owner_authorization(self) -> None:
+        created_user = self.client.post(
+            "/api/users",
+            json={
+                "username": "lead-member",
+                "password": "lead-password-123",
+                "role": "member",
+                "can_collect": True,
+            },
+        )
+        self.assertEqual(created_user.status_code, 200, created_user.text)
+        member_id = created_user.json()["id"]
+        lead = self.client.post(
+            "/api/leads",
+            json={
+                "platform": "xhs",
+                "nickname": "管理员负责的线索",
+                "source_round_id": self.round_id,
+            },
+        )
+        self.assertEqual(lead.status_code, 200, lead.text)
+        lead_id = lead.json()["id"]
+        self.assertEqual(lead.json()["owner_user_id"], self.user_id)
+
+        self.client.post("/api/auth/logout")
+        login = self.client.post(
+            "/api/auth/login",
+            json={"username": "lead-member", "password": "lead-password-123"},
+        )
+        self.assertEqual(login.status_code, 200, login.text)
+        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+        self.assertEqual(
+            self.client.patch(
+                f"/api/leads/{lead_id}",
+                json={"nickname": "越权修改"},
+                headers=headers,
+            ).status_code,
+            403,
+        )
+        self.assertEqual(
+            self.client.post(
+                f"/api/leads/{lead_id}/assign",
+                json={"owner_user_id": member_id},
+                headers=headers,
+            ).status_code,
+            403,
+        )
+        self.assertEqual(
+            self.client.post(
+                f"/api/leads/{lead_id}/convert",
+                json={"account_id": "u1", "fetch": False},
+                headers=headers,
+            ).status_code,
+            403,
+        )
+
+        self.client.post("/api/auth/logout", headers=headers)
+        admin = self.client.post(
+            "/api/auth/login",
+            json={"username": "test-admin", "password": "test-password-123"},
+        )
+        admin_headers = {"X-CSRF-Token": admin.json()["csrf_token"]}
+        assigned = self.client.post(
+            f"/api/leads/{lead_id}/assign",
+            json={"owner_user_id": member_id},
+            headers=admin_headers,
+        )
+        self.assertEqual(assigned.status_code, 200, assigned.text)
+        self.assertEqual(assigned.json()["owner_user_id"], member_id)
+
+    def test_lead_create_assign_and_convert(self) -> None:
+        created = self.client.post(
+            "/api/leads",
+            json={
+                "platform": "xhs",
+                "nickname": "API lead",
+                "account_id": "u1",
+                "profile_url": "",
+                "raw_title": "lead",
+                "source": "manual",
+                "source_round_id": self.round_id,
+            },
+        )
+        self.assertEqual(created.status_code, 200)
+        lead = created.json()
+        self.assertEqual(lead["status"], "unverified")
+        lead_id = lead["id"]
+
+        listed = self.client.get("/api/leads?status=unverified")
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(listed.json()["total"], 1)
+
+        assigned = self.client.post(f"/api/leads/{lead_id}/assign", json={"owner_user_id": 1})
+        self.assertEqual(assigned.status_code, 200)
+        self.assertEqual(assigned.json()["owner_user_id"], 1)
+
+        converted = self.client.post(
+            f"/api/leads/{lead_id}/convert",
+            json={"account_id": "u1", "profile_url": "", "fetch": False},
+        )
+        self.assertEqual(converted.status_code, 200, converted.text)
+        self.assertEqual(converted.json()["lead"]["status"], "converted")
+        self.assertEqual(converted.json()["creator"]["user_id"], "u1")
+
     def test_active_job_endpoint(self) -> None:
         with Database(self.settings.output_dir) as db:
             job_id = db.claim_job(self.round_id)
@@ -177,6 +327,10 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["id"], job_id)
         self.assertEqual(response.json()["round_id"], self.round_id)
+        cancelled = self.client.post(f"/api/jobs/{job_id}/cancel")
+        self.assertEqual(cancelled.status_code, 200, cancelled.text)
+        self.assertEqual(cancelled.json()["status"], "failed")
+        self.assertIsNone(self.client.get("/api/jobs/active").json())
 
     def test_pagination_facets_and_meta(self) -> None:
         page = self.client.get(

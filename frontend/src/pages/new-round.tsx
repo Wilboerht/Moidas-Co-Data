@@ -78,7 +78,17 @@ export function NewRoundPage() {
   const estimatedYuan = tokens * YUAN_PER_TOKEN;
   const yuanText = (Math.round(estimatedYuan * 100) / 100).toFixed(2);
   const credentialsOk = selectedProvider ? selectedProvider.ready : Boolean(settings?.credentials_ok);
-  const canCreate = words.length > 0 && Boolean(vertical.trim()) && credentialsOk && !creating;
+  const canCreate =
+    words.length > 0 &&
+    words.length <= 50 &&
+    words.every((word) => word.length <= 50) &&
+    vertical.trim().length > 0 &&
+    vertical.trim().length <= 40 &&
+    roundName.trim().length <= 100 &&
+    pages >= 1 &&
+    pages <= 20 &&
+    credentialsOk &&
+    !creating;
   const providerLabel =
     provider === "auto"
       ? `自动（当前最优：${selectedProvider?.label ?? "未配置"}）`
@@ -308,7 +318,7 @@ export function NewRoundPage() {
                     min={1}
                     max={20}
                     value={pages}
-                    onChange={(event) => setPages(Math.max(1, Number(event.target.value) || 1))}
+                    onChange={(event) => setPages(Math.min(20, Math.max(1, Number(event.target.value) || 1)))}
                   />
                   <p className="text-xs text-muted-foreground">{cost} token/页</p>
                 </div>
@@ -321,7 +331,7 @@ export function NewRoundPage() {
                     min={0}
                     max={500}
                     value={maxCreators}
-                    onChange={(event) => setMaxCreators(Math.max(0, Number(event.target.value) || 0))}
+                    onChange={(event) => setMaxCreators(Math.min(500, Math.max(0, Number(event.target.value) || 0)))}
                   />
                   <p className="text-xs text-muted-foreground">0 表示不限制。</p>
                 </div>
@@ -351,6 +361,7 @@ export function NewRoundPage() {
                     id="round-name"
                     name="round-name"
                     autoComplete="off"
+                    maxLength={100}
                     value={roundName}
                     onChange={(event) => setRoundName(event.target.value)}
                     placeholder="留空自动生成"

@@ -468,7 +468,6 @@ def cmd_import_excel(settings: Any, args: argparse.Namespace) -> None:
                 direction = _cell_text(row.get("匹配方向"))
                 tags = _cell_text(row.get("标签"))
                 source = _cell_text(row.get("数据来源")) or "护肤达人池"
-                executor = _cell_text(row.get("执行者"))
                 cooperation_platform = _cell_text(row.get("合作主平台"))
                 top_title = _cell_text(row.get("代表作"))
 
@@ -567,7 +566,6 @@ def cmd_import_excel(settings: Any, args: argparse.Namespace) -> None:
                             "data_round": data_round,
                             "tier_label": tier_label,
                             "account_id": account_id,
-                            "executor": executor,
                             "cooperation_platform": cooperation_platform,
                             "raw_title": raw_title,
                         },

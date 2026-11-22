@@ -106,11 +106,15 @@ def session_expiry(days: int) -> str:
 
 
 class LoginRateLimiter:
-    def __init__(self, max_attempts: int = 10, window_seconds: int = 900) -> None:
+    def __init__(
+        self, max_attempts: int = 10, window_seconds: int = 900, max_keys: int = 5000
+    ) -> None:
         self.max_attempts = max_attempts
         self.window_seconds = window_seconds
+        self.max_keys = max_keys
         self._attempts: dict[str, list[float]] = {}
         self._lock = threading.Lock()
+        self._last_cleanup = 0.0
 
     def _prune(self, key: str, now: float) -> list[float]:
         attempts = [stamp for stamp in self._attempts.get(key, []) if now - stamp < self.window_seconds]
@@ -120,14 +124,31 @@ class LoginRateLimiter:
             self._attempts.pop(key, None)
         return attempts
 
+    def _prune_all(self, now: float) -> None:
+        if now - self._last_cleanup < 60 and len(self._attempts) <= self.max_keys:
+            return
+        self._last_cleanup = now
+        for key in list(self._attempts):
+            self._prune(key, now)
+        if len(self._attempts) > self.max_keys:
+            overflow = len(self._attempts) - self.max_keys
+            oldest = sorted(
+                self._attempts,
+                key=lambda key: max(self._attempts[key], default=0),
+            )[:overflow]
+            for key in oldest:
+                self._attempts.pop(key, None)
+
     def blocked(self, key: str) -> bool:
         now = time.monotonic()
         with self._lock:
+            self._prune_all(now)
             return len(self._prune(key, now)) >= self.max_attempts
 
     def fail(self, key: str) -> None:
         now = time.monotonic()
         with self._lock:
+            self._prune_all(now)
             self._attempts.setdefault(key, []).append(now)
 
     def reset(self, key: str) -> None:

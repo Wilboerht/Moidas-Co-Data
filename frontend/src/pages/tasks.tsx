@@ -1,8 +1,8 @@
 import { Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { ChevronRight, Plus } from "lucide-react";
+import { ChevronRight, Plus, RotateCw } from "lucide-react";
 import { api } from "@/shared/api";
-import { fmtDateTime, fmtNumber, shorten } from "@/shared/format";
+import { fmtDateTime, fmtDuration, fmtNumber, shorten } from "@/shared/format";
 import { useAuth } from "@/shared/auth-context";
 import { useRound } from "@/shared/round-context";
 import type { Round } from "@/shared/types";
@@ -86,7 +86,10 @@ export function TasksPage() {
         }
         actions={
           <>
-            <Button variant="outline" onClick={refresh}>刷新</Button>
+            <Button variant="outline" onClick={refresh} disabled={tasksQuery.isFetching}>
+              <RotateCw className={tasksQuery.isFetching ? "animate-spin" : undefined} />
+              刷新
+            </Button>
             {canCollect ? (
               <Button asChild>
                 <Link to="/new">
@@ -114,10 +117,10 @@ export function TasksPage() {
       ) : (
         <Section
           title="采集记录"
-          description="点击任务名称查看运行状态、日志和接口调用详情。"
+          description="点击任务名称查看运行状态、日志和接口调用详情；花费按 token 计。"
           contentClassName="px-0"
         >
-          <Table className="min-w-[920px] table-fixed">
+          <Table className="min-w-[950px] table-fixed">
             <TableHeader>
               <TableRow>
                 <TableHead className="w-[260px]">任务</TableHead>
@@ -125,7 +128,7 @@ export function TasksPage() {
                 <TableHead className="w-[100px]">状态</TableHead>
                 <TableHead className="w-[150px]">进度</TableHead>
                 <TableHead className="w-[80px] text-right">达人</TableHead>
-                <TableHead className="w-[100px] text-right">花费</TableHead>
+                <TableHead className="w-[90px] text-right">花费</TableHead>
                 <TableHead className="w-[180px]">时间</TableHead>
                 <TableHead className="w-[110px] text-right">操作</TableHead>
               </TableRow>
@@ -154,7 +157,7 @@ export function TasksPage() {
                     </TableCell>
                     <TableCell>
                       <span className="block">{item.platform_label}</span>
-                      <span className="block text-xs text-muted-foreground">{item.provider_label}</span>
+                      <span className="block text-xs text-muted-foreground capitalize">{item.provider_label}</span>
                     </TableCell>
                     <TableCell>
                       <StatusBadge status={status} label={statusLabel} />
@@ -163,23 +166,37 @@ export function TasksPage() {
                       {progress === null || !job ? (
                         <span className="text-sm text-muted-foreground">—</span>
                       ) : (
-                        <div className="space-y-1">
-                          <div className="flex items-center justify-between gap-2 text-xs tabular-nums">
+                        <div className="space-y-1.5">
+                          <div className="flex items-center gap-1.5 text-xs tabular-nums">
                             <span className="text-muted-foreground">
                               {job.progress_done} / {job.progress_total}
                             </span>
+                            <span className="text-muted-foreground/60">·</span>
                             <span>{progress}%</span>
                           </div>
-                          <Progress value={progress} className="h-1" />
+                          {job.status === "done" ? null : <Progress value={progress} className="h-1" />}
                         </div>
                       )}
                     </TableCell>
-                    <TableCell className="text-right tabular-nums">{fmtNumber(item.creators)}</TableCell>
-                    <TableCell className="text-right tabular-nums">{fmtNumber(item.cost_tokens)}</TableCell>
+                    <TableCell className={`text-right tabular-nums ${item.creators ? "" : "text-muted-foreground"}`}>
+                      {fmtNumber(item.creators)}
+                    </TableCell>
+                    <TableCell className={`text-right tabular-nums ${item.cost_tokens ? "" : "text-muted-foreground"}`}>
+                      {fmtNumber(item.cost_tokens)}
+                    </TableCell>
                     <TableCell className="text-muted-foreground">
                       <span className="block text-xs">开始 {fmtDateTime(item.started_at ?? item.created_at)}</span>
                       {item.finished_at ? (
-                        <span className="block text-xs">结束 {fmtDateTime(item.finished_at)}</span>
+                        <span
+                          className="block text-xs"
+                          title={`结束 ${fmtDateTime(item.finished_at)}`}
+                        >
+                          用时 {fmtDuration(item.started_at ?? item.created_at, item.finished_at)}
+                        </span>
+                      ) : isActive(status) ? (
+                        <span className="block text-xs">
+                          已运行 {fmtDuration(item.started_at ?? item.created_at, null)}
+                        </span>
                       ) : null}
                     </TableCell>
                     <TableCell className="text-right">

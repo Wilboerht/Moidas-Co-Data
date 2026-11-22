@@ -12,6 +12,7 @@ export interface Job {
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
+  heartbeat_at?: string | null;
 }
 
 export interface Round {
@@ -33,7 +34,7 @@ export interface Round {
   created_at: string;
   keywords: string;
   keyword_details?: { word: string; category: string | null; pages: number }[];
-  summary?: { creators: number; notes: number; note_hits: number; cost: number };
+  summary?: { creators: number; leads: number; notes: number; note_hits: number; cost: number };
   job?: Job | null;
 }
 
@@ -70,7 +71,9 @@ export interface Creator {
   source_keywords: string[];
   source: string;
   remark: string;
-  executor: string;
+  owner_user_id: number | null;
+  owner_username: string;
+  claimed_at: string | null;
   cooperation_platform: string;
   raw_title: string;
   sample_notes: number;
@@ -101,6 +104,111 @@ export interface CreatorDetail extends Creator {
   creator_tags: string[];
   raw_json: Record<string, unknown>;
   notes: Note[];
+}
+
+export interface Lead {
+  id: number;
+  platform: string;
+  platform_label: string;
+  nickname: string;
+  account_id: string;
+  profile_url: string;
+  raw_title: string;
+  source: string;
+  source_label: string;
+  source_round_id: number | null;
+  source_round_name: string;
+  owner_user_id: number | null;
+  owner_username: string;
+  status: string;
+  status_label: string;
+  legacy_user_id: string;
+  created_by: number | null;
+  created_at: string | null;
+  updated_at: string | null;
+  converted_platform: string;
+  converted_user_id: string;
+  converted_at: string | null;
+}
+
+export interface LeadRound {
+  lead_id: number;
+  round_id: number;
+  round_name: string;
+  source_keywords: string;
+  raw_title: string;
+  data_round: string;
+  top_note_id: string;
+  sample_notes: number;
+  sample_likes: number;
+  sample_collected: number;
+  sample_comments: number;
+  sample_interactions: number;
+  updated_at: string;
+}
+
+export interface LeadAttempt {
+  id: number;
+  lead_id: number;
+  provider: string;
+  query: string;
+  candidate_user_id: string;
+  candidate_nickname: string;
+  candidate_profile_url: string;
+  confidence: string;
+  status: string;
+  error: string;
+  cost: number;
+  cost_native: number;
+  cost_currency: string;
+  created_by: number | null;
+  created_at: string;
+}
+
+export interface LeadDetail extends Lead {
+  raw_json: Record<string, unknown>;
+  rounds: LeadRound[];
+  attempts: LeadAttempt[];
+}
+
+export interface LeadOwner {
+  id: number;
+  username: string;
+  role: string;
+  can_collect: number;
+}
+
+export interface LeadFacet {
+  value: string;
+  count: number;
+}
+
+export interface LeadFacets {
+  platforms: LeadFacet[];
+  statuses: LeadFacet[];
+  sources: LeadFacet[];
+  owners: LeadFacet[];
+  rounds: LeadFacet[];
+}
+
+export interface LeadQuery {
+  round_id: number | null;
+  platform: string;
+  search: string;
+  statuses: string[];
+  sources: string[];
+  owner: string;
+  page: number;
+  page_size: number;
+  sort: string;
+  order: "asc" | "desc";
+}
+
+export interface LeadListResponse {
+  items: Lead[];
+  total: number;
+  page: number;
+  page_size: number;
 }
 
 export interface Keyword {
@@ -190,6 +298,7 @@ export interface Counts {
   notes: number;
   creators: number;
   creator_rounds: number;
+  leads: number;
 }
 
 export interface DashboardMetrics {
@@ -200,6 +309,15 @@ export interface DashboardMetrics {
   cost: number;
 }
 
+export interface LeadMetrics {
+  leads: number;
+  unverified: number;
+  verifying: number;
+  converted: number;
+  duplicate: number;
+  discarded: number;
+}
+
 export interface DashboardData {
   counts: Counts;
   recent_rounds: Round[];
@@ -208,6 +326,7 @@ export interface DashboardData {
   status_counts?: Record<string, number>;
   top_creators?: Creator[];
   metrics?: DashboardMetrics;
+  lead_metrics?: LeadMetrics;
 }
 
 export interface ApiCall {
@@ -258,9 +377,23 @@ export interface PlatformDef {
   label: string;
 }
 
+export interface LeadStatusDef {
+  code: string;
+  label: string;
+  color: string;
+  order: number;
+}
+
+export interface LeadSourceDef {
+  code: string;
+  label: string;
+}
+
 export interface Meta {
   statuses: StatusDef[];
   default_status: string;
+  lead_statuses: LeadStatusDef[];
+  lead_sources: LeadSourceDef[];
   platforms: PlatformDef[];
 }
 
@@ -293,6 +426,7 @@ export interface CreatorQuery {
   tiers: string[];
   directions: string[];
   sources: string[];
+  owner: string;
   min_fans: string;
   max_fans: string;
   only_unenriched: boolean;

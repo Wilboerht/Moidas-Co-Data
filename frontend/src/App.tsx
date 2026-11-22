@@ -3,6 +3,7 @@ import { Route, Routes } from "react-router-dom";
 import { AppShell } from "@/components/app-shell";
 import { DashboardPage } from "@/pages/dashboard";
 import { CreatorsPage } from "@/pages/creators";
+import { LeadsPage } from "@/pages/leads";
 import { NewRoundPage } from "@/pages/new-round";
 import { TasksPage } from "@/pages/tasks";
 import { TaskDetailPage } from "@/pages/task-detail";
@@ -39,6 +40,7 @@ export function App() {
         <Route element={<AppShell />}>
           <Route index element={<DashboardPage />} />
           <Route path="/creators" element={<CreatorsPage />} />
+          <Route path="/leads" element={<LeadsPage />} />
           <Route path="/new" element={<NewRoundPage />} />
           <Route path="/tasks" element={<TasksPage />} />
           <Route path="/tasks/:roundId" element={<TaskDetailPage />} />

@@ -59,7 +59,7 @@ REQUESTED_COLUMNS = [
 
 EXTRA_COLUMNS = [
     "备注",
-    "执行者",
+    "经手人",
     "合作主平台",
     "原始标题",
     "样本笔记",
@@ -182,7 +182,7 @@ def creator_rows(db: Database, round_id: int) -> pd.DataFrame:
                 "代表作": top_title,
                 "数据来源": "、".join(str(word) for word in keywords),
                 "平台": PLATFORM_LABELS.get(row["platform"], row["platform"]),
-                "执行者": row.get("executor") or "",
+                "经手人": row.get("owner_username") or "",
                 "合作主平台": row.get("cooperation_platform") or "",
                 "原始标题": row.get("raw_title") or "",
                 "样本笔记": row.get("sample_notes") or 0,

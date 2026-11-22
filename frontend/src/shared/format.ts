@@ -60,3 +60,21 @@ export function shorten(value: string | null | undefined, limit = 36): string {
   }
   return `${text.slice(0, limit - 1)}…`;
 }
+
+export function safeHttpUrl(value: string | null | undefined): string | undefined {
+  const text = String(value || "").trim();
+  if (!text) return undefined;
+  try {
+    const url = new URL(text);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.toString() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function assumeHttpUrl(value: string | null | undefined): string | undefined {
+  const text = String(value || "").trim();
+  if (!text) return undefined;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(text)) return safeHttpUrl(text);
+  return safeHttpUrl(`https://${text.replace(/^\/+/, "")}`);
+}

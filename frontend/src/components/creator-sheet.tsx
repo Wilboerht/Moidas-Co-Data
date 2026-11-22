@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ExternalLink, LoaderCircle } from "lucide-react";
+import { ExternalLink, LoaderCircle, UserCheck, UserMinus } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/shared/api";
-import { fmtDate, fmtDateTime, fmtNumber, shorten } from "@/shared/format";
+import { fmtDate, fmtDateTime, fmtNumber, safeHttpUrl, shorten } from "@/shared/format";
+import { useAuth } from "@/shared/auth-context";
 import { useRound } from "@/shared/round-context";
 import type { CreatorDetail, StatusDef } from "@/shared/types";
 import { Badge } from "@/components/ui/badge";
@@ -46,6 +47,7 @@ export function CreatorSheet({
     queryFn: () => api.getCreator(roundId, platform, userId),
     enabled: Boolean(platform && userId),
   });
+  const profileHref = safeHttpUrl(detail.data?.profile_url);
 
   return (
     <Sheet open onOpenChange={(open) => { if (!open) onClose(); }}>
@@ -66,9 +68,9 @@ export function CreatorSheet({
                   {detail.data?.platform_label || platform}
                   {detail.data?.fetched_at ? " · 资料已补全" : " · 资料未补全"}
                 </span>
-                {detail.data?.profile_url ? (
+                {profileHref ? (
                   <a
-                    href={detail.data.profile_url}
+                    href={profileHref}
                     target="_blank"
                     rel="noreferrer"
                     className="inline-flex items-center gap-1 text-foreground underline underline-offset-4"
@@ -127,8 +129,14 @@ function CreatorDetailForm({
   const [direction, setDirection] = useState(detail.match_direction || "");
   const [tags, setTags] = useState(detail.tags_manual || "");
   const [remark, setRemark] = useState(detail.remark || "");
+  const { user } = useAuth();
+  const queryClient = useQueryClient();
+  const loadedKey = useRef("");
 
   useEffect(() => {
+    const key = `${detail.platform}|${detail.user_id}`;
+    if (loadedKey.current === key) return;
+    loadedKey.current = key;
     setStatus(detail.status || "pending");
     setDirection(detail.match_direction || "");
     setTags(detail.tags_manual || "");
@@ -154,6 +162,22 @@ function CreatorDetailForm({
       toast.success("已保存备注");
     },
     onError: (error) => toast.error(error instanceof Error ? error.message : "保存失败"),
+  });
+
+  const claimMutation = useMutation({
+    mutationFn: (action: "claim" | "release") =>
+      action === "claim"
+        ? api.claimCreator(roundId, detail.platform, detail.user_id)
+        : api.releaseCreator(roundId, detail.platform, detail.user_id),
+    onSuccess: async (updated, action) => {
+      await onSaved(updated);
+      toast.success(action === "claim" ? "已认领该达人" : "已释放该达人");
+    },
+    onError: async (error) => {
+      toast.error(error instanceof Error ? error.message : "认领操作失败");
+      await queryClient.invalidateQueries({ queryKey: ["creator", roundId, detail.platform, detail.user_id] });
+      await queryClient.invalidateQueries({ queryKey: ["creators"] });
+    },
   });
 
   const metrics = useMemo(
@@ -185,7 +209,6 @@ function CreatorDetailForm({
     ["关注数", detail.follows != null ? fmtNumber(detail.follows) : ""],
     ["总收藏", detail.collected != null ? fmtNumber(detail.collected) : ""],
     ["认证信息", detail.verify_info],
-    ["执行者", detail.executor],
     ["合作主平台", detail.cooperation_platform],
     ["资料更新", detail.fetched_at ? fmtDateTime(detail.fetched_at) : ""],
     ["平台标签", detail.creator_tags.join("、")],
@@ -205,6 +228,46 @@ function CreatorDetailForm({
       </div>
 
       {detail.desc ? <p className="text-sm text-muted-foreground">{detail.desc}</p> : null}
+
+      <div className="space-y-2">
+        <div className="flex flex-wrap items-center justify-between gap-3 border bg-muted/20 px-3 py-2.5">
+          <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1">
+            <span className="text-xs text-muted-foreground">经手人</span>
+            <span className="text-sm font-medium">
+              {detail.owner_username || (detail.owner_user_id ? "未知用户" : "未认领")}
+              {detail.owner_user_id === user?.id ? "（我）" : ""}
+            </span>
+            {detail.claimed_at ? (
+              <span className="text-xs text-muted-foreground">{fmtDateTime(detail.claimed_at)} 认领</span>
+            ) : null}
+          </div>
+          {detail.owner_user_id == null ? (
+            <Button size="sm" onClick={() => claimMutation.mutate("claim")} disabled={claimMutation.isPending}>
+              <UserCheck />
+              {claimMutation.isPending ? "认领中…" : "认领"}
+            </Button>
+          ) : detail.owner_user_id === user?.id || user?.role === "admin" ? (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => claimMutation.mutate("release")}
+              disabled={claimMutation.isPending}
+            >
+              <UserMinus />
+              释放
+            </Button>
+          ) : (
+            <span className="text-xs text-muted-foreground">
+              已被 {detail.owner_username || "其他成员"} 认领
+            </span>
+          )}
+        </div>
+        {claimMutation.isError ? (
+          <p className="text-sm text-destructive">
+            {claimMutation.error instanceof Error ? claimMutation.error.message : "认领操作失败"}
+          </p>
+        ) : null}
+      </div>
 
       {detail.source_keywords.length > 0 ? (
         <div className="space-y-2">
@@ -232,9 +295,9 @@ function CreatorDetailForm({
         <section className="space-y-2">
           <h3 className="text-sm font-semibold">代表作</h3>
           <div className="flex items-start justify-between gap-3">
-            {detail.top_url ? (
+            {safeHttpUrl(detail.top_url) ? (
               <a
-                href={detail.top_url}
+                href={safeHttpUrl(detail.top_url)}
                 target="_blank"
                 rel="noreferrer"
                 className="min-w-0 break-words text-sm underline underline-offset-4 hover:text-primary"
@@ -364,9 +427,9 @@ function CreatorDetailForm({
               const title = shorten(note.title, 72) || "无标题";
               return (
                 <div key={note.note_id} className="space-y-1 py-3">
-                  {note.url ? (
+                  {safeHttpUrl(note.url) ? (
                     <a
-                      href={note.url}
+                      href={safeHttpUrl(note.url)}
                       target="_blank"
                       rel="noreferrer"
                       className="inline-flex items-start gap-1 text-sm font-medium underline-offset-4 hover:underline"

@@ -12,6 +12,12 @@ import type {
   Facets,
   Job,
   Keyword,
+  Lead,
+  LeadDetail,
+  LeadFacets,
+  LeadListResponse,
+  LeadOwner,
+  LeadQuery,
   Meta,
   Round,
   Settings,
@@ -120,6 +126,8 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ refresh_users: refreshUsers, force }),
     }),
+  cancelJob: (jobId: number) =>
+    request<Job | null>(`/jobs/${jobId}/cancel`, { method: "POST" }),
   getMeta: () => request<Meta>("/meta"),
   getCreators: (roundId: number | null, query: CreatorQuery) => {
     const params = new URLSearchParams();
@@ -133,6 +141,7 @@ export const api = {
     if (query.tiers.length) params.set("tier", query.tiers.join(","));
     if (query.directions.length) params.set("direction", query.directions.join(","));
     if (query.sources.length) params.set("source", query.sources.join(","));
+    if (query.owner) params.set("owner", query.owner);
     if (query.min_fans) params.set("min_fans", query.min_fans);
     if (query.max_fans) params.set("max_fans", query.max_fans);
     if (query.only_unenriched) params.set("only_unenriched", "true");
@@ -168,6 +177,84 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload),
     }),
+  claimCreator: (roundId: number, platform: string, userId: string) =>
+    request<CreatorDetail>(`/rounds/${roundId}/creators/${platform}/${encodeURIComponent(userId)}/claim`, {
+      method: "POST",
+    }),
+  releaseCreator: (roundId: number, platform: string, userId: string) =>
+    request<CreatorDetail>(`/rounds/${roundId}/creators/${platform}/${encodeURIComponent(userId)}/release`, {
+      method: "POST",
+    }),
+  claimCreators: (roundId: number, items: { platform: string; user_id: string }[]) =>
+    request<{ claimed: number; already_mine: number; skipped: number; missing: number }>(
+      `/rounds/${roundId}/creators/claim`,
+      {
+        method: "POST",
+        body: JSON.stringify({ items }),
+      },
+    ),
+  getLeads: (query: LeadQuery) => {
+    const params = new URLSearchParams();
+    if (query.round_id !== null) params.set("round_id", String(query.round_id));
+    if (query.platform) params.set("platform", query.platform);
+    if (query.search) params.set("search", query.search);
+    if (query.statuses.length) params.set("status", query.statuses.join(","));
+    if (query.sources.length) params.set("source", query.sources.join(","));
+    if (query.owner) params.set("owner", query.owner);
+    params.set("sort", query.sort);
+    params.set("order", query.order);
+    params.set("page", String(query.page));
+    params.set("page_size", String(query.page_size));
+    return request<LeadListResponse>(`/leads?${params.toString()}`);
+  },
+  getLead: (leadId: number) => request<LeadDetail>(`/leads/${leadId}`),
+  createLead: (payload: {
+    platform: string;
+    nickname: string;
+    account_id: string;
+    profile_url: string;
+    raw_title: string;
+    source: string;
+    source_round_id: number | null;
+    owner_user_id: number | null;
+    raw_json?: Record<string, unknown>;
+  }) =>
+    request<LeadDetail>("/leads", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  createLeadsBulk: (items: Array<{
+    platform: string;
+    nickname: string;
+    account_id: string;
+    profile_url: string;
+    raw_title: string;
+    source: string;
+    source_round_id: number | null;
+    owner_user_id: number | null;
+  }>) =>
+    request<{ created: number; ids: number[]; errors: { index: number; error: string }[] }>("/leads/bulk", {
+      method: "POST",
+      body: JSON.stringify({ items }),
+    }),
+  updateLead: (leadId: number, payload: Partial<Lead>) =>
+    request<LeadDetail>(`/leads/${leadId}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
+  assignLead: (leadId: number, ownerUserId: number | null) =>
+    request<LeadDetail>(`/leads/${leadId}/assign`, {
+      method: "POST",
+      body: JSON.stringify({ owner_user_id: ownerUserId }),
+    }),
+  convertLead: (leadId: number, payload: { account_id: string; profile_url: string; fetch: boolean }) =>
+    request<{ lead: Lead; creator: unknown; rounds: number[] }>(`/leads/${leadId}/convert`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  getLeadFacets: (roundId: number | null) =>
+    request<LeadFacets>(`/leads/facets${roundId === null ? "" : `?round_id=${roundId}`}`),
+  getLeadOwners: () => request<LeadOwner[]>("/leads/owners"),
   getJob: (roundId: number) => request<Job | null>(`/rounds/${roundId}/job`),
   getActiveJob: () => request<Job | null>(`/jobs/active`),
   getCalls: (roundId: number) => request<ApiCall[]>(`/rounds/${roundId}/calls`),
@@ -228,6 +315,7 @@ export function exportUrl(
     if (query.tiers.length) params.set("tier", query.tiers.join(","));
     if (query.directions.length) params.set("direction", query.directions.join(","));
     if (query.sources.length) params.set("source", query.sources.join(","));
+    if (query.owner) params.set("owner", query.owner);
     if (query.min_fans) params.set("min_fans", query.min_fans);
     if (query.max_fans) params.set("max_fans", query.max_fans);
     if (query.only_unenriched) params.set("only_unenriched", "true");

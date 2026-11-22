@@ -149,7 +149,7 @@ class ProviderTests(unittest.TestCase):
                 self.assertEqual(summary["provider"], "rnote")
                 self.assertTrue(bad.closed)
                 self.assertTrue(good.closed)
-                self.assertEqual(db.get_round(round_id)["provider"], "rnote")
+                self.assertEqual(db.get_round(round_id)["provider"], "auto")
                 self.assertEqual(summary["cost_tokens"], 90)
 
     def test_rnote_client_uses_api_key(self) -> None:

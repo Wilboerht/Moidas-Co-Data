@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
 
 from .config import load_settings
 from .db import Database
+from .normalize import utc_now
 from .pipeline import Pipeline
 
 
@@ -27,6 +29,36 @@ def main(argv: list[str] | None = None) -> None:
     settings = load_settings(require_credentials=True)
     with Database(settings.output_dir) as db:
         pipeline = Pipeline(settings, db)
+        job_id = args.job_id
+
+        def handle_stop(signum: int, _frame: object) -> None:
+            if job_id:
+                try:
+                    current = db.get_job(job_id)
+                    if current and current.get("status") in ("pending", "running"):
+                        finished = utc_now()
+                        db.update_job(
+                            job_id,
+                            status="failed",
+                            stage="中断",
+                            error="任务被系统终止",
+                            finished_at=finished,
+                        )
+                        db.update_round(
+                            args.round_id,
+                            status="failed",
+                            error="任务被系统终止",
+                            finished_at=finished,
+                        )
+                except Exception:
+                    pass
+            raise SystemExit(128 + signum)
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                signal.signal(sig, handle_stop)
+            except (ValueError, OSError):
+                pass
         try:
             pipeline.run_round(
                 args.round_id,

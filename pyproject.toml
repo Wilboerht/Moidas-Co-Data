@@ -1,8 +1,8 @@
 [project]
 name = "codata"
-version = "0.1.0"
+version = "0.2.0"
 description = "DataFlow/Rnote 多服务商小红书关键词达人采集客户端与 React 面板"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.27",
     "python-dotenv>=1.0",
@@ -17,6 +17,7 @@ codata = "codata.cli:main"
 codata-panel = "codata.api_server:main"
 codata-web = "codata.api_server:main"
 codata-admin = "codata.admin_cli:main"
+codata-cleanup-executor = "codata.cleanup_legacy_executor:main"
 
 [build-system]
 requires = ["hatchling"]

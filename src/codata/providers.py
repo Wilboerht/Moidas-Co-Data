@@ -17,6 +17,7 @@ class SearchResponse:
     payload: Any
     items: list[dict[str, Any]]
     state: dict[str, str]
+    has_more: bool | None = None
 
 
 @dataclass(frozen=True)

@@ -17,25 +17,35 @@ sudo apt install -y python3 python3-venv nginx certbot python3-certbot-nginx
 ```bash
 sudo useradd --system --create-home --home-dir /opt/codata --shell /usr/sbin/nologin codata
 sudo mkdir -p /opt/codata
-sudo chown -R codata:codata /opt/codata
+sudo chown codata:codata /opt/codata
 sudo -u codata bash -lc 'curl -LsSf https://astral.sh/uv/install.sh | sh'
+sudo chown -R root:root /opt/codata
 ```
 
-把项目同步到 `/opt/codata`（`rsync`、`git clone` 或 scp 都可以），并确保 `.env`、`data/` 权限为 `codata` 用户。
+把项目同步到 `/opt/codata`（`rsync`、`git clone` 或 scp 都可以）。代码和前端构建保持 root 只读，只把运行数据与 `.env` 交给服务用户：
+
+```bash
+sudo mkdir -p /opt/codata/data
+sudo chown -R codata:codata /opt/codata/data
+sudo chown codata:codata /opt/codata/.env
+sudo chmod 600 /opt/codata/.env
+```
 
 ## 2. 安装依赖并构建前端
 
 ```bash
 cd /opt/codata
-sudo -u codata /opt/codata/.local/bin/uv sync --frozen
-sudo -u codata bash -lc 'cd /opt/codata/frontend && npm ci && npm run build'
+sudo /opt/codata/.local/bin/uv sync --frozen
+sudo npm --prefix /opt/codata/frontend ci
+sudo npm --prefix /opt/codata/frontend run build
 ```
 
 ## 3. 配置 .env
 
 ```bash
 sudo -u codata cp .env.example .env
-sudo -u codata chmod 600 .env
+sudo chown codata:codata .env
+sudo chmod 600 .env
 sudo -u codata nano .env
 ```
 
@@ -89,18 +99,30 @@ sudo systemctl status codata
 
 ## 6. 配置 Nginx 和证书
 
+先用 HTTP-only 配置完成 ACME 验证，再启用完整 HTTPS 配置：
+
+```bash
+sudo mkdir -p /var/www/certbot
+sudo tee /etc/nginx/conf.d/codata.conf >/dev/null <<'EOF'
+server {
+    listen 80;
+    server_name codata.example.com;
+    location /.well-known/acme-challenge/ { root /var/www/certbot; }
+    location / { return 404; }
+}
+EOF
+sudo nginx -t && sudo systemctl reload nginx
+sudo certbot certonly --webroot -w /var/www/certbot -d codata.example.com \
+  --deploy-hook "systemctl reload nginx"
+```
+
+证书签发后换用完整配置：
+
 ```bash
 sudo cp /opt/codata/deploy/nginx-codata.conf.example /etc/nginx/conf.d/codata.conf
 sudo nano /etc/nginx/conf.d/codata.conf   # 改域名和证书路径
-sudo mkdir -p /var/www/certbot
-sudo nginx -t
-```
-
-首次签发证书：
-
-```bash
-sudo certbot certonly --webroot -w /var/www/certbot -d codata.example.com
 sudo nginx -t && sudo systemctl reload nginx
+sudo certbot renew --dry-run
 ```
 
 确认只开放 80/443：
@@ -129,24 +151,47 @@ sudo ufw status
 
 ## 8. 备份与升级
 
-备份：
+备份（使用 SQLite 在线备份，服务无需长时间停机）：
+
+```bash
+sudo install -d -m 700 /var/backups/codata
+sudo /opt/codata/.venv/bin/python - <<'PY'
+import sqlite3
+from pathlib import Path
+src = Path('/opt/codata/data/codata.sqlite')
+dst = Path('/var/backups/codata') / f'codata-{__import__("datetime").date.today()}.sqlite'
+target = sqlite3.connect(dst)
+source = sqlite3.connect(src)
+try:
+    source.backup(target)
+finally:
+    target.close(); source.close()
+PY
+sudo tar -czf /var/backups/codata/env-$(date +%F).tar.gz -C /opt/codata .env
+sudo chmod 600 /var/backups/codata/*
+```
+
+恢复步骤（先停服务，确认备份可打开后再替换）：
 
 ```bash
 sudo systemctl stop codata
-sudo tar -czf codata-backup-$(date +%F).tar.gz -C /opt/codata .env config data
+sudo -u codata cp /var/backups/codata/codata-YYYY-MM-DD.sqlite /opt/codata/data/codata.sqlite
 sudo systemctl start codata
+curl -fsS http://127.0.0.1:8501/api/health
 ```
 
 升级：
 
 ```bash
 cd /opt/codata
-sudo -u codata /opt/codata/.local/bin/uv sync --frozen
-sudo -u codata bash -lc 'cd /opt/codata/frontend && npm ci && npm run build'
+# 先按上一节完成备份
+sudo /opt/codata/.local/bin/uv sync --frozen
+sudo npm --prefix /opt/codata/frontend ci
+sudo npm --prefix /opt/codata/frontend run build
 sudo systemctl restart codata
 ```
 
-SQLite + 单 API 进程适合公司内部规模；不要在同一份 SQLite 上启动多个 Uvicorn worker。如果后续需要多实例/高并发，再迁移到 Postgres 并把采集任务拆到独立 worker。
+应用启动时如检测到 schema 版本升级，会在 `data/` 下自动生成 `codata.sqlite.bak-schema-v*` 备份后再迁移。不要在同一份 SQLite 上启动多个 Uvicorn worker；如果后续需要多实例/高并发，再迁移到 Postgres 并把采集任务拆到独立 worker。
 
 ## 9. 后续接 SSO
 

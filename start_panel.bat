@@ -29,7 +29,7 @@ if not exist ".env" (
 )
 
 echo [1/4] Syncing Python dependencies...
-"%UV%" sync --quiet
+"%UV%" sync --frozen --quiet
 if errorlevel 1 (
     echo [ERROR] uv sync failed. Check network or uv config.
     pause

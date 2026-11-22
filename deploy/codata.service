@@ -12,12 +12,14 @@ Environment=CODATA_ROOT=/opt/codata
 ExecStart=/opt/codata/.venv/bin/codata-web --host 127.0.0.1 --port 8501
 Restart=always
 RestartSec=3
+KillMode=mixed
+TimeoutStopSec=20
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/codata
+ReadWritePaths=/opt/codata/data /opt/codata/.env
 
 [Install]
 WantedBy=multi-user.target

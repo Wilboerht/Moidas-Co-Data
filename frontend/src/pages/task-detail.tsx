@@ -69,6 +69,8 @@ export function TaskDetailPage() {
   const [forceRefresh, setForceRefresh] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [starting, setStarting] = useState(false);
+  const [cancelOpen, setCancelOpen] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
 
   const taskQuery = useQuery({
     queryKey: ["task", roundId],
@@ -127,6 +129,24 @@ export function TaskDetailPage() {
       toast.error(error instanceof Error ? error.message : "启动失败");
     } finally {
       setStarting(false);
+    }
+  };
+
+  const cancel = async () => {
+    if (roundId === null || !job) return;
+    setCancelling(true);
+    try {
+      await api.cancelJob(job.id);
+      setCancelOpen(false);
+      toast.success("任务已取消");
+      await queryClient.invalidateQueries({ queryKey: ["task", roundId] });
+      await queryClient.invalidateQueries({ queryKey: ["task-log", roundId] });
+      await queryClient.invalidateQueries({ queryKey: ["task-list"] });
+      await refreshRounds();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "取消失败");
+    } finally {
+      setCancelling(false);
     }
   };
 
@@ -394,8 +414,12 @@ export function TaskDetailPage() {
                 <dd className="tabular-nums">{round?.pages ?? "—"}</dd>
               </div>
               <div className="flex items-center justify-between gap-3">
-                <dt className="shrink-0 text-muted-foreground">达人数量</dt>
+                <dt className="shrink-0 text-muted-foreground">候选达人</dt>
                 <dd className="tabular-nums">{fmtNumber(summary?.creators)}</dd>
+              </div>
+              <div className="flex items-center justify-between gap-3">
+                <dt className="shrink-0 text-muted-foreground">关联线索</dt>
+                <dd className="tabular-nums">{fmtNumber(summary?.leads)}</dd>
               </div>
               <div className="flex items-center justify-between gap-3">
                 <dt className="shrink-0 text-muted-foreground">笔记数量</dt>
@@ -409,6 +433,26 @@ export function TaskDetailPage() {
           </Section>
         </aside>
       </div>
+
+      <AlertDialog open={cancelOpen} onOpenChange={setCancelOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>取消当前任务？</AlertDialogTitle>
+            <AlertDialogDescription>
+              将终止当前采集进程，已产生的数据和费用会保留。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={cancelling}>继续运行</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={cancelling}
+              onClick={(event) => { event.preventDefault(); void cancel(); }}
+            >
+              {cancelling ? "取消中…" : "确认取消"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
         <AlertDialogContent>

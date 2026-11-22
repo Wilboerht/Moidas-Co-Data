@@ -7,12 +7,22 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from .lead_statuses import (
+    DEFAULT_LEAD_SOURCE,
+    DEFAULT_LEAD_STATUS,
+    LEAD_STATUS_CODES,
+    normalize_lead_source,
+    normalize_lead_status,
+)
 from .normalize import TIER_LABELS, derive_tags, normalize_tier_label, utc_now
 from .statuses import DEFAULT_STATUS, normalize_status
 
 
 class JobBusyError(RuntimeError):
     """A round already has a pending or running job."""
+
+
+SCHEMA_VERSION = 2
 
 
 SCHEMA = """
@@ -118,12 +128,77 @@ CREATE TABLE IF NOT EXISTS creator_rounds (
     data_round TEXT,
     tier_label TEXT,
     account_id TEXT,
-    executor TEXT,
+    owner_user_id INTEGER,
+    claimed_at TEXT,
     cooperation_platform TEXT,
     raw_title TEXT,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (round_id, platform, user_id)
 );
+
+CREATE TABLE IF NOT EXISTS leads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform TEXT NOT NULL DEFAULT 'xhs',
+    nickname TEXT,
+    account_id TEXT,
+    profile_url TEXT,
+    raw_title TEXT,
+    source TEXT NOT NULL DEFAULT 'manual',
+    source_round_id INTEGER,
+    owner_user_id INTEGER,
+    status TEXT NOT NULL DEFAULT 'unverified',
+    legacy_user_id TEXT,
+    raw_json TEXT,
+    created_by INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    converted_platform TEXT,
+    converted_user_id TEXT,
+    converted_at TEXT,
+    conversion_lock TEXT,
+    conversion_locked_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS lead_rounds (
+    lead_id INTEGER NOT NULL,
+    round_id INTEGER NOT NULL,
+    source_keywords TEXT,
+    raw_title TEXT,
+    data_round TEXT,
+    top_note_id TEXT,
+    sample_notes INTEGER NOT NULL DEFAULT 0,
+    sample_likes INTEGER NOT NULL DEFAULT 0,
+    sample_collected INTEGER NOT NULL DEFAULT 0,
+    sample_comments INTEGER NOT NULL DEFAULT 0,
+    sample_interactions INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (lead_id, round_id)
+);
+
+CREATE TABLE IF NOT EXISTS lead_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id INTEGER NOT NULL,
+    provider TEXT,
+    query TEXT,
+    candidate_user_id TEXT,
+    candidate_nickname TEXT,
+    candidate_profile_url TEXT,
+    confidence TEXT,
+    status TEXT NOT NULL,
+    error TEXT,
+    cost INTEGER NOT NULL DEFAULT 0,
+    cost_native REAL NOT NULL DEFAULT 0,
+    cost_currency TEXT NOT NULL DEFAULT 'token',
+    created_by INTEGER,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_leads_status_owner ON leads (status, owner_user_id);
+CREATE INDEX IF NOT EXISTS idx_leads_platform ON leads (platform, status);
+CREATE INDEX IF NOT EXISTS idx_leads_round ON leads (source_round_id);
+CREATE INDEX IF NOT EXISTS idx_leads_updated ON leads (updated_at);
+CREATE INDEX IF NOT EXISTS idx_lead_rounds_round ON lead_rounds (round_id, lead_id);
+CREATE INDEX IF NOT EXISTS idx_lead_attempts_lead ON lead_attempts (lead_id, id);
 
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -137,7 +212,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     pid INTEGER,
     created_at TEXT NOT NULL,
     started_at TEXT,
-    finished_at TEXT
+    finished_at TEXT,
+    heartbeat_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS api_calls (
@@ -245,6 +321,7 @@ FROM creator_rounds cr
 JOIN rounds r ON r.id = cr.round_id
 LEFT JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id
 LEFT JOIN notes n ON n.platform = cr.platform AND n.note_id = cr.top_note_id
+LEFT JOIN users u ON u.id = cr.owner_user_id
 """
 
 ALL_ROUNDS_FROM_SQL = """
@@ -259,6 +336,7 @@ FROM (
 JOIN rounds r ON r.id = cr.round_id
 LEFT JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id
 LEFT JOIN notes n ON n.platform = cr.platform AND n.note_id = cr.top_note_id
+LEFT JOIN users u ON u.id = cr.owner_user_id
 """
 
 CREATOR_SELECT_SQL = f"""
@@ -268,10 +346,17 @@ SELECT cr.round_id, cr.platform, cr.user_id,
        cr.source_keywords, cr.sample_notes, cr.sample_likes, cr.sample_collected,
        cr.sample_comments, cr.sample_interactions, cr.top_note_id,
        cr.auto_tags, cr.status, cr.match_direction, cr.tags_manual, cr.remark,
-       cr.data_round, cr.tier_label, cr.account_id, cr.executor,
+       cr.data_round, cr.tier_label, cr.account_id,
+       cr.owner_user_id, cr.claimed_at, COALESCE(u.username, '') AS owner_username,
        cr.cooperation_platform, cr.raw_title,
        n.title AS top_title, n.url AS top_url, n.liked AS top_liked,
        r.name AS round_name, {TIER_SQL} AS derived_tier
+"""
+
+LEAD_FROM_SQL = """
+FROM leads l
+LEFT JOIN users u ON u.id = l.owner_user_id
+LEFT JOIN rounds r ON r.id = l.source_round_id
 """
 
 ROUND_FIELDS = {
@@ -296,6 +381,7 @@ JOB_FIELDS = {
     "pid",
     "started_at",
     "finished_at",
+    "heartbeat_at",
 }
 REVIEW_FIELDS = {"status", "match_direction", "tags_manual", "remark"}
 
@@ -323,10 +409,32 @@ class Database:
             if state is None:
                 self._has_fts = False
                 self._fts_trigram = False
-                self._init_db()
+                self._migrate_schema()
                 _SCHEMA_READY[db_key] = (self._has_fts, self._fts_trigram)
             else:
                 self._has_fts, self._fts_trigram = state
+
+    def _migrate_schema(self) -> None:
+        current = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+        has_data = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'rounds'"
+        ).fetchone()
+        if has_data and current < SCHEMA_VERSION:
+            self._backup_before_migration(current)
+        self._init_db()
+        if current < SCHEMA_VERSION:
+            self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            self._conn.commit()
+
+    def _backup_before_migration(self, version: int) -> Path:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = self.root / f"codata.sqlite.bak-schema-v{version}-{stamp}"
+        target = sqlite3.connect(path)
+        try:
+            self._conn.backup(target)
+        finally:
+            target.close()
+        return path
 
     def close(self) -> None:
         self._conn.close()
@@ -380,12 +488,39 @@ class Database:
             "data_round",
             "tier_label",
             "account_id",
-            "executor",
             "cooperation_platform",
             "raw_title",
         ):
             if column not in existing:
                 self._conn.execute(f"ALTER TABLE creator_rounds ADD COLUMN {column} TEXT")
+        if "owner_user_id" not in existing:
+            self._conn.execute("ALTER TABLE creator_rounds ADD COLUMN owner_user_id INTEGER")
+        if "claimed_at" not in existing:
+            self._conn.execute("ALTER TABLE creator_rounds ADD COLUMN claimed_at TEXT")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_creator_rounds_owner "
+            "ON creator_rounds (round_id, owner_user_id)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_creator_rounds_owner_user "
+            "ON creator_rounds (owner_user_id)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_creator_rounds_lookup "
+            "ON creator_rounds (platform, user_id)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_creator_rounds_latest "
+            "ON creator_rounds (platform, user_id, round_id DESC, updated_at DESC)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_note_hits_note "
+            "ON note_hits (platform, note_id)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_leads_legacy "
+            "ON leads (platform, legacy_user_id)"
+        )
         canonical_placeholders = ", ".join("?" for _ in TIER_LABELS)
         self._conn.execute(
             f"""
@@ -463,21 +598,47 @@ class Database:
             self._conn.execute(
                 "ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0"
             )
+        lead_columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(leads)").fetchall()
+        }
+        if "conversion_lock" not in lead_columns:
+            self._conn.execute("ALTER TABLE leads ADD COLUMN conversion_lock TEXT")
+        if "conversion_locked_at" not in lead_columns:
+            self._conn.execute("ALTER TABLE leads ADD COLUMN conversion_locked_at TEXT")
+        job_columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(jobs)").fetchall()
+        }
+        if "heartbeat_at" not in job_columns:
+            self._conn.execute("ALTER TABLE jobs ADD COLUMN heartbeat_at TEXT")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_status "
+            "ON jobs (status, heartbeat_at)"
+        )
         self._conn.commit()
 
-        for tokenizer in ("trigram", "unicode61"):
-            try:
-                self._conn.execute(
-                    "CREATE VIRTUAL TABLE IF NOT EXISTS creator_search USING fts5("
-                    "nickname, account_id, executor, raw_title, tags_manual, source_keywords, "
-                    "round_id UNINDEXED, platform UNINDEXED, user_id UNINDEXED, "
-                    f"tokenize='{tokenizer}')"
-                )
-                self._has_fts = True
-                self._fts_trigram = tokenizer == "trigram"
-                break
-            except sqlite3.OperationalError:
-                self._has_fts = False
+        existing_fts = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'creator_search'"
+        ).fetchone()
+        if existing_fts:
+            sql = str(existing_fts["sql"] or "").lower()
+            self._has_fts = True
+            self._fts_trigram = "trigram" in sql
+        else:
+            for tokenizer in ("trigram", "unicode61"):
+                try:
+                    self._conn.execute(
+                        "CREATE VIRTUAL TABLE creator_search USING fts5("
+                        "nickname, account_id, executor, raw_title, tags_manual, source_keywords, "
+                        "round_id UNINDEXED, platform UNINDEXED, user_id UNINDEXED, "
+                        f"tokenize='{tokenizer}')"
+                    )
+                    self._has_fts = True
+                    self._fts_trigram = tokenizer == "trigram"
+                    break
+                except sqlite3.OperationalError:
+                    self._has_fts = False
         if self._has_fts:
             try:
                 fts_count = self._conn.execute(
@@ -603,6 +764,12 @@ class Database:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def get_keyword(self, keyword_id: int) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM keywords WHERE id = ?", (keyword_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
     def update_keyword(self, keyword_id: int, category: str | None = None, enabled: bool | None = None) -> None:
         sets, values = [], []
         if category is not None:
@@ -684,9 +851,11 @@ class Database:
         row = self._conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
         return dict(row) if row else None
 
-    def list_rounds(self) -> list[dict[str, Any]]:
+    def list_rounds(self, limit: int | None = None) -> list[dict[str, Any]]:
+        limit_sql = " LIMIT ?" if limit is not None else ""
+        params: list[Any] = [int(limit)] if limit is not None else []
         rows = self._conn.execute(
-            """
+            f"""
             SELECT r.*,
                    COALESCE((
                        SELECT GROUP_CONCAT(k.word, '、')
@@ -695,8 +864,9 @@ class Database:
                    ), '') AS keywords,
                    (SELECT COUNT(*) FROM creator_rounds cr WHERE cr.round_id = r.id) AS creators
             FROM rounds r
-            ORDER BY r.id DESC
-            """
+            ORDER BY r.id DESC{limit_sql}
+            """,
+            params,
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -718,8 +888,32 @@ class Database:
         row = self.get_round(round_id)
         if not row:
             raise ValueError(f"轮次不存在: {round_id}")
-        counts: dict[str, int] = {}
+        active = self._conn.execute(
+            "SELECT 1 FROM jobs WHERE round_id = ? AND status IN ('pending', 'running') LIMIT 1",
+            (round_id,),
+        ).fetchone()
+        if active:
+            raise ValueError("该轮次仍有运行中的任务，请先取消或等待结束")
+        raw_files = [
+            Path(item["raw_file"])
+            for item in self._conn.execute(
+                "SELECT DISTINCT raw_file FROM api_calls "
+                "WHERE round_id = ? AND raw_file IS NOT NULL AND raw_file != ''",
+                (round_id,),
+            ).fetchall()
+        ]
+        counts: dict[str, Any] = {}
         with self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM lead_rounds WHERE round_id = ?", (round_id,)
+            )
+            counts["lead_rounds"] = max(0, cur.rowcount)
+            cur = self._conn.execute(
+                "UPDATE leads SET source_round_id = NULL, updated_at = ? "
+                "WHERE source_round_id = ?",
+                (utc_now(), round_id),
+            )
+            counts["leads_unlinked"] = max(0, cur.rowcount)
             for table in ("creator_rounds", "note_hits", "jobs", "api_calls", "round_keywords"):
                 cur = self._conn.execute(f"DELETE FROM {table} WHERE round_id = ?", (round_id,))
                 counts[table] = max(0, cur.rowcount)
@@ -735,6 +929,11 @@ class Database:
                 WHERE NOT EXISTS (
                     SELECT 1 FROM creator_rounds cr
                     WHERE cr.platform = creators.platform AND cr.user_id = creators.user_id
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM leads l
+                    WHERE l.converted_platform = creators.platform
+                      AND l.converted_user_id = creators.user_id
                 )
                 """
             )
@@ -753,13 +952,20 @@ class Database:
                 """
             )
             counts["orphan_notes"] = max(0, cur.rowcount)
-        raw_files = list(self.raw_dir.glob(f"*round{round_id}_*"))
+        removed_files = 0
         for path in raw_files:
-            path.unlink(missing_ok=True)
+            try:
+                path.unlink(missing_ok=True)
+                removed_files += 1
+            except OSError:
+                pass
         log_files = list((self.root / "logs").glob(f"round_{round_id}_*.log"))
         for path in log_files:
-            path.unlink(missing_ok=True)
-        counts["raw_files"] = len(raw_files)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        counts["raw_files"] = removed_files
         counts["log_files"] = len(log_files)
         return {"id": round_id, "name": row["name"], **counts}
 
@@ -774,7 +980,10 @@ class Database:
             cur = self._conn.execute(
                 "DELETE FROM creators WHERE NOT EXISTS "
                 "(SELECT 1 FROM creator_rounds cr WHERE cr.platform = creators.platform "
-                "AND cr.user_id = creators.user_id)"
+                "AND cr.user_id = creators.user_id) "
+                "AND NOT EXISTS (SELECT 1 FROM leads l "
+                "WHERE l.converted_platform = creators.platform "
+                "AND l.converted_user_id = creators.user_id)"
             )
             counts["creators"] = max(0, cur.rowcount)
             cur = self._conn.execute(
@@ -788,8 +997,10 @@ class Database:
             if self._has_fts:
                 cur = self._conn.execute(
                     "DELETE FROM creator_search WHERE NOT EXISTS "
-                    "(SELECT 1 FROM creators c WHERE c.platform = creator_search.platform "
-                    "AND c.user_id = creator_search.user_id)"
+                    "(SELECT 1 FROM creator_rounds cr "
+                    "WHERE cr.platform = creator_search.platform "
+                    "AND cr.user_id = creator_search.user_id "
+                    "AND CAST(cr.round_id AS TEXT) = creator_search.round_id)"
                 )
                 counts["search_rows"] = max(0, cur.rowcount)
         return counts
@@ -797,22 +1008,24 @@ class Database:
     def prune_round_creators(self, round_id: int, max_creators: int | None) -> int:
         if not max_creators or max_creators <= 0:
             return 0
-        reviewed = [
-            row["user_id"]
+        protected = [
+            (row["platform"], row["user_id"])
             for row in self._conn.execute(
-                "SELECT user_id FROM creator_rounds WHERE round_id = ? AND status <> 'pending'",
+                "SELECT platform, user_id FROM creator_rounds "
+                "WHERE round_id = ? AND (status <> 'pending' OR owner_user_id IS NOT NULL)",
                 (round_id,),
             ).fetchall()
         ]
-        remaining = max(0, int(max_creators) - len(reviewed))
+        remaining = max(0, int(max_creators) - len(protected))
         pending = [
-            row["user_id"]
+            (row["platform"], row["user_id"])
             for row in self._conn.execute(
                 """
-                SELECT cr.user_id
+                SELECT cr.platform, cr.user_id
                 FROM creator_rounds cr
                 LEFT JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id
                 WHERE cr.round_id = ? AND cr.status = 'pending'
+                  AND cr.owner_user_id IS NULL
                 ORDER BY
                     CASE WHEN c.fans IS NULL THEN 1 ELSE 0 END,
                     COALESCE(c.fans, 0) DESC,
@@ -823,15 +1036,16 @@ class Database:
                 (round_id, remaining),
             ).fetchall()
         ]
-        keep = set(reviewed) | set(pending)
+        keep = protected + pending
         if not keep:
             return 0
-        placeholders = ", ".join("?" for _ in keep)
+        keep_sql = " OR ".join("(platform = ? AND user_id = ?)" for _ in keep)
+        keep_params = [value for pair in keep for value in pair]
         with self._conn:
             cur = self._conn.execute(
                 f"DELETE FROM creator_rounds WHERE round_id = ? AND status = 'pending' "
-                f"AND user_id NOT IN ({placeholders})",
-                (round_id, *keep),
+                f"AND owner_user_id IS NULL AND NOT ({keep_sql})",
+                (round_id, *keep_params),
             )
             deleted = max(0, cur.rowcount)
         if deleted and self._has_fts:
@@ -858,17 +1072,17 @@ class Database:
                  liked, collected, comments, shares, url, hashtags, raw_json, first_seen, last_seen)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(platform, note_id) DO UPDATE SET
-                    author_id = excluded.author_id,
-                    title = excluded.title,
-                    desc = excluded.desc,
-                    note_type = excluded.note_type,
+                    author_id = COALESCE(NULLIF(excluded.author_id, ''), notes.author_id),
+                    title = COALESCE(NULLIF(excluded.title, ''), notes.title),
+                    desc = COALESCE(NULLIF(excluded.desc, ''), notes.desc),
+                    note_type = COALESCE(NULLIF(excluded.note_type, ''), notes.note_type),
                     published_at = COALESCE(excluded.published_at, notes.published_at),
-                    liked = excluded.liked,
-                    collected = excluded.collected,
-                    comments = excluded.comments,
-                    shares = excluded.shares,
-                    url = excluded.url,
-                    hashtags = excluded.hashtags,
+                    liked = COALESCE(NULLIF(excluded.liked, 0), notes.liked),
+                    collected = COALESCE(NULLIF(excluded.collected, 0), notes.collected),
+                    comments = COALESCE(NULLIF(excluded.comments, 0), notes.comments),
+                    shares = COALESCE(NULLIF(excluded.shares, 0), notes.shares),
+                    url = COALESCE(NULLIF(excluded.url, ''), notes.url),
+                    hashtags = COALESCE(NULLIF(excluded.hashtags, ''), notes.hashtags),
                     raw_json = excluded.raw_json,
                     last_seen = excluded.last_seen
                 """,
@@ -1387,23 +1601,24 @@ class Database:
                     (round_id, platform, user_id, source_keywords, sample_notes, sample_likes,
                      sample_collected, sample_comments, sample_interactions, top_note_id,
                      auto_tags, status, match_direction, tags_manual, remark, data_round,
-                     tier_label, account_id, executor, cooperation_platform, raw_title, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     tier_label, account_id, cooperation_platform, raw_title, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(round_id, platform, user_id) DO UPDATE SET
-                        source_keywords = excluded.source_keywords,
+                        source_keywords = CASE WHEN excluded.source_keywords IN ('', '[]')
+                            THEN creator_rounds.source_keywords ELSE excluded.source_keywords END,
                         sample_notes = excluded.sample_notes,
                         sample_likes = excluded.sample_likes,
                         sample_collected = excluded.sample_collected,
                         sample_comments = excluded.sample_comments,
                         sample_interactions = excluded.sample_interactions,
-                        top_note_id = excluded.top_note_id,
-                        auto_tags = excluded.auto_tags,
-                        data_round = excluded.data_round,
-                        tier_label = excluded.tier_label,
-                        account_id = excluded.account_id,
-                        executor = excluded.executor,
-                        cooperation_platform = excluded.cooperation_platform,
-                        raw_title = excluded.raw_title,
+                        top_note_id = COALESCE(NULLIF(excluded.top_note_id, ''), creator_rounds.top_note_id),
+                        auto_tags = CASE WHEN excluded.auto_tags IN ('', '[]')
+                            THEN creator_rounds.auto_tags ELSE excluded.auto_tags END,
+                        data_round = COALESCE(NULLIF(excluded.data_round, ''), creator_rounds.data_round),
+                        tier_label = COALESCE(NULLIF(excluded.tier_label, ''), creator_rounds.tier_label),
+                        account_id = COALESCE(NULLIF(excluded.account_id, ''), creator_rounds.account_id),
+                        cooperation_platform = COALESCE(NULLIF(excluded.cooperation_platform, ''), creator_rounds.cooperation_platform),
+                        raw_title = COALESCE(NULLIF(excluded.raw_title, ''), creator_rounds.raw_title),
                         updated_at = excluded.updated_at
                     """,
                     (
@@ -1425,7 +1640,6 @@ class Database:
                         row.get("data_round"),
                         tier_label,
                         row.get("account_id"),
-                        row.get("executor"),
                         row.get("cooperation_platform"),
                         row.get("raw_title"),
                         now,
@@ -1504,6 +1718,149 @@ class Database:
                 self._refresh_search_row(round_id, platform, user_id)
         return changed
 
+    def _creator_owner_row(
+        self, round_id: int, platform: str, user_id: str
+    ) -> sqlite3.Row | None:
+        return self._conn.execute(
+            """
+            SELECT cr.owner_user_id, cr.claimed_at, COALESCE(u.username, '') AS owner_username
+            FROM creator_rounds cr
+            LEFT JOIN users u ON u.id = cr.owner_user_id
+            WHERE cr.round_id = ? AND cr.platform = ? AND cr.user_id = ?
+            """,
+            (round_id, platform, user_id),
+        ).fetchone()
+
+    def creator_owner(self, round_id: int, platform: str, user_id: str) -> dict[str, Any] | None:
+        row = self._creator_owner_row(round_id, platform, user_id)
+        return dict(row) if row else None
+
+    def claim_creator(
+        self, round_id: int, platform: str, user_id: str, owner_user_id: int
+    ) -> dict[str, Any]:
+        row = self._creator_owner_row(round_id, platform, user_id)
+        if not row:
+            raise ValueError("达人不存在")
+        current = row["owner_user_id"]
+        if current is not None and int(current) != int(owner_user_id):
+            return {
+                "ok": False,
+                "owner_user_id": int(current),
+                "owner_username": row["owner_username"],
+            }
+        if current is None:
+            now = utc_now()
+            with self._conn:
+                cur = self._conn.execute(
+                    """
+                    UPDATE creator_rounds
+                    SET owner_user_id = ?, claimed_at = ?, updated_at = ?
+                    WHERE round_id = ? AND platform = ? AND user_id = ?
+                      AND owner_user_id IS NULL
+                    """,
+                    (owner_user_id, now, now, round_id, platform, user_id),
+                )
+            if cur.rowcount > 0:
+                return {"ok": True, "owner_user_id": int(owner_user_id), "already_mine": False}
+            latest = self._creator_owner_row(round_id, platform, user_id)
+            if not latest:
+                raise ValueError("达人不存在")
+            if latest["owner_user_id"] is not None:
+                if int(latest["owner_user_id"]) == int(owner_user_id):
+                    return {"ok": True, "owner_user_id": int(owner_user_id), "already_mine": True}
+                return {
+                    "ok": False,
+                    "owner_user_id": int(latest["owner_user_id"]),
+                    "owner_username": latest["owner_username"],
+                }
+            return {"ok": False, "owner_user_id": None, "owner_username": ""}
+        return {"ok": True, "owner_user_id": int(owner_user_id), "already_mine": True}
+
+    def release_creator(
+        self,
+        round_id: int,
+        platform: str,
+        user_id: str,
+        expected_owner_user_id: int | None = None,
+    ) -> dict[str, Any]:
+        row = self._creator_owner_row(round_id, platform, user_id)
+        if not row:
+            raise ValueError("达人不存在")
+        current = row["owner_user_id"]
+        if current is None:
+            return {"ok": True, "released": False, "previous": None}
+        if expected_owner_user_id is None or int(current) != int(expected_owner_user_id):
+            return {
+                "ok": False,
+                "owner_user_id": int(current),
+                "owner_username": row["owner_username"],
+            }
+        with self._conn:
+            cur = self._conn.execute(
+                """
+                UPDATE creator_rounds
+                SET owner_user_id = NULL, claimed_at = NULL, updated_at = ?
+                WHERE round_id = ? AND platform = ? AND user_id = ?
+                  AND owner_user_id = ?
+                """,
+                (utc_now(), round_id, platform, user_id, int(current)),
+            )
+        if cur.rowcount == 0:
+            latest = self._creator_owner_row(round_id, platform, user_id)
+            if latest and latest["owner_user_id"] is not None:
+                return {
+                    "ok": False,
+                    "owner_user_id": int(latest["owner_user_id"]),
+                    "owner_username": latest["owner_username"],
+                }
+            return {"ok": True, "released": False, "previous": None}
+        return {
+            "ok": True,
+            "released": True,
+            "previous": {
+                "owner_user_id": int(current),
+                "owner_username": row["owner_username"],
+            },
+        }
+
+    def claim_creators(
+        self,
+        round_id: int,
+        items: Iterable[tuple[str, str]],
+        owner_user_id: int,
+    ) -> dict[str, int]:
+        now = utc_now()
+        result = {"claimed": 0, "already_mine": 0, "skipped": 0, "missing": 0}
+        with self._conn:
+            for platform, user_id in items:
+                row = self._conn.execute(
+                    "SELECT owner_user_id FROM creator_rounds "
+                    "WHERE round_id = ? AND platform = ? AND user_id = ?",
+                    (round_id, platform, user_id),
+                ).fetchone()
+                if not row:
+                    result["missing"] += 1
+                    continue
+                current = row["owner_user_id"]
+                if current is not None:
+                    if int(current) == int(owner_user_id):
+                        result["already_mine"] += 1
+                    else:
+                        result["skipped"] += 1
+                    continue
+                cur = self._conn.execute(
+                    """
+                    UPDATE creator_rounds
+                    SET owner_user_id = ?, claimed_at = ?, updated_at = ?
+                    WHERE round_id = ? AND platform = ? AND user_id = ?
+                      AND owner_user_id IS NULL
+                    """,
+                    (owner_user_id, now, now, round_id, platform, user_id),
+                )
+                if cur.rowcount > 0:
+                    result["claimed"] += 1
+        return result
+
     # ---- queries for panel ----
 
     def creator_table(
@@ -1528,7 +1885,8 @@ class Database:
                    cr.source_keywords, cr.sample_notes, cr.sample_likes, cr.sample_collected,
                    cr.sample_comments, cr.sample_interactions, cr.top_note_id,
                    cr.auto_tags, cr.status, cr.match_direction, cr.tags_manual, cr.remark,
-                   cr.data_round, cr.tier_label, cr.account_id, cr.executor,
+                   cr.data_round, cr.tier_label, cr.account_id,
+                   cr.owner_user_id, cr.claimed_at, COALESCE(u.username, '') AS owner_username,
                    cr.cooperation_platform, cr.raw_title,
                    n.title AS top_title, n.url AS top_url, n.liked AS top_liked,
                    r.name AS round_name
@@ -1536,6 +1894,7 @@ class Database:
             JOIN rounds r ON r.id = cr.round_id
             LEFT JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id
             LEFT JOIN notes n ON n.platform = cr.platform AND n.note_id = cr.top_note_id
+            LEFT JOIN users u ON u.id = cr.owner_user_id
             WHERE {' AND '.join(conditions)}
             ORDER BY cr.sample_likes DESC, cr.sample_notes DESC
             """,
@@ -1552,6 +1911,7 @@ class Database:
         tiers: Iterable[str] | None = None,
         directions: Iterable[str] | None = None,
         sources: Iterable[str] | None = None,
+        owner: str | None = None,
         min_fans: int | None = None,
         max_fans: int | None = None,
         only_unenriched: bool = False,
@@ -1561,6 +1921,11 @@ class Database:
         if platform:
             conditions.append("cr.platform = ?")
             params.append(platform)
+        if owner == "unassigned":
+            conditions.append("cr.owner_user_id IS NULL")
+        elif owner and str(owner).isdigit():
+            conditions.append("cr.owner_user_id = ?")
+            params.append(int(owner))
         if search:
             text = search.strip()
             if self._has_fts and self._fts_trigram and len(text) >= 3:
@@ -1589,12 +1954,11 @@ class Database:
                     "c.nickname LIKE ? ESCAPE '\\' OR "
                     "cr.account_id LIKE ? ESCAPE '\\' OR "
                     "cr.user_id LIKE ? ESCAPE '\\' OR "
-                    "cr.executor LIKE ? ESCAPE '\\' OR "
                     "cr.raw_title LIKE ? ESCAPE '\\' OR "
                     "cr.tags_manual LIKE ? ESCAPE '\\'"
                     ")"
                 )
-                params.extend([like] * 6)
+                params.extend([like] * 5)
         status_values = [value for value in (statuses or []) if value]
         if status_values:
             conditions.append(f"cr.status IN ({','.join('?' * len(status_values))})")
@@ -1651,7 +2015,7 @@ class Database:
                 (round_id, platform, user_id, nickname, account_id, executor,
                  raw_title, tags_manual, source_keywords)
                 SELECT CAST(cr.round_id AS TEXT), cr.platform, cr.user_id, c.nickname,
-                       cr.account_id, cr.executor, cr.raw_title, cr.tags_manual,
+                       cr.account_id, '', cr.raw_title, cr.tags_manual,
                        cr.source_keywords
                 FROM creator_rounds cr
                 LEFT JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id
@@ -1676,7 +2040,7 @@ class Database:
                 (round_id, platform, user_id, nickname, account_id, executor,
                  raw_title, tags_manual, source_keywords)
                 SELECT CAST(cr.round_id AS TEXT), cr.platform, cr.user_id, c.nickname,
-                       cr.account_id, cr.executor, cr.raw_title, cr.tags_manual,
+                       cr.account_id, '', cr.raw_title, cr.tags_manual,
                        cr.source_keywords
                 FROM creator_rounds cr
                 LEFT JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id
@@ -1694,6 +2058,7 @@ class Database:
         tiers: Iterable[str] | None = None,
         directions: Iterable[str] | None = None,
         sources: Iterable[str] | None = None,
+        owner: str | None = None,
         min_fans: int | None = None,
         max_fans: int | None = None,
         only_unenriched: bool = False,
@@ -1711,6 +2076,7 @@ class Database:
             tiers=tiers,
             directions=directions,
             sources=sources,
+            owner=owner,
             min_fans=min_fans,
             max_fans=max_fans,
             only_unenriched=only_unenriched,
@@ -1799,10 +2165,11 @@ class Database:
     def creator_detail(self, round_id: int, platform: str, user_id: str) -> dict[str, Any] | None:
         row = self._conn.execute(
             """
-            SELECT cr.*, c.*, r.name AS round_name
+            SELECT cr.*, c.*, r.name AS round_name, COALESCE(u.username, '') AS owner_username
             FROM creator_rounds cr
             JOIN rounds r ON r.id = cr.round_id
             LEFT JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id
+            LEFT JOIN users u ON u.id = cr.owner_user_id
             WHERE cr.round_id = ? AND cr.platform = ? AND cr.user_id = ?
             """,
             (round_id, platform, user_id),
@@ -1847,6 +2214,460 @@ class Database:
                 note["keywords"].append(row["keyword"])
         return list(notes.values())
 
+    # ---- leads ----
+
+    def query_leads(
+        self,
+        round_id: int | None = None,
+        platform: str | None = None,
+        search: str | None = None,
+        statuses: Iterable[str] | None = None,
+        sources: Iterable[str] | None = None,
+        owner: str | None = None,
+        sort: str = "updated_at",
+        order: str = "desc",
+        page: int = 1,
+        page_size: int = 50,
+    ) -> dict[str, Any]:
+        conditions: list[str] = ["1 = 1"]
+        params: list[Any] = []
+        if round_id is not None:
+            conditions.append(
+                "EXISTS (SELECT 1 FROM lead_rounds lr "
+                "WHERE lr.lead_id = l.id AND lr.round_id = ?)"
+            )
+            params.append(round_id)
+        if platform:
+            conditions.append("l.platform = ?")
+            params.append(platform)
+        if search and search.strip():
+            escaped = search.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            like = f"%{escaped}%"
+            conditions.append(
+                "(l.nickname LIKE ? ESCAPE '\\' OR l.raw_title LIKE ? ESCAPE '\\' "
+                "OR l.account_id LIKE ? ESCAPE '\\' OR l.profile_url LIKE ? ESCAPE '\\' "
+                "OR l.legacy_user_id LIKE ? ESCAPE '\\')"
+            )
+            params.extend([like] * 5)
+        status_values = [
+            normalize_lead_status(value, default="")
+            for value in (statuses or [])
+            if value
+        ]
+        status_values = [value for value in status_values if value in LEAD_STATUS_CODES]
+        if status_values:
+            conditions.append(f"l.status IN ({','.join('?' * len(status_values))})")
+            params.extend(status_values)
+        source_values = [
+            normalize_lead_source(value, default="")
+            for value in (sources or [])
+            if value
+        ]
+        source_values = [value for value in source_values if value]
+        if source_values:
+            conditions.append(f"l.source IN ({','.join('?' * len(source_values))})")
+            params.extend(source_values)
+        if owner:
+            if owner == "unassigned":
+                conditions.append("l.owner_user_id IS NULL")
+            elif owner.isdigit():
+                conditions.append("l.owner_user_id = ?")
+                params.append(int(owner))
+        where = " AND ".join(conditions)
+        sort_map = {
+            "updated_at": "l.updated_at",
+            "created_at": "l.created_at",
+            "nickname": "l.nickname",
+            "status": "l.status",
+        }
+        sort_sql = sort_map.get(sort, sort_map["updated_at"])
+        direction = "ASC" if str(order).lower() == "asc" else "DESC"
+        page = max(1, int(page))
+        page_size = max(1, min(200, int(page_size)))
+        total = self._conn.execute(
+            f"SELECT COUNT(*) AS n {LEAD_FROM_SQL} WHERE {where}", params
+        ).fetchone()["n"]
+        rows = self._conn.execute(
+            f"""
+            SELECT l.id, l.platform, l.nickname, l.account_id, l.profile_url, l.raw_title,
+                   l.source, l.source_round_id, l.owner_user_id, l.status, l.legacy_user_id,
+                   l.created_by, l.created_at, l.updated_at,
+                   l.converted_platform, l.converted_user_id, l.converted_at,
+                   u.username AS owner_username,
+                   COALESCE(
+                       r.name,
+                       (SELECT r2.name FROM lead_rounds lr2
+                        JOIN rounds r2 ON r2.id = lr2.round_id
+                        WHERE lr2.lead_id = l.id ORDER BY lr2.round_id DESC LIMIT 1)
+                   ) AS source_round_name
+            {LEAD_FROM_SQL} WHERE {where}
+            ORDER BY {sort_sql} {direction}, l.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            [*params, page_size, (page - 1) * page_size],
+        ).fetchall()
+        return {
+            "items": [dict(row) for row in rows],
+            "total": int(total),
+            "page": page,
+            "page_size": page_size,
+        }
+
+    def get_lead(self, lead_id: int) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            f"""
+            SELECT l.*, u.username AS owner_username, r.name AS source_round_name
+            {LEAD_FROM_SQL} WHERE l.id = ?
+            """,
+            (lead_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def lead_rounds(self, lead_id: int) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """
+            SELECT lr.*, r.name AS round_name
+            FROM lead_rounds lr
+            LEFT JOIN rounds r ON r.id = lr.round_id
+            WHERE lr.lead_id = ?
+            ORDER BY lr.round_id DESC
+            """,
+            (lead_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def lead_attempts(self, lead_id: int, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM lead_attempts WHERE lead_id = ? ORDER BY id DESC LIMIT ?",
+            (lead_id, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def create_lead(
+        self,
+        *,
+        platform: str,
+        nickname: str = "",
+        account_id: str = "",
+        profile_url: str = "",
+        raw_title: str = "",
+        source: str = DEFAULT_LEAD_SOURCE,
+        source_round_id: int | None = None,
+        owner_user_id: int | None = None,
+        raw_json: Any = None,
+        created_by: int | None = None,
+        legacy_user_id: str = "",
+        status: str = DEFAULT_LEAD_STATUS,
+        source_keywords: str = "[]",
+        data_round: str = "",
+    ) -> int:
+        now = utc_now()
+        raw_text = raw_json if isinstance(raw_json, str) else json.dumps(raw_json or {}, ensure_ascii=False)
+        with self._conn:
+            cur = self._conn.execute(
+                """
+                INSERT INTO leads
+                (platform, nickname, account_id, profile_url, raw_title, source,
+                 source_round_id, owner_user_id, status, legacy_user_id, raw_json,
+                 created_by, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    platform or "xhs",
+                    nickname or "",
+                    account_id or "",
+                    profile_url or "",
+                    raw_title or "",
+                    normalize_lead_source(source),
+                    source_round_id,
+                    owner_user_id,
+                    normalize_lead_status(status),
+                    legacy_user_id or "",
+                    raw_text,
+                    created_by,
+                    now,
+                    now,
+                ),
+            )
+            lead_id = int(cur.lastrowid)
+            if source_round_id is not None and self.get_round(source_round_id):
+                self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO lead_rounds
+                    (lead_id, round_id, source_keywords, raw_title, data_round,
+                     sample_notes, sample_likes, sample_collected, sample_comments,
+                     sample_interactions, updated_at)
+                    VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, 0, ?)
+                    """,
+                    (
+                        lead_id,
+                        source_round_id,
+                        source_keywords or "[]",
+                        raw_title or "",
+                        data_round or "",
+                        now,
+                    ),
+                )
+        return lead_id
+
+    def update_lead(self, lead_id: int, **fields: Any) -> None:
+        allowed = {
+            "nickname",
+            "account_id",
+            "profile_url",
+            "raw_title",
+            "source",
+            "source_round_id",
+            "owner_user_id",
+            "status",
+        }
+        updates = {key: value for key, value in fields.items() if key in allowed}
+        if not updates:
+            return
+        current = self.get_lead(lead_id)
+        if not current:
+            raise ValueError("线索不存在")
+        if current.get("status") == "converted":
+            raise ValueError("已转达人的线索不可修改")
+        if "status" in updates:
+            updates["status"] = normalize_lead_status(updates["status"])
+            if updates["status"] == "converted":
+                raise ValueError("请使用线索转换接口")
+        if "source" in updates:
+            updates["source"] = normalize_lead_source(updates["source"])
+        new_round = updates.get("source_round_id", current.get("source_round_id"))
+        if new_round is not None and not self.get_round(int(new_round)):
+            raise ValueError("来源轮次不存在")
+        old_round = current.get("source_round_id")
+        updates["updated_at"] = utc_now()
+        sets = ", ".join(f"{key} = ?" for key in updates)
+        with self._conn:
+            self._conn.execute(
+                f"UPDATE leads SET {sets} WHERE id = ?", [*updates.values(), lead_id]
+            )
+            if "source_round_id" in updates:
+                if new_round is not None:
+                    self._conn.execute(
+                        """
+                        INSERT OR IGNORE INTO lead_rounds
+                        (lead_id, round_id, source_keywords, raw_title, data_round, updated_at)
+                        VALUES (?, ?, '[]', ?, '', ?)
+                        """,
+                        (lead_id, int(new_round), current.get("raw_title") or "", utc_now()),
+                    )
+                if old_round is not None and int(old_round) != int(new_round or 0):
+                    self._conn.execute(
+                        "DELETE FROM lead_rounds WHERE lead_id = ? AND round_id = ?",
+                        (lead_id, int(old_round)),
+                    )
+
+    def add_lead_attempt(
+        self,
+        lead_id: int,
+        status: str,
+        provider: str = "",
+        query: str = "",
+        candidate_user_id: str = "",
+        candidate_nickname: str = "",
+        candidate_profile_url: str = "",
+        confidence: str = "",
+        error: str = "",
+        cost: int = 0,
+        cost_native: float = 0,
+        cost_currency: str = "token",
+        created_by: int | None = None,
+    ) -> None:
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO lead_attempts
+                (lead_id, provider, query, candidate_user_id, candidate_nickname,
+                 candidate_profile_url, confidence, status, error, cost, cost_native,
+                 cost_currency, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    lead_id,
+                    provider or "",
+                    query or "",
+                    candidate_user_id or "",
+                    candidate_nickname or "",
+                    candidate_profile_url or "",
+                    confidence or "",
+                    status,
+                    error or "",
+                    int(cost or 0),
+                    float(cost_native or 0),
+                    cost_currency or "token",
+                    created_by,
+                    utc_now(),
+                ),
+            )
+
+    def lead_metrics(self, round_id: int | None = None) -> dict[str, int]:
+        where = ""
+        params: list[Any] = []
+        if round_id is not None:
+            where = (
+                "WHERE EXISTS (SELECT 1 FROM lead_rounds lr "
+                "WHERE lr.lead_id = l.id AND lr.round_id = ?)"
+            )
+            params = [round_id]
+        rows = self._conn.execute(
+            f"SELECT l.status, COUNT(*) AS n FROM leads l {where} GROUP BY l.status",
+            params,
+        ).fetchall()
+        result = {code: 0 for code in LEAD_STATUS_CODES}
+        for row in rows:
+            result[normalize_lead_status(row["status"])] += int(row["n"])
+        result["leads"] = sum(result.values())
+        return result
+
+    def lead_facets(self, round_id: int | None = None) -> dict[str, Any]:
+        where = ""
+        params: list[Any] = []
+        if round_id is not None:
+            where = (
+                "WHERE EXISTS (SELECT 1 FROM lead_rounds lr "
+                "WHERE lr.lead_id = l.id AND lr.round_id = ?)"
+            )
+            params = [round_id]
+
+        def facet(column: str) -> list[dict[str, Any]]:
+            rows = self._conn.execute(
+                f"SELECT {column} AS value, COUNT(*) AS count FROM leads l {where} "
+                f"GROUP BY {column} ORDER BY count DESC",
+                params,
+            ).fetchall()
+            return [
+                {"value": str(row["value"] or ""), "count": int(row["count"])}
+                for row in rows
+            ]
+
+        round_where = "WHERE lr.round_id = ?" if round_id is not None else ""
+        round_params: list[Any] = [round_id] if round_id is not None else []
+        round_rows = self._conn.execute(
+            f"SELECT lr.round_id AS value, COUNT(DISTINCT lr.lead_id) AS count "
+            f"FROM lead_rounds lr JOIN leads l ON l.id = lr.lead_id {round_where} "
+            f"GROUP BY lr.round_id ORDER BY count DESC",
+            round_params,
+        ).fetchall()
+
+        return {
+            "platforms": facet("l.platform"),
+            "statuses": facet("l.status"),
+            "sources": facet("l.source"),
+            "owners": facet("l.owner_user_id"),
+            "rounds": [
+                {"value": str(row["value"] or ""), "count": int(row["count"])}
+                for row in round_rows
+            ],
+        }
+
+    def lead_owner_options(self) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT id, username, role, can_collect FROM users "
+            "WHERE disabled = 0 AND (role = 'admin' OR can_collect = 1) "
+            "ORDER BY username COLLATE NOCASE"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def add_creator_round(
+        self,
+        round_id: int,
+        platform: str,
+        user_id: str,
+        *,
+        source_keywords: str = "[]",
+        raw_title: str = "",
+        account_id: str = "",
+        data_round: str = "",
+        top_note_id: str = "",
+        sample_notes: int = 0,
+        sample_likes: int = 0,
+        sample_collected: int = 0,
+        sample_comments: int = 0,
+        sample_interactions: int = 0,
+        status: str = DEFAULT_STATUS,
+    ) -> bool:
+        if not self.get_round(round_id):
+            raise ValueError(f"轮次不存在: {round_id}")
+        now = utc_now()
+        with self._conn:
+            cur = self._conn.execute(
+                """
+                INSERT OR IGNORE INTO creator_rounds
+                (round_id, platform, user_id, source_keywords, sample_notes, sample_likes,
+                 sample_collected, sample_comments, sample_interactions, top_note_id,
+                 auto_tags, status, match_direction, tags_manual, remark, data_round,
+                 tier_label, account_id, cooperation_platform, raw_title, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, NULL, '', '', ?, NULL, ?, '', ?, ?)
+                """,
+                (
+                    round_id,
+                    platform,
+                    user_id,
+                    source_keywords or "[]",
+                    int(sample_notes or 0),
+                    int(sample_likes or 0),
+                    int(sample_collected or 0),
+                    int(sample_comments or 0),
+                    int(sample_interactions or 0),
+                    top_note_id or "",
+                    normalize_status(status),
+                    data_round or "",
+                    account_id or user_id,
+                    raw_title or "",
+                    now,
+                ),
+            )
+            inserted = cur.rowcount > 0
+        if inserted and self._has_fts:
+            self.rebuild_search_index(round_id)
+        return inserted
+
+    def acquire_lead_conversion(
+        self, lead_id: int, token: str, stale_minutes: int = 15
+    ) -> bool:
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=max(1, stale_minutes))).isoformat(
+            timespec="seconds"
+        )
+        now = utc_now()
+        with self._conn:
+            cur = self._conn.execute(
+                """
+                UPDATE leads SET conversion_lock = ?, conversion_locked_at = ?, updated_at = ?
+                WHERE id = ? AND status IN ('unverified', 'verifying')
+                  AND (
+                      conversion_lock IS NULL OR conversion_locked_at IS NULL
+                      OR conversion_locked_at < ?
+                  )
+                """,
+                (token, now, now, lead_id, cutoff),
+            )
+        return cur.rowcount > 0
+
+    def release_lead_conversion(self, lead_id: int, token: str) -> None:
+        with self._conn:
+            self._conn.execute(
+                "UPDATE leads SET conversion_lock = NULL, conversion_locked_at = NULL "
+                "WHERE id = ? AND conversion_lock = ?",
+                (lead_id, token),
+            )
+
+    def mark_lead_converted(self, lead_id: int, platform: str, user_id: str) -> None:
+        now = utc_now()
+        with self._conn:
+            self._conn.execute(
+                """
+                UPDATE leads SET status = 'converted', converted_platform = ?,
+                    converted_user_id = ?, converted_at = ?, updated_at = ?,
+                    conversion_lock = NULL, conversion_locked_at = NULL
+                WHERE id = ?
+                """,
+                (platform, user_id, now, now, lead_id),
+            )
+
     def counts(self) -> dict[str, int]:
         def count(table: str) -> int:
             return int(self._conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"])
@@ -1857,6 +2678,7 @@ class Database:
             "notes": count("notes"),
             "creators": count("creators"),
             "creator_rounds": count("creator_rounds"),
+            "leads": count("leads"),
         }
 
     def round_summary(self, round_id: int) -> dict[str, Any]:
@@ -1864,6 +2686,7 @@ class Database:
             """
             SELECT
                 (SELECT COUNT(*) FROM creator_rounds WHERE round_id = ?) AS creators,
+                (SELECT COUNT(*) FROM lead_rounds WHERE round_id = ?) AS leads,
                 (SELECT COUNT(*) FROM note_hits WHERE round_id = ?) AS note_hits,
                 (SELECT COUNT(DISTINCT note_id) FROM (
                     SELECT n.note_id FROM note_hits nh
@@ -1875,7 +2698,7 @@ class Database:
                 )) AS notes,
                 (SELECT COALESCE(SUM(cost), 0) FROM api_calls WHERE round_id = ?) AS cost
             """,
-            (round_id, round_id, round_id, round_id, round_id),
+            (round_id, round_id, round_id, round_id, round_id, round_id),
         ).fetchone()
         return dict(row)
 
@@ -1899,26 +2722,23 @@ class Database:
 
     def all_round_metrics(self) -> dict[str, int]:
         row = self._conn.execute(
-            """
-            WITH unique_creators AS (
-                SELECT cr.platform, cr.user_id,
-                       MAX(CASE WHEN c.fans IS NOT NULL THEN 1 ELSE 0 END) AS enriched,
-                       MAX(CASE cr.status
-                           WHEN 'adopted' THEN 3
-                           WHEN 'shortlisted' THEN 2
-                           WHEN 'pending' THEN 1
-                           ELSE 0
-                       END) AS status_rank
+            f"""
+            WITH latest AS (
+                SELECT cr.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY cr.platform, cr.user_id
+                           ORDER BY cr.round_id DESC, cr.updated_at DESC
+                       ) AS rn
                 FROM creator_rounds cr
-                LEFT JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id
-                GROUP BY cr.platform, cr.user_id
             )
             SELECT
                 COUNT(*) AS creators,
-                SUM(enriched) AS enriched,
-                SUM(CASE WHEN status_rank = 1 THEN 1 ELSE 0 END) AS pending,
-                SUM(CASE WHEN status_rank = 3 THEN 1 ELSE 0 END) AS adopted
-            FROM unique_creators
+                SUM(CASE WHEN c.fans IS NOT NULL THEN 1 ELSE 0 END) AS enriched,
+                SUM(CASE WHEN cr.status = 'pending' THEN 1 ELSE 0 END) AS pending,
+                SUM(CASE WHEN cr.status = 'adopted' THEN 1 ELSE 0 END) AS adopted
+            FROM latest cr
+            LEFT JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id
+            WHERE cr.rn = 1
             """
         ).fetchone()
         return {key: int(row[key] or 0) for key in ("creators", "enriched", "pending", "adopted")}
@@ -1926,48 +2746,41 @@ class Database:
     def all_status_counts(self) -> dict[str, int]:
         rows = self._conn.execute(
             """
-            WITH unique_creators AS (
-                SELECT cr.platform, cr.user_id,
-                       MAX(CASE cr.status
-                           WHEN 'adopted' THEN 3
-                           WHEN 'shortlisted' THEN 2
-                           WHEN 'pending' THEN 1
-                           ELSE 0
-                       END) AS status_rank
+            WITH latest AS (
+                SELECT cr.status,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY cr.platform, cr.user_id
+                           ORDER BY cr.round_id DESC, cr.updated_at DESC
+                       ) AS rn
                 FROM creator_rounds cr
-                GROUP BY cr.platform, cr.user_id
             )
-            SELECT status_rank, COUNT(*) AS n FROM unique_creators GROUP BY status_rank
+            SELECT status, COUNT(*) AS n FROM latest WHERE rn = 1 GROUP BY status
             """
         ).fetchall()
-        labels = {0: "rejected", 1: "pending", 2: "shortlisted", 3: "adopted"}
-        return {labels[int(row["status_rank"])]: int(row["n"]) for row in rows}
+        return {row["status"]: int(row["n"]) for row in rows}
 
     def all_tier_counts(self) -> dict[str, int]:
-        from .normalize import fans_tier
-
         rows = self._conn.execute(
-            """
-            WITH unique_creators AS (
-                SELECT cr.platform, cr.user_id, MAX(c.fans) AS fans,
-                       MAX(cr.tier_label) AS tier_label
+            f"""
+            WITH latest AS (
+                SELECT cr.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY cr.platform, cr.user_id
+                           ORDER BY cr.round_id DESC, cr.updated_at DESC
+                       ) AS rn
                 FROM creator_rounds cr
-                LEFT JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id
-                GROUP BY cr.platform, cr.user_id
             )
-            SELECT fans, tier_label FROM unique_creators
+            SELECT {TIER_SQL} AS label, COUNT(*) AS n
+            FROM latest cr
+            LEFT JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id
+            WHERE cr.rn = 1
+            GROUP BY label
             """
         ).fetchall()
         result = {label: 0 for label in TIER_LABELS}
         result["未补全"] = 0
         for row in rows:
-            if row["tier_label"]:
-                label = row["tier_label"]
-            elif row["fans"] is None:
-                label = "未补全"
-            else:
-                label = fans_tier(row["fans"])
-            result[label] = result.get(label, 0) + 1
+            result[row["label"]] = result.get(row["label"], 0) + int(row["n"])
         return result
 
     def status_counts(self, round_id: int | None) -> dict[str, int]:
@@ -2001,15 +2814,54 @@ class Database:
     # ---- jobs ----
 
     def create_job(self, round_id: int) -> int:
+        now = utc_now()
         with self._conn:
             cur = self._conn.execute(
-                "INSERT INTO jobs (round_id, status, stage, created_at) VALUES (?, 'pending', '排队中', ?)",
-                (round_id, utc_now()),
+                "INSERT INTO jobs (round_id, status, stage, created_at, heartbeat_at) "
+                "VALUES (?, 'pending', '排队中', ?, ?)",
+                (round_id, now, now),
             )
         return int(cur.lastrowid)
 
-    def claim_job(self, round_id: int, max_active: int | None = None) -> int:
+    def reconcile_stale_jobs(self, stale_minutes: int = 30) -> list[int]:
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=max(1, int(stale_minutes)))
+        rows = self._conn.execute(
+            "SELECT * FROM jobs WHERE status IN ('pending', 'running')"
+        ).fetchall()
+        stale: list[int] = []
+        for row in rows:
+            raw = row["heartbeat_at"] or row["started_at"] or row["created_at"]
+            try:
+                last = datetime.fromisoformat(str(raw))
+            except (TypeError, ValueError):
+                continue
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+            if last >= cutoff:
+                continue
+            finished = utc_now()
+            stage = "启动超时" if row["status"] == "pending" else "执行超时"
+            error = "任务进程已失联，系统已自动标记失败"
+            with self._conn:
+                self._conn.execute(
+                    "UPDATE jobs SET status = 'failed', stage = ?, error = ?, finished_at = ?, "
+                    "heartbeat_at = ? WHERE id = ?",
+                    (stage, error, finished, finished, row["id"]),
+                )
+                if row["round_id"] is not None:
+                    self._conn.execute(
+                        "UPDATE rounds SET status = 'failed', finished_at = ?, error = ? "
+                        "WHERE id = ? AND status IN ('pending', 'running')",
+                        (finished, error, row["round_id"]),
+                    )
+            stale.append(int(row["id"]))
+        return stale
+
+    def claim_job(
+        self, round_id: int, max_active: int | None = None, stale_minutes: int = 30
+    ) -> int:
         """Atomically create a job unless the round already has an active one."""
+        self.reconcile_stale_jobs(stale_minutes)
         try:
             self._conn.execute("BEGIN IMMEDIATE")
             if max_active is not None and max_active > 0:
@@ -2029,9 +2881,11 @@ class Database:
                 raise JobBusyError(
                     "\u8be5\u8f6e\u6b21\u5df2\u6709\u4efb\u52a1\u5728\u8fd0\u884c\uff0c\u8bf7\u7b49\u5f85\u7ed3\u675f\u6216\u5148\u91cd\u7f6e\u4efb\u52a1"
                 )
+            now = utc_now()
             cur = self._conn.execute(
-                "INSERT INTO jobs (round_id, status, stage, created_at) VALUES (?, 'pending', ?, ?)",
-                (round_id, "\u6392\u961f\u4e2d", utc_now()),
+                "INSERT INTO jobs (round_id, status, stage, created_at, heartbeat_at) "
+                "VALUES (?, 'pending', ?, ?, ?)",
+                (round_id, "\u6392\u961f\u4e2d", now, now),
             )
             self._conn.commit()
             return int(cur.lastrowid)
@@ -2046,9 +2900,31 @@ class Database:
         updates = {key: value for key, value in fields.items() if key in JOB_FIELDS}
         if not updates:
             return
+        updates.setdefault("heartbeat_at", utc_now())
         sets = ", ".join(f"{key} = ?" for key in updates)
         with self._conn:
             self._conn.execute(f"UPDATE jobs SET {sets} WHERE id = ?", [*updates.values(), job_id])
+
+    def cancel_job(self, job_id: int) -> dict[str, Any] | None:
+        job = self.get_job(job_id)
+        if not job:
+            return None
+        if job["status"] not in ("pending", "running"):
+            return job
+        finished = utc_now()
+        with self._conn:
+            self._conn.execute(
+                "UPDATE jobs SET status = 'failed', stage = '已取消', error = '任务已取消', "
+                "finished_at = ?, heartbeat_at = ? WHERE id = ?",
+                (finished, finished, job_id),
+            )
+            if job["round_id"] is not None:
+                self._conn.execute(
+                    "UPDATE rounds SET status = 'failed', finished_at = ?, error = '任务已取消' "
+                    "WHERE id = ? AND status IN ('pending', 'running')",
+                    (finished, job["round_id"]),
+                )
+        return self.get_job(job_id)
 
     def get_job(self, job_id: int) -> dict[str, Any] | None:
         row = self._conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
@@ -2060,6 +2936,18 @@ class Database:
         ).fetchone()
         return dict(row) if row else None
 
+    def latest_jobs_by_round(self) -> dict[int, dict[str, Any]]:
+        rows = self._conn.execute(
+            """
+            SELECT j.*
+            FROM jobs j
+            JOIN (
+                SELECT round_id, MAX(id) AS id FROM jobs GROUP BY round_id
+            ) latest ON latest.id = j.id
+            """
+        ).fetchall()
+        return {int(row["round_id"]): dict(row) for row in rows if row["round_id"] is not None}
+
     def latest_active_job(self) -> dict[str, Any] | None:
         row = self._conn.execute(
             "SELECT * FROM jobs WHERE status IN ('pending', 'running') "
@@ -2067,11 +2955,20 @@ class Database:
         ).fetchone()
         return dict(row) if row else None
 
-    def recent_api_calls(self, round_id: int, limit: int = 20) -> list[dict[str, Any]]:
-        rows = self._conn.execute(
-            "SELECT * FROM api_calls WHERE round_id = ? ORDER BY id DESC LIMIT ?",
-            (round_id, limit),
-        ).fetchall()
+    def recent_api_calls(
+        self, round_id: int, limit: int = 20, job_id: int | None = None
+    ) -> list[dict[str, Any]]:
+        if job_id is None:
+            rows = self._conn.execute(
+                "SELECT * FROM api_calls WHERE round_id = ? ORDER BY id DESC LIMIT ?",
+                (round_id, limit),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM api_calls WHERE round_id = ? AND job_id = ? "
+                "ORDER BY id DESC LIMIT ?",
+                (round_id, job_id, limit),
+            ).fetchall()
         return [dict(row) for row in rows]
 
     # ---- users / sessions / audit ----
@@ -2165,6 +3062,60 @@ class Database:
         sets = ", ".join(f"{key} = ?" for key in updates)
         with self._conn:
             self._conn.execute(f"UPDATE users SET {sets} WHERE id = ?", [*updates.values(), user_id])
+
+    def update_user_with_admin_guard(
+        self,
+        user_id: int,
+        role: str | None = None,
+        disabled: bool | None = None,
+        can_collect: bool | None = None,
+    ) -> None:
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            target = self._conn.execute(
+                "SELECT * FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+            if not target:
+                raise ValueError("用户不存在")
+            removes_admin = target["role"] == "admin" and (
+                bool(disabled) or (role is not None and role != "admin")
+            )
+            if removes_admin:
+                count = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND disabled = 0"
+                ).fetchone()["n"]
+                if int(count) <= 1:
+                    raise ValueError("至少保留一个可用管理员")
+            updates: dict[str, Any] = {"updated_at": utc_now()}
+            if role is not None:
+                updates["role"] = role
+            if disabled is not None:
+                updates["disabled"] = 1 if disabled else 0
+            if can_collect is not None:
+                updates["can_collect"] = 1 if can_collect else 0
+            sets = ", ".join(f"{key} = ?" for key in updates)
+            self._conn.execute(
+                f"UPDATE users SET {sets} WHERE id = ?",
+                [*updates.values(), user_id],
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def prune_maintenance(self, audit_retention_days: int = 365) -> dict[str, int]:
+        now = utc_now()
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=max(1, int(audit_retention_days)))
+        ).isoformat(timespec="seconds")
+        with self._conn:
+            sessions = self._conn.execute(
+                "DELETE FROM sessions WHERE expires_at <= ?", (now,)
+            ).rowcount
+            audits = self._conn.execute(
+                "DELETE FROM audit_log WHERE ts < ?", (cutoff,)
+            ).rowcount
+        return {"sessions": max(0, sessions), "audit_log": max(0, audits)}
 
     def update_last_login(self, user_id: int) -> None:
         with self._conn:

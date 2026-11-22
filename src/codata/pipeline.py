@@ -84,9 +84,17 @@ class Pipeline:
         round_row = self.db.get_round(round_id)
         if not round_row:
             raise ValueError(f"轮次不存在: {round_id}")
-        job_id = job_id or self.db.claim_job(round_id, getattr(self.settings, "max_active_jobs", None))
+        job_id = job_id or self.db.claim_job(
+            round_id,
+            getattr(self.settings, "max_active_jobs", None),
+            getattr(self.settings, "job_stale_minutes", 30),
+        )
         if not self.db.get_job(job_id):
-            job_id = self.db.claim_job(round_id, getattr(self.settings, "max_active_jobs", None))
+            job_id = self.db.claim_job(
+                round_id,
+                getattr(self.settings, "max_active_jobs", None),
+                getattr(self.settings, "job_stale_minutes", 30),
+            )
         self._active_job_id = job_id
 
         self.db.update_round(round_id, status="running", started_at=utc_now(), error=None)
@@ -117,6 +125,12 @@ class Pipeline:
         finally:
             self.close()
         return summary
+
+    def _check_active(self, job_id: int) -> None:
+        job = self.db.get_job(job_id)
+        if not job or job.get("status") not in ("pending", "running"):
+            raise RuntimeError("任务已取消或已停止")
+        self.db.update_job(job_id, heartbeat_at=utc_now())
 
     def _provider_candidates(self, platform: str, requested: str) -> list[Provider]:
         if self.api is not None:
@@ -190,6 +204,7 @@ class Pipeline:
             keyword_pages = int(row.get("pages") or pages)
             search_state: dict[str, str] = {}
             for page in range(1, keyword_pages + 1):
+                self._check_active(job_id)
                 response = self._call(
                     round_id,
                     platform,
@@ -206,7 +221,10 @@ class Pipeline:
                     raise ProviderError(None, "搜索适配器返回了无效响应")
                 items = response.items
                 if response.state:
-                    search_state = {**search_state, **response.state}
+                    search_state = {
+                        **search_state,
+                        **{key: value for key, value in response.state.items() if value},
+                    }
                 for rank, item in enumerate(items, 1):
                     note, author = provider.normalize_search(item)
                     if not note.get("note_id"):
@@ -226,6 +244,8 @@ class Pipeline:
                 done += 1
                 self.db.update_job(job_id, progress_done=done)
                 print(f"[search] {word} 第 {page} 页: {len(items)} 条")
+                if response.has_more is False or not items:
+                    break
 
         stats = self.db.round_author_stats(round_id)
         to_fetch: list[dict[str, Any]] = []
@@ -248,6 +268,7 @@ class Pipeline:
 
         enriched = 0
         for entry in to_fetch:
+            self._check_active(job_id)
             platform_code = entry["platform"]
             user_id = entry["user_id"]
             profile_url = entry.get("profile_url") or ""
@@ -283,7 +304,7 @@ class Pipeline:
             status="done",
             finished_at=utc_now(),
             cost_tokens=round_cost,
-            provider=provider.provider_id,
+            provider=provider.provider_id if requested not in {"auto", "cheapest", "default"} else requested,
         )
         self.db.update_job(
             job_id,

@@ -11,8 +11,9 @@ import { useRound } from "@/shared/round-context";
 import { APP_VERSION, BUILD_TIME } from "@/shared/version";
 import type { Balance, PlatformProviderPrice, ProviderSettings } from "@/shared/types";
 import { ErrorState, Page, PageHeader, Section } from "@/components/page";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card } from "@/components/ui/card";
 import {
   Dialog,
   DialogContent,
@@ -46,13 +47,22 @@ const UPDATED_AT = new Date(BUILD_TIME).toLocaleString("zh-CN", {
   hour12: false,
 });
 
+function formatCny(value: string) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return value;
+  return amount.toLocaleString("zh-CN", { maximumFractionDigits: 4 });
+}
+
 export function SettingsPage() {
   const { user } = useAuth();
   const isAdmin = user?.role === "admin";
   const { counts } = useRound();
   const [searchParams, setSearchParams] = useSearchParams();
   const requestedTab = searchParams.get("tab");
-  const tab: SettingsTab = SETTINGS_TABS.includes(requestedTab as SettingsTab)
+  const availableTabs: readonly SettingsTab[] = isAdmin
+    ? SETTINGS_TABS
+    : SETTINGS_TABS.filter((item) => item !== "storage");
+  const tab: SettingsTab = availableTabs.includes(requestedTab as SettingsTab)
     ? (requestedTab as SettingsTab)
     : "connection";
   const setTab = (next: string) => {
@@ -241,13 +251,6 @@ export function SettingsPage() {
       platformPrices.set(option.id, entries);
     }
   }
-  const priceColumns = [
-    { code: "xhs", label: "小红书单价" },
-    { code: "douyin", label: "抖音单价" },
-    { code: "bilibili", label: "B站单价" },
-    { code: "zhihu", label: "知乎单价" },
-    { code: "instagram", label: "Instagram单价" },
-  ];
   const priceFor = (providerId: string, code: string) =>
     platformPrices.get(providerId)?.find((entry) => entry.code === code)?.price;
   const outputDir = settings.output_dir.replace(/[\\/]+$/, "");
@@ -260,6 +263,7 @@ export function SettingsPage() {
     { label: "关键词", value: counts?.keywords ?? 0 },
     { label: "笔记", value: counts?.notes ?? 0 },
     { label: "达人", value: counts?.creators ?? 0 },
+    { label: "线索", value: counts?.leads ?? 0 },
     { label: "达人-轮次", value: counts?.creator_rounds ?? 0 },
   ];
 
@@ -276,18 +280,16 @@ export function SettingsPage() {
         </div>
       ) : null}
 
-      <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5">
-        {metrics.map((item) => (
-          <Card key={item.label} size="sm">
-            <CardHeader className="gap-1">
-              <CardTitle className="text-sm font-normal text-muted-foreground">{item.label}</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <p className="text-xl font-semibold tabular-nums">{item.value.toLocaleString("zh-CN")}</p>
-            </CardContent>
-          </Card>
-        ))}
-      </div>
+      <Card className="py-0">
+        <div className="grid grid-cols-2 gap-px bg-border sm:grid-cols-3 xl:grid-cols-6">
+          {metrics.map((item) => (
+            <div key={item.label} className="min-w-0 bg-card px-4 py-3">
+              <p className="text-xs text-muted-foreground">{item.label}</p>
+              <p className="mt-1 text-xl leading-none font-semibold tabular-nums">{fmtNumber(item.value)}</p>
+            </div>
+          ))}
+        </div>
+      </Card>
 
       <Tabs value={tab} onValueChange={setTab} className="flex flex-1 flex-col">
         <TabsList>
@@ -302,16 +304,17 @@ export function SettingsPage() {
             description="集中管理所有采集接口、令牌和计价；令牌保存后立即生效。"
             contentClassName="px-0"
           >
-            <Table className="min-w-[1340px] table-fixed">
+            <Table className="min-w-[1080px] table-fixed">
               <TableHeader>
                 <TableRow>
-                  <TableHead className="w-[150px]">服务商</TableHead>
-                  <TableHead className="w-[220px]">接口地址</TableHead>
-                  <TableHead className="w-[190px]">访问令牌</TableHead>
-                  {priceColumns.map((column) => (
-                    <TableHead key={column.code} className="w-[140px]">{column.label}</TableHead>
+                  <TableHead className="w-[240px]">服务商</TableHead>
+                  <TableHead className="w-[170px]">访问令牌</TableHead>
+                  {settings.platforms.map((platform) => (
+                    <TableHead key={platform.code} className="w-[110px] px-2 text-center">
+                      {platform.label}
+                    </TableHead>
                   ))}
-                  <TableHead className="w-[150px] text-right">接口余额</TableHead>
+                  <TableHead className="w-[120px] text-right">余额</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -324,30 +327,38 @@ export function SettingsPage() {
                   return (
                     <TableRow key={provider.id}>
                       <TableCell>
-                        <div className="font-medium">{provider.label}</div>
-                        <div className="text-xs text-muted-foreground">
-                          {provider.id === "dataflow" ? "主服务商" : provider.id === "rnote" ? "备用服务商" : "备用服务商"}
+                        <div className="flex items-center gap-2">
+                          <span className="font-medium">{provider.label}</span>
+                          {provider.id === "dataflow" ? (
+                            <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">主</span>
+                          ) : null}
                         </div>
-                      </TableCell>
-                      <TableCell className="truncate font-mono text-xs" title={provider.host}>
                         {provider.host ? (
                           <a
                             href={provider.host}
                             target="_blank"
                             rel="noreferrer"
-                            className="underline-offset-4 hover:underline"
+                            title={provider.host}
+                            className="mt-0.5 block max-w-[210px] truncate font-mono text-[11px] text-muted-foreground underline-offset-4 hover:underline"
                           >
-                            {provider.host}
+                            {provider.host.replace(/^https?:\/\//, "")}
                           </a>
                         ) : (
-                          "未配置"
+                          <span className="text-xs text-muted-foreground">未配置地址</span>
                         )}
                       </TableCell>
                       <TableCell>
                         <div className="flex items-center justify-start gap-2">
-                          <span className="text-xs text-muted-foreground">
+                          <Badge
+                            variant="outline"
+                            className={
+                              provider.token_configured
+                                ? "border-emerald-200 bg-emerald-50 font-normal text-emerald-700"
+                                : "font-normal text-muted-foreground"
+                            }
+                          >
                             {provider.token_configured ? "已配置" : "未配置"}
-                          </span>
+                          </Badge>
                           {isAdmin ? (
                             <Button
                               type="button"
@@ -362,26 +373,31 @@ export function SettingsPage() {
                           ) : null}
                         </div>
                       </TableCell>
-                      {priceColumns.map((column) => {
-                        const price = priceFor(provider.id, column.code);
+                      {settings.platforms.map((platform) => {
+                        const price = priceFor(provider.id, platform.code);
                         return (
-                          <TableCell key={column.code} className="text-xs">
+                          <TableCell key={platform.code} className="px-2 text-center">
                             {price ? (
                               <div className="space-y-0.5">
-                                <div>{price.search_cost_native} {price.search_currency}</div>
-                                <div className="text-[10px] text-muted-foreground">
-                                  ≈ {price.search_cost_tokens}t / ¥{price.search_cost_cny}
+                                <div className="text-xs whitespace-nowrap tabular-nums">
+                                  {price.search_cost_native} {price.search_currency}
+                                </div>
+                                <div
+                                  className="text-[10px] whitespace-nowrap tabular-nums text-muted-foreground"
+                                  title={`≈ ${fmtNumber(price.search_cost_tokens)} token`}
+                                >
+                                  ≈¥{formatCny(price.search_cost_cny)}
                                 </div>
                               </div>
                             ) : (
-                              <span className="text-muted-foreground">—</span>
+                              <span className="text-xs text-muted-foreground">—</span>
                             )}
                           </TableCell>
                         );
                       })}
                       <TableCell className="text-right">
                         {!provider.token_configured ? (
-                          <span className="text-xs text-muted-foreground">未配置</span>
+                          <span className="text-xs text-muted-foreground">—</span>
                         ) : provider.id === "dataflow" ? (
                           <div className="flex items-center justify-end gap-2">
                             {balanceError ? (
@@ -486,7 +502,7 @@ export function SettingsPage() {
           </Section>
         </TabsContent>
 
-        <TabsContent value="storage" className="space-y-8 pt-6">
+        {isAdmin ? <TabsContent value="storage" className="space-y-8 pt-6">
           <Section title="数据与路径" description="所有采集数据默认保存在项目 data 目录。" contentClassName="px-0">
             <Table className="min-w-[640px] table-fixed">
               <TableHeader>
@@ -507,7 +523,7 @@ export function SettingsPage() {
               SQLite 使用 WAL 与安全写入，无需手动维护。建议定期备份 codata.sqlite；原始响应与运行日志可按需清理，迁移或换机时复制整个 data 目录即可。
             </p>
           </Section>
-        </TabsContent>
+        </TabsContent> : null}
 
         <TabsContent value="about" className="flex flex-1 flex-col pt-6">
           <div className="flex flex-1 flex-col">

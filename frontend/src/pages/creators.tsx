@@ -9,11 +9,13 @@ import {
   Download,
   RotateCw,
   SlidersHorizontal,
+  UserCheck,
   X,
 } from "lucide-react";
 import { toast } from "sonner";
 import { api, exportUrl } from "@/shared/api";
-import { fmtNumber, shorten } from "@/shared/format";
+import { fmtNumber, safeHttpUrl, shorten } from "@/shared/format";
+import { useAuth } from "@/shared/auth-context";
 import { useRound } from "@/shared/round-context";
 import type { Creator, CreatorQuery } from "@/shared/types";
 import { EmptyState, ErrorState, Page, PageHeader, Section } from "@/components/page";
@@ -79,7 +81,7 @@ const ALL_COLUMNS = [
   ["data_round", "数据轮次"],
   ["source_keywords", "命中关键词"],
   ["source", "数据来源"],
-  ["executor", "执行者"],
+  ["owner_username", "经手人"],
   ["platform_label", "平台"],
   ["cooperation_platform", "合作主平台"],
   ["raw_title", "原始标题"],
@@ -98,6 +100,7 @@ const CORE_COLUMNS = new Set([
   "posted",
   "liked",
   "interaction",
+  "owner_username",
 ]);
 
 const TOGGLE_COLUMNS = ALL_COLUMNS.filter(([key]) => key !== "nickname");
@@ -139,7 +142,8 @@ function facetOptions(items: { value: string; count: number }[] | undefined) {
 }
 
 export function CreatorsPage() {
-  const { meta, rounds, refreshRounds, loading } = useRound();
+  const { user } = useAuth();
+  const { meta, rounds, refreshRounds, loading, error: bootstrapError } = useRound();
   const queryClient = useQueryClient();
   const [params, setParams] = useSearchParams();
   const statuses = meta?.statuses ?? [];
@@ -150,7 +154,7 @@ export function CreatorsPage() {
     const parsed = value ? Number(value) : NaN;
     return value && value !== "all" && Number.isFinite(parsed) ? parsed : null;
   });
-  const [platform, setPlatform] = useState(params.get("platform") ?? "");
+  const [platform, setPlatform] = useState(params.get("platform") ?? "xhs");
   const [page, setPage] = useState(() => {
     const value = Number(params.get("page") ?? 1);
     return Number.isFinite(value) && value > 0 ? Math.floor(value) : 1;
@@ -165,6 +169,7 @@ export function CreatorsPage() {
   const [tierFilter, setTierFilter] = useState<string[]>(params.get("tier")?.split(",").filter(Boolean) ?? []);
   const [directionFilter, setDirectionFilter] = useState<string[]>(params.get("direction")?.split(",").filter(Boolean) ?? []);
   const [sourceFilter, setSourceFilter] = useState<string[]>(params.get("source")?.split(",").filter(Boolean) ?? []);
+  const [ownerFilter, setOwnerFilter] = useState(params.get("owner") ?? "");
   const [minFans, setMinFans] = useState(params.get("min_fans") ?? "");
   const [maxFans, setMaxFans] = useState(params.get("max_fans") ?? "");
   const [onlyUnenriched, setOnlyUnenriched] = useState(params.get("only_unenriched") === "true");
@@ -217,6 +222,7 @@ export function CreatorsPage() {
     if (tierFilter.length) next.set("tier", tierFilter.join(","));
     if (directionFilter.length) next.set("direction", directionFilter.join(","));
     if (sourceFilter.length) next.set("source", sourceFilter.join(","));
+    if (ownerFilter) next.set("owner", ownerFilter);
     if (minFans) next.set("min_fans", minFans);
     if (maxFans) next.set("max_fans", maxFans);
     if (onlyUnenriched) next.set("only_unenriched", "true");
@@ -229,22 +235,22 @@ export function CreatorsPage() {
     setParams(next, { replace: true });
   }, [
     roundFilter, platform, page, pageSize, debouncedSearch, statusFilter, tierFilter,
-    directionFilter, sourceFilter, minFans, maxFans, onlyUnenriched, sort, order,
+    directionFilter, sourceFilter, ownerFilter, minFans, maxFans, onlyUnenriched, sort, order,
     detailKey, detailRoundParam, setParams,
   ]);
 
   useEffect(() => {
     setPage(1);
     setSelected({});
-  }, [roundFilter, platform, debouncedSearch, statusFilter, tierFilter, directionFilter, sourceFilter, minFans, maxFans, onlyUnenriched]);
+  }, [roundFilter, platform, debouncedSearch, statusFilter, tierFilter, directionFilter, sourceFilter, ownerFilter, minFans, maxFans, onlyUnenriched]);
 
   const creatorQuery: CreatorQuery = useMemo(
     () => ({
       platform, page, page_size: pageSize, search: debouncedSearch,
       statuses: statusFilter, tiers: tierFilter, directions: directionFilter, sources: sourceFilter,
-      min_fans: minFans, max_fans: maxFans, only_unenriched: onlyUnenriched, sort, order,
+      owner: ownerFilter, min_fans: minFans, max_fans: maxFans, only_unenriched: onlyUnenriched, sort, order,
     }),
-    [platform, page, pageSize, debouncedSearch, statusFilter, tierFilter, directionFilter, sourceFilter, minFans, maxFans, onlyUnenriched, sort, order],
+    [platform, page, pageSize, debouncedSearch, statusFilter, tierFilter, directionFilter, sourceFilter, ownerFilter, minFans, maxFans, onlyUnenriched, sort, order],
   );
 
   const creatorsQuery = useQuery({
@@ -264,13 +270,15 @@ export function CreatorsPage() {
         groups.set(targetRound, rows);
       }
       const results = await Promise.all(
-        [...groups.entries()].map(([targetRound, items]) =>
-          api.batchUpdate(targetRound, {
-            items,
-            status: batchStatus === "none" ? null : batchStatus,
-            match_direction: batchDirection || null,
-            remark: batchRemark || null,
-          }),
+        [...groups.entries()].flatMap(([targetRound, items]) =>
+          chunk(items).map((part) =>
+            api.batchUpdate(targetRound, {
+              items: part,
+              status: batchStatus === "none" ? null : batchStatus,
+              match_direction: batchDirection || null,
+              remark: batchRemark || null,
+            }),
+          ),
         ),
       );
       return { changed: results.reduce((sum, item) => sum + item.changed, 0) };
@@ -306,12 +314,53 @@ export function CreatorsPage() {
     onError: (error) => toast.error(error instanceof Error ? error.message : "状态更新失败"),
   });
 
+  const claimMutation = useMutation({
+    mutationFn: async () => {
+      const groups = new Map<number, { platform: string; user_id: string }[]>();
+      for (const item of Object.values(selected)) {
+        const targetRound = item.round_id ?? roundFilter ?? rounds[0]?.id;
+        if (targetRound == null) continue;
+        const rows = groups.get(targetRound) ?? [];
+        rows.push({ platform: item.platform, user_id: item.user_id });
+        groups.set(targetRound, rows);
+      }
+      const results = await Promise.all(
+        [...groups.entries()].flatMap(([targetRound, items]) =>
+          chunk(items).map((part) => api.claimCreators(targetRound, part)),
+        ),
+      );
+      return results.reduce(
+        (acc, item) => ({
+          claimed: acc.claimed + item.claimed,
+          already_mine: acc.already_mine + item.already_mine,
+          skipped: acc.skipped + item.skipped,
+          missing: acc.missing + item.missing,
+        }),
+        { claimed: 0, already_mine: 0, skipped: 0, missing: 0 },
+      );
+    },
+    onSuccess: async (result) => {
+      const parts = [`已认领 ${result.claimed} 位`];
+      if (result.already_mine > 0) parts.push(`${result.already_mine} 位已在你名下`);
+      if (result.skipped > 0) parts.push(`${result.skipped} 位已被其他成员认领`);
+      if (result.missing > 0) parts.push(`${result.missing} 位不存在`);
+      if (result.claimed > 0) toast.success(parts.join("，"));
+      else toast.warning(parts.join("，"));
+      setSelected({});
+      await queryClient.invalidateQueries({ queryKey: ["creators"] });
+      await queryClient.invalidateQueries({ queryKey: ["facets"] });
+      await queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+    },
+    onError: (error) => toast.error(error instanceof Error ? error.message : "认领失败"),
+  });
+
   const clearFilters = () => {
     setSearch("");
     setStatusFilter([]);
     setTierFilter([]);
     setDirectionFilter([]);
     setSourceFilter([]);
+    setOwnerFilter("");
     setMinFans("");
     setMaxFans("");
     setOnlyUnenriched(false);
@@ -327,16 +376,29 @@ export function CreatorsPage() {
   const total = creatorsQuery.data?.total ?? 0;
   const items = (creatorsQuery.data?.items ?? []) as CreatorRow[];
   const selectedCount = Object.values(selected).length;
+  const batchHasChanges =
+    batchStatus !== "none" || Boolean(batchDirection.trim()) || Boolean(batchRemark.trim());
   const advancedFilterCount =
     directionFilter.length + sourceFilter.length +
     (minFans ? 1 : 0) + (maxFans ? 1 : 0) + (onlyUnenriched ? 1 : 0);
   const activeFilters =
     statusFilter.length + tierFilter.length + advancedFilterCount +
-    (debouncedSearch ? 1 : 0);
+    (debouncedSearch ? 1 : 0) + (ownerFilter ? 1 : 0);
   const platformTabs = facetsQuery.data?.platforms ?? [];
   const visibleKeys = ALL_COLUMNS.filter(([key]) => key === "nickname" || visibleColumns[key] !== false).map(([key]) => key);
   const pageAllSelected = items.length > 0 && items.every((item) => Boolean(selected[item.key]));
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  useEffect(() => {
+    if (page > totalPages) setPage(totalPages);
+  }, [page, totalPages]);
+  const ownerFilterLabel =
+    ownerFilter === "unassigned"
+      ? "未认领"
+      : ownerFilter && ownerFilter === String(user?.id)
+        ? "我认领的"
+        : ownerFilter
+          ? `用户 ${ownerFilter}`
+          : "";
 
   const togglePageSelection = () => {
     setSelected((current) => {
@@ -382,11 +444,18 @@ export function CreatorsPage() {
       case "remark": return shorten(item.remark, 36) || "—";
       case "tags": return shorten(item.tags, 36) || "—";
       case "account_id": return <span className="font-mono text-xs">{item.account_id || "—"}</span>;
-      case "profile_url": return item.profile_url ? <a className="underline underline-offset-4" href={item.profile_url} target="_blank" rel="noreferrer">打开</a> : "—";
+      case "profile_url": return safeHttpUrl(item.profile_url) ? <a className="underline underline-offset-4" href={safeHttpUrl(item.profile_url)} target="_blank" rel="noreferrer">打开</a> : "—";
       case "data_round": return item.data_round || "—";
       case "source_keywords": return shorten(item.source_keywords.join("、"), 48) || "—";
       case "source": return item.source || "—";
-      case "executor": return item.executor || "—";
+      case "owner_username": return item.owner_username ? (
+        <span>
+          {item.owner_username}
+          {item.owner_user_id === user?.id ? "（我）" : ""}
+        </span>
+      ) : (
+        <span className="text-muted-foreground">{item.owner_user_id ? "未知用户" : "未认领"}</span>
+      );
       case "platform_label": return item.platform_label || "—";
       case "cooperation_platform": return item.cooperation_platform || "—";
       case "raw_title": return shorten(item.raw_title, 48) || "—";
@@ -406,6 +475,15 @@ export function CreatorsPage() {
     );
   }
 
+  if (bootstrapError) {
+    return (
+      <Page>
+        <PageHeader title="达人库" />
+        <ErrorState message={bootstrapError} />
+      </Page>
+    );
+  }
+
   if (rounds.length === 0) {
     return (
       <Page>
@@ -413,7 +491,7 @@ export function CreatorsPage() {
         <EmptyState
           title="还没有采集轮次"
           description="新建一轮采集，再进入达人筛选。"
-          actions={<Button asChild><Link to="/new">新建采集</Link></Button>}
+          actions={user?.role === "admin" || user?.can_collect ? <Button asChild><Link to="/new">新建采集</Link></Button> : undefined}
         />
       </Page>
     );
@@ -455,8 +533,15 @@ export function CreatorsPage() {
                 ))}
               </SelectContent>
             </Select>
-            <Button variant="outline" onClick={() => void creatorsQuery.refetch()} disabled={creatorsQuery.isFetching}>
-              <RotateCw className={creatorsQuery.isFetching ? "animate-spin" : undefined} />
+            <Button
+              variant="outline"
+              onClick={() => {
+                void facetsQuery.refetch();
+                void creatorsQuery.refetch();
+              }}
+              disabled={creatorsQuery.isFetching || facetsQuery.isFetching}
+            >
+              <RotateCw className={creatorsQuery.isFetching || facetsQuery.isFetching ? "animate-spin" : undefined} />
               刷新
             </Button>
           </>
@@ -488,7 +573,7 @@ export function CreatorsPage() {
         }
       >
         <div className="space-y-4">
-          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
             <div className="space-y-2">
               <Label htmlFor="creator-search">搜索</Label>
               <Input
@@ -498,7 +583,7 @@ export function CreatorsPage() {
                 spellCheck={false}
                 value={search}
                 onChange={(event) => setSearch(event.target.value)}
-                placeholder="昵称、账号 ID、执行者或标题"
+                placeholder="昵称、账号 ID 或标题"
               />
             </div>
             <div className="space-y-2">
@@ -524,6 +609,20 @@ export function CreatorsPage() {
                 searchPlaceholder="搜索层级…"
                 emptyText="暂无层级"
               />
+            </div>
+            <div className="space-y-2">
+              <Label>经手人</Label>
+              <Select
+                value={ownerFilter || "all"}
+                onValueChange={(value) => setOwnerFilter(value === "all" ? "" : value)}
+              >
+                <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">全部经手人</SelectItem>
+                  {user ? <SelectItem value={String(user.id)}>我认领的</SelectItem> : null}
+                  <SelectItem value="unassigned">未认领</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
             <div className="space-y-2">
               <Label>排序</Label>
@@ -606,6 +705,9 @@ export function CreatorsPage() {
               {sourceFilter.length > 0 ? (
                 <FilterChip label={`来源：${summarize(sourceFilter)}`} onRemove={() => setSourceFilter([])} />
               ) : null}
+              {ownerFilter ? (
+                <FilterChip label={`经手人：${ownerFilterLabel}`} onRemove={() => setOwnerFilter("")} />
+              ) : null}
               {minFans ? <FilterChip label={`粉丝 ≥ ${minFans}`} onRemove={() => setMinFans("")} /> : null}
               {maxFans ? <FilterChip label={`粉丝 ≤ ${maxFans}`} onRemove={() => setMaxFans("")} /> : null}
               {onlyUnenriched ? <FilterChip label="只看未补全" onRemove={() => setOnlyUnenriched(false)} /> : null}
@@ -674,6 +776,10 @@ export function CreatorsPage() {
             {selectedCount > 0 ? (
               <>
                 <span className="text-sm text-muted-foreground">已选 {selectedCount} 位</span>
+                <Button size="sm" variant="outline" onClick={() => claimMutation.mutate()} disabled={claimMutation.isPending}>
+                  <UserCheck />
+                  {claimMutation.isPending ? "认领中…" : "认领所选"}
+                </Button>
                 <Button size="sm" onClick={() => setBatchOpen(true)}>批量修改</Button>
                 <Button variant="ghost" size="sm" onClick={() => setSelected({})}>取消选择</Button>
               </>
@@ -764,7 +870,7 @@ export function CreatorsPage() {
               </p>
               <div className="flex items-center gap-2">
                 <Select value={String(pageSize)} onValueChange={(value) => { setPageSize(Number(value)); setPage(1); }}>
-                  <SelectTrigger className="h-8 w-[100px]"><SelectValue /></SelectTrigger>
+                  <SelectTrigger className="h-8 w-[100px]" aria-label="每页条数"><SelectValue /></SelectTrigger>
                   <SelectContent>
                     {[25, 50, 100, 200].map((size) => <SelectItem key={size} value={String(size)}>{size} / 页</SelectItem>)}
                   </SelectContent>
@@ -810,7 +916,7 @@ export function CreatorsPage() {
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setBatchOpen(false)}>取消</Button>
-            <Button onClick={() => batchMutation.mutate()} disabled={batchMutation.isPending}>
+            <Button onClick={() => batchMutation.mutate()} disabled={batchMutation.isPending || !batchHasChanges}>
               {batchMutation.isPending ? "应用中…" : "应用修改"}
             </Button>
           </DialogFooter>
@@ -857,7 +963,7 @@ function InlineStatusSelect({
       <SelectTrigger
         size="sm"
         className="h-7 w-auto max-w-[130px] border-0 bg-transparent px-0.5 shadow-none hover:bg-muted/60 focus-visible:ring-2"
-        aria-label={`?? ${item.nickname || item.key} ?????`}
+        aria-label={`更改 ${item.nickname || item.key} 的采用状态`}
       >
         <StatusBadge status={item.status} label={item.status_label} />
       </SelectTrigger>
@@ -870,6 +976,14 @@ function InlineStatusSelect({
       </SelectContent>
     </Select>
   );
+}
+
+function chunk<T>(items: T[], size = 500): T[][] {
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
 }
 
 function summarize(values: string[], labels?: Map<string, string>) {

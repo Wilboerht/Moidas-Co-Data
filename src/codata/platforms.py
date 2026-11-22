@@ -281,11 +281,10 @@ def load_registry(
         os.getenv("CODATA_PLATFORMS_FILE", str(PROJECT_ROOT / "config" / "platforms.json"))
     )
     data = _read_config(config_path)
-    billing = data.get("billing") if isinstance(data.get("billing"), dict) else {}
-    token_cny = _decimal(billing.get("token_cny", settings.token_cny), "billing.token_cny")
-    usd_cny = _decimal(billing.get("usd_cny", settings.usd_cny), "billing.usd_cny")
+    token_cny = _decimal(settings.token_cny, "CODATA_TOKEN_CNY")
+    usd_cny = _decimal(settings.usd_cny, "CODATA_USD_CNY")
     if token_cny <= 0:
-        raise PlatformConfigError("billing.token_cny 必须大于 0")
+        raise PlatformConfigError("CODATA_TOKEN_CNY 必须大于 0")
 
     providers_raw = data.get("providers") if isinstance(data.get("providers"), dict) else {}
     providers: dict[str, ProviderRuntime] = {}

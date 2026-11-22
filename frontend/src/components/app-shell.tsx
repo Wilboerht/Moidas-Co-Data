@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
 import {
   LayoutDashboard,
+  ContactRound,
   ListChecks,
   Settings,
   Tags,
@@ -38,6 +39,7 @@ import { APP_VERSION } from "@/shared/version";
 const NAV_ITEMS = [
   { href: "/", label: "工作台", icon: LayoutDashboard },
   { href: "/creators", label: "达人库", icon: Users },
+  { href: "/leads", label: "线索库", icon: ContactRound },
   { href: "/tasks", label: "采集任务", icon: ListChecks },
   { href: "/keywords", label: "关键词", icon: Tags },
 ];
@@ -56,6 +58,7 @@ const TITLES: Record<string, string> = {
   "/users": "用户管理",
   "/": "工作台",
   "/creators": "达人库",
+  "/leads": "线索库",
   "/new": "新建采集",
   "/tasks": "采集任务",
   "/keywords": "关键词",

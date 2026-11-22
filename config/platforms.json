@@ -1,8 +1,4 @@
 {
-  "billing": {
-    "token_cny": "0.001",
-    "usd_cny": "7.2"
-  },
   "providers": {
     "dataflow": {
       "label": "DataFlow",

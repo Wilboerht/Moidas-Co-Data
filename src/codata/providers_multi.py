@@ -54,6 +54,15 @@ def _items(payload: Any) -> list[dict[str, Any]]:
     return []
 
 
+def _has_more(payload: Any) -> bool | None:
+    value = _find(payload, ("hasMore", "has_more", "hasNext", "has_next"))
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes"}
+    return bool(value)
+
+
 class JsonProvider(Provider):
     adapter = ""
     supports_balance = False
@@ -124,6 +133,7 @@ class EveryInfraProvider(JsonProvider):
             payload=payload,
             items=_items(payload),
             state={"page_token": str(next_token)} if next_token else {},
+            has_more=bool(next_token),
         )
 
     def search_users(self, keyword: str) -> SearchResponse:
@@ -178,6 +188,7 @@ class TikHubProvider(JsonProvider):
                     "search_id": str(_find(payload, ("search_id",)) or ""),
                     "search_session_id": str(_find(payload, ("search_session_id",)) or ""),
                 },
+                has_more=_has_more(payload),
             )
         body = {
             "keyword": keyword,
@@ -202,6 +213,7 @@ class TikHubProvider(JsonProvider):
                 "search_id": str(_find(payload, ("search_id",)) or ""),
                 "backtrace": str(_find(payload, ("backtrace",)) or ""),
             },
+            has_more=_has_more(payload),
         )
 
     def user(self, user_id: str, profile_url: str = "") -> Any:
@@ -241,6 +253,7 @@ class JustOneAPIProvider(JsonProvider):
             payload=payload,
             items=_items(payload),
             state={"searchId": str(_find(payload, ("searchId", "search_id")) or "")},
+            has_more=_has_more(payload),
         )
 
     def user(self, user_id: str, profile_url: str = "") -> Any:
@@ -268,6 +281,7 @@ class SocialDataXProvider(JsonProvider):
             payload=payload,
             items=_items(payload),
             state={"page_token": str(token)} if token else {},
+            has_more=bool(token),
         )
 
     def user(self, user_id: str, profile_url: str = "") -> Any:
@@ -303,6 +317,7 @@ class RedFoxProvider(JsonProvider):
             payload=payload,
             items=_items(payload),
             state={"offset": str(offset + 20)} if has_more not in (False, 0, "0") else {},
+            has_more=has_more not in (False, 0, "0"),
         )
 
     def user(self, user_id: str, profile_url: str = "") -> Any:

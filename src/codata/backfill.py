@@ -4,6 +4,7 @@ import argparse
 import json
 import re
 import sys
+import time
 from typing import Any
 
 from .config import load_settings
@@ -116,7 +117,24 @@ def main(argv: list[str] | None = None) -> None:
                     print(f"[{index}/{len(candidates)}] {imported_id}: 无昵称，跳过")
                     continue
                 try:
+                    started = time.perf_counter()
                     result = provider.search_users(nickname)
+                    duration_ms = int((time.perf_counter() - started) * 1000)
+                    search_price = provider.search_price
+                    db.log_api_call(
+                        None,
+                        args.platform,
+                        "search_users",
+                        {"keyword": nickname},
+                        None,
+                        200,
+                        provider.search_cost_tokens,
+                        duration_ms,
+                        path=provider.search_path,
+                        provider=provider.provider_id,
+                        cost_native=float(search_price.amount) if search_price else 0.0,
+                        cost_currency=search_price.currency if search_price else "token",
+                    )
                     selected, note = choose_exact(result.items, nickname)
                     if selected is None:
                         db.record_backfill_attempt(
@@ -141,7 +159,24 @@ def main(argv: list[str] | None = None) -> None:
                         skipped += 1
                         print(f"[{index}/{len(candidates)}] {nickname}: 匹配结果无 ID，跳过")
                         continue
+                    started = time.perf_counter()
                     payload = provider.user(real_id)
+                    duration_ms = int((time.perf_counter() - started) * 1000)
+                    user_price = provider.user_price
+                    db.log_api_call(
+                        None,
+                        args.platform,
+                        "user",
+                        {"userId": real_id},
+                        None,
+                        200,
+                        provider.user_cost_tokens,
+                        duration_ms,
+                        path=provider.user_path,
+                        provider=provider.provider_id,
+                        cost_native=float(user_price.amount) if user_price else 0.0,
+                        cost_currency=user_price.currency if user_price else "token",
+                    )
                     creator = provider.normalize_user(payload, real_id)
                     db.enrich_imported_creator(
                         args.platform,
