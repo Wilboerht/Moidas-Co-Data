@@ -45,7 +45,7 @@ def validate_password(password: str) -> str:
 def hash_password(password: str, validate: bool = True) -> str:
     value = validate_password(password) if validate else (password or "")
     if not value:
-        raise ValueError("??????")
+        raise ValueError("密码不能为空")
     salt = secrets.token_bytes(16)
     digest = hashlib.scrypt(
         value.encode("utf-8"),

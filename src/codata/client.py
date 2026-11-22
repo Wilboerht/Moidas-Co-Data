@@ -74,7 +74,7 @@ def _same_host_request(
         if not location:
             raise ProviderError(
                 response.status_code,
-                "??????????? Location",
+                "服务商返回重定向但缺少 Location",
                 provider=provider_id,
                 status=response.status_code,
             )
@@ -82,14 +82,14 @@ def _same_host_request(
         if target.scheme != "https" and target.host not in {"127.0.0.1", "localhost", "::1"}:
             raise ProviderError(
                 response.status_code,
-                f"???????? HTTPS ??????: {target}",
+                f"服务商重定向到非 HTTPS 地址，已拒绝: {target}",
                 provider=provider_id,
                 status=response.status_code,
             )
         if allowed and (target.host or "").lower() not in allowed:
             raise ProviderError(
                 response.status_code,
-                f"????????????????: {target}",
+                f"服务商重定向到非允许域名，已拒绝: {target}",
                 provider=provider_id,
                 status=response.status_code,
             )
@@ -99,7 +99,7 @@ def _same_host_request(
         current_params = None
     raise ProviderError(
         301,
-        "??????????????",
+        "服务商重定向次数过多，已拒绝",
         provider=provider_id,
         status=301,
     )
@@ -345,7 +345,7 @@ class JsonProviderClient:
         self.provider = provider
         base_url = provider.base_url
         if not base_url:
-            raise ProviderError(None, f"??? {provider.label} ??", provider=provider.id)
+            raise ProviderError(None, f"未配置 {provider.label} 地址", provider=provider.id)
         validate_provider_host(base_url, tuple(provider.allowed_hosts))
         headers = {"Accept": "application/json"}
         if provider.auth_header and provider.api_key:
@@ -418,14 +418,14 @@ class JsonProviderClient:
                 if response.status_code in FATAL_STATUS:
                     raise ProviderError(
                         response.status_code,
-                        f"???????: HTTP {response.status_code}",
+                        f"服务商拒绝请求: HTTP {response.status_code}",
                         provider=self.provider.id,
                         status=response.status_code,
                     )
                 if response.status_code in RETRYABLE_STATUS:
                     raise ProviderError(
                         response.status_code,
-                        f"????????: HTTP {response.status_code}",
+                        f"服务商暂时不可用: HTTP {response.status_code}",
                         provider=self.provider.id,
                         status=response.status_code,
                         retryable=True,
@@ -433,7 +433,7 @@ class JsonProviderClient:
                 if 400 <= response.status_code < 500:
                     raise ProviderError(
                         response.status_code,
-                        f"???????: HTTP {response.status_code}",
+                        f"服务商拒绝请求: HTTP {response.status_code}",
                         provider=self.provider.id,
                         status=response.status_code,
                     )
@@ -444,7 +444,7 @@ class JsonProviderClient:
                 if attempt < retries:
                     delay = _retry_delay(attempt, delay, response)
                     continue
-                raise ProviderError(None, f"????: {exc}", provider=self.provider.id) from exc
+                raise ProviderError(None, f"请求失败: {exc}", provider=self.provider.id) from exc
             except ProviderError as exc:
                 last_error = exc
                 if exc.retryable and attempt < retries:
@@ -461,12 +461,12 @@ class JsonProviderClient:
                     message = message or str(payload.get("message") or payload.get("msg") or error or "")
                 raise ProviderError(
                     int(code) if str(code).lstrip("-").isdigit() else response.status_code,
-                    message or "???????",
+                    message or "服务商返回失败",
                     payload,
                     provider=self.provider.id,
                     status=response.status_code,
                 )
             self.cost += cost
             return payload
-        raise ProviderError(None, f"??????: {last_error}", provider=self.provider.id)
+        raise ProviderError(None, f"重试后仍失败: {last_error}", provider=self.provider.id)
 

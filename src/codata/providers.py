@@ -42,7 +42,7 @@ class Provider:
     def search(self, keyword: str, page: int, state: dict[str, str]) -> SearchResponse:
         raise NotImplementedError
 
-    def user(self, user_id: str) -> Any:
+    def user(self, user_id: str, profile_url: str = "") -> Any:
         raise NotImplementedError
 
     def balance(self) -> BalanceResponse:
@@ -88,7 +88,7 @@ class DataFlowProvider(Provider):
         )
         return SearchResponse(payload=payload, items=as_items(payload), state={})
 
-    def user(self, user_id: str) -> Any:
+    def user(self, user_id: str, profile_url: str = "") -> Any:
         return self.client.get(
             self.user_path,
             {"userId": user_id},
@@ -131,7 +131,7 @@ class LegacyDataFlowProvider(Provider):
         payload = self.api.xhs_search(keyword, page)
         return SearchResponse(payload=payload, items=as_items(payload), state={})
 
-    def user(self, user_id: str) -> Any:
+    def user(self, user_id: str, profile_url: str = "") -> Any:
         return self.api.xhs_user(user_id)
 
     def balance(self) -> BalanceResponse:
@@ -211,7 +211,7 @@ class RnoteProvider(Provider):
                 }
         return {}
 
-    def user(self, user_id: str) -> Any:
+    def user(self, user_id: str, profile_url: str = "") -> Any:
         return self.api.user(
             user_id,
             path=self.user_path,

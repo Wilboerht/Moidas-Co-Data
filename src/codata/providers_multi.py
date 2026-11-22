@@ -13,7 +13,13 @@ from .platforms import PlatformProviderRuntime
 from .providers import BalanceResponse, Provider, SearchResponse
 from .storage import as_items, unwrap_data
 
-PLATFORM_MAP = {"xhs": "xiaohongshu", "douyin": "douyin"}
+PLATFORM_MAP = {
+    "xhs": "xiaohongshu",
+    "douyin": "douyin",
+    "bilibili": "bilibili",
+    "zhihu": "zhihu",
+    "instagram": "instagram",
+}
 
 
 def _find(payload: Any, keys: tuple[str, ...], depth: int = 0) -> Any:
@@ -41,7 +47,7 @@ def _items(payload: Any) -> list[dict[str, Any]]:
     items = as_items(payload)
     if items:
         return items
-    for key in ("business_data", "results", "videos", "works", "data"):
+    for key in ("business_data", "results", "videos", "works", "reels", "posts", "items", "data"):
         value = _find(payload, (key,))
         if isinstance(value, list):
             return [item for item in value if isinstance(item, dict)]
@@ -72,7 +78,7 @@ class JsonProvider(Provider):
     def search(self, keyword: str, page: int, state: dict[str, str]) -> SearchResponse:
         raise NotImplementedError
 
-    def user(self, user_id: str) -> Any:
+    def user(self, user_id: str, profile_url: str = "") -> Any:
         raise NotImplementedError
 
     def normalize_search(self, item: Any) -> tuple[dict[str, Any], dict[str, Any] | None]:
@@ -111,7 +117,8 @@ class EveryInfraProvider(JsonProvider):
         token = state.get("page_token")
         if token:
             params["page_token"] = token
-        payload = self._call("search", params, self.search_cost_tokens)
+        action = "reels_search" if self.platform == "instagram" else "search"
+        payload = self._call(action, params, self.search_cost_tokens)
         next_token = _find(payload, ("next_page_token",))
         return SearchResponse(
             payload=payload,
@@ -119,8 +126,14 @@ class EveryInfraProvider(JsonProvider):
             state={"page_token": str(next_token)} if next_token else {},
         )
 
-    def user(self, user_id: str) -> Any:
-        return self._call("profile", {"user_id": user_id}, self.user_cost_tokens)
+    def user(self, user_id: str, profile_url: str = "") -> Any:
+        if self.platform == "zhihu":
+            params = {"url": profile_url or f"https://www.zhihu.com/people/{user_id}"}
+        elif self.platform == "instagram":
+            params = {"username": user_id}
+        else:
+            params = {"user_id": user_id}
+        return self._call("profile", params, self.user_cost_tokens)
 
     def balance(self) -> BalanceResponse:
         payload = self.client.request("GET", self.provider.balance_path, cost=0)
@@ -131,10 +144,10 @@ class EveryInfraProvider(JsonProvider):
             if isinstance(nested, dict):
                 balance = nested.get("total_usd")
         if balance is None:
-            return BalanceResponse(None, "USD", None, "EveryInfra ?????????")
+            return BalanceResponse(None, "USD", None, "EveryInfra 余额接口未返回余额")
         usd = Decimal(str(balance))
         tokens = int(usd * Decimal(str(self.settings.usd_cny)) / Decimal(str(self.settings.token_cny)))
-        return BalanceResponse(usd, "USD", tokens, f"?? ${usd.quantize(Decimal('0.0001'))}?? {tokens} token?")
+        return BalanceResponse(usd, "USD", tokens, f"剩余 ${usd.quantize(Decimal('0.0001'))}（约 {tokens} token）")
 
 
 class TikHubProvider(JsonProvider):
@@ -186,7 +199,7 @@ class TikHubProvider(JsonProvider):
             },
         )
 
-    def user(self, user_id: str) -> Any:
+    def user(self, user_id: str, profile_url: str = "") -> Any:
         params = {"sec_user_id": user_id} if self.platform == "douyin" else {"user_id": user_id}
         return self.client.request(
             "GET", self.user_path, params=params, cost=self.user_cost_tokens
@@ -201,10 +214,10 @@ class TikHubProvider(JsonProvider):
         raw_balance = user_data.get("balance")
         free_credit = user_data.get("free_credit")
         if raw_balance is None:
-            return BalanceResponse(None, "USD", None, "TikHub ?????????")
+            return BalanceResponse(None, "USD", None, "TikHub 余额接口未返回余额")
         usd = Decimal(str(raw_balance)) + Decimal(str(free_credit or 0))
         tokens = int(usd * Decimal(str(self.settings.usd_cny)) / Decimal(str(self.settings.token_cny)))
-        return BalanceResponse(usd, "USD", tokens, f"?? ${usd.quantize(Decimal('0.0001'))}?? {tokens} token?")
+        return BalanceResponse(usd, "USD", tokens, f"剩余 ${usd.quantize(Decimal('0.0001'))}（约 {tokens} token）")
 
 
 class JustOneAPIProvider(JsonProvider):
@@ -225,7 +238,7 @@ class JustOneAPIProvider(JsonProvider):
             state={"searchId": str(_find(payload, ("searchId", "search_id")) or "")},
         )
 
-    def user(self, user_id: str) -> Any:
+    def user(self, user_id: str, profile_url: str = "") -> Any:
         params = {"secUid": user_id} if self.platform == "douyin" else {"userId": user_id}
         return self.client.request(
             "GET", self.user_path, params=params, cost=self.user_cost_tokens
@@ -252,7 +265,7 @@ class SocialDataXProvider(JsonProvider):
             state={"page_token": str(token)} if token else {},
         )
 
-    def user(self, user_id: str) -> Any:
+    def user(self, user_id: str, profile_url: str = "") -> Any:
         return self.client.request(
             "POST", self.user_path, json_body={"user_id": user_id}, cost=self.user_cost_tokens
         )
@@ -287,7 +300,7 @@ class RedFoxProvider(JsonProvider):
             state={"offset": str(offset + 20)} if has_more not in (False, 0, "0") else {},
         )
 
-    def user(self, user_id: str) -> Any:
+    def user(self, user_id: str, profile_url: str = "") -> Any:
         if self.platform == "douyin":
             body = {"accountId": user_id}
         else:
@@ -306,10 +319,10 @@ class RedFoxProvider(JsonProvider):
         data = unwrap_data(payload)
         points = _find(data, ("totalAvailablePoints", "total_available_points"))
         if points is None:
-            return BalanceResponse(None, "points", None, "RedFoxHub ?????????")
+            return BalanceResponse(None, "points", None, "RedFoxHub 余额接口未返回积分")
         amount = Decimal(str(points))
         tokens = int(amount * Decimal("100"))
-        return BalanceResponse(amount, "points", tokens, f"?? {amount.quantize(Decimal('0.01'))} ???? {tokens} token?")
+        return BalanceResponse(amount, "points", tokens, f"剩余 {amount.quantize(Decimal('0.01'))} 积分（约 {tokens} token）")
 
 
 MULTI_PROVIDERS = {

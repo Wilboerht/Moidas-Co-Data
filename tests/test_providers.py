@@ -17,6 +17,7 @@ from codata.client import RnoteClient
 from codata.config import Settings
 from codata.db import Database
 from codata.normalize import normalize_rnote_user, normalize_search_item
+from codata.normalize_platform import normalize_search_item_platform, normalize_user_platform
 from codata.platforms import PlatformConfigError, Price, load_registry, validate_provider_host
 from codata.pipeline import Pipeline
 from codata.providers import BalanceResponse, RnoteProvider, SearchResponse
@@ -34,7 +35,8 @@ class ProviderTests(unittest.TestCase):
             dataflow_allowed_hosts=("dataflowserver.org",),
             rnote_allowed_hosts=("rnote.dev",),
         )
-        registry = load_registry(settings)
+        with patch.dict(os.environ, {"EVERYINFRA_API_KEY": "", "TIKHUB_API_KEY": "", "JUSTONEAPI_TOKEN": "", "SOCIALDATAX_API_KEY": "", "REDFOX_API_KEY": ""}):
+            registry = load_registry(settings)
         self.assertEqual(registry.cheapest("xhs").provider.id, "dataflow")
         prices = {item.provider.id: item.search.price for item in registry.options("xhs")}
         self.assertEqual(prices["dataflow"].tokens(registry.usd_cny, registry.token_cny), 45)
@@ -119,7 +121,7 @@ class ProviderTests(unittest.TestCase):
                     {"code": 0}, [search_item("n1", "u1", "咖啡师")], {}
                 )
 
-            def user(self, user_id: str):
+            def user(self, user_id: str, profile_url: str = ""):
                 return user_payload(user_id, "咖啡师", fans=100)
 
             def normalize_search(self, item):
@@ -199,9 +201,9 @@ class ProviderTests(unittest.TestCase):
                         "data": [
                             {
                                 "id": "n-every",
-                                "text": "?? #??",
+                                "text": "咖啡 #咖啡",
                                 "author_id": "u-every",
-                                "author_name": "???",
+                                "author_name": "咖啡师",
                                 "like_count": 10,
                                 "collect_count": 2,
                                 "comment_count": 1,
@@ -212,7 +214,7 @@ class ProviderTests(unittest.TestCase):
                         "next_page_token": "next",
                     },
                 )
-            return httpx.Response(200, json={"data": {"nickname": "???", "follower_count": 100}})
+            return httpx.Response(200, json={"data": {"nickname": "咖啡师", "follower_count": 100}})
 
         provider.client._client.close()
         provider.client._client = httpx.Client(
@@ -220,7 +222,7 @@ class ProviderTests(unittest.TestCase):
             transport=httpx.MockTransport(handler),
         )
         try:
-            result = provider.search("??", 1, {})
+            result = provider.search("咖啡", 1, {})
             self.assertEqual(result.items[0]["id"], "n-every")
             self.assertEqual(result.state["page_token"], "next")
             note, author = provider.normalize_search(result.items[0])
@@ -233,7 +235,100 @@ class ProviderTests(unittest.TestCase):
         finally:
             provider.close()
 
+    def test_everyinfra_platform_actions(self) -> None:
+        settings = Settings(host="", token="", output_dir=Path("data"))
+        with patch.dict(os.environ, {"EVERYINFRA_API_KEY": "every-key"}):
+            registry = load_registry(settings)
+        cases = {
+            "bilibili": ("search", "user_id", {"bvid": "BV1x", "title": "B站视频", "author_id": "123", "author_name": "UP"}),
+            "zhihu": ("search", "url", {"id": "z1", "type": "answer", "title": "标题", "author_id": "u1", "author_name": "答主", "author_url": "https://www.zhihu.com/people/u1"}),
+            "instagram": ("reels_search", "username", {"post_id": "ig1", "text": "IG", "author_username": "creator", "author_id": "42"}),
+        }
+        for platform, (expected_action, expected_user_key, sample) in cases.items():
+            option = registry.platforms[platform].providers["everyinfra"]
+            provider = EveryInfraProvider(settings, option, platform)
+            seen: list[dict] = []
+
+            def handler(request: httpx.Request, expected_action=expected_action, sample=sample) -> httpx.Response:
+                body = __import__("json").loads(request.content or b"{}")
+                seen.append(body)
+                if body.get("action") in {"search", "reels_search"}:
+                    return httpx.Response(200, json={"data": [sample], "next_page_token": None})
+                return httpx.Response(200, json={"data": {"name": "author"}})
+
+            provider.client._client.close()
+            provider.client._client = httpx.Client(
+                base_url=option.provider.base_url,
+                transport=httpx.MockTransport(handler),
+            )
+            try:
+                result = provider.search("咖啡", 1, {})
+                self.assertEqual(seen[0]["action"], expected_action)
+                self.assertEqual(seen[0]["platform"], platform)
+                note, author = provider.normalize_search(result.items[0])
+                self.assertEqual(note["platform"], platform)
+                self.assertIsNotNone(author)
+                profile_url = "https://www.zhihu.com/people/u1" if platform == "zhihu" else ""
+                provider.user("u1", profile_url)
+                self.assertIn(expected_user_key, seen[1]["params"])
+            finally:
+                provider.close()
+
+    def test_normalize_new_platforms(self) -> None:
+        bili, bili_author = normalize_search_item_platform(
+            {
+                "bvid": "BV1xx",
+                "title": "B站视频",
+                "author_id": 123,
+                "author_name": "UP",
+                "author_url": "https://space.bilibili.com/123",
+                "stat": {"like": 5, "reply": 2},
+            },
+            "bilibili",
+        )
+        self.assertEqual(bili["platform"], "bilibili")
+        self.assertEqual(bili["note_id"], "BV1xx")
+        self.assertEqual(bili_author["user_id"], "123")
+        self.assertEqual(bili_author["profile_url"], "https://space.bilibili.com/123")
+
+        zhihu, zhihu_author = normalize_search_item_platform(
+            {
+                "id": "z1",
+                "type": "answer",
+                "title": "知乎回答",
+                "author_id": "u1",
+                "author_name": "答主",
+                "author_url": "https://www.zhihu.com/people/u1",
+                "like_count": 5,
+            },
+            "zhihu",
+        )
+        self.assertEqual(zhihu["platform"], "zhihu")
+        self.assertEqual(zhihu_author["user_id"], "u1")
+        self.assertEqual(zhihu_author["profile_url"], "https://www.zhihu.com/people/u1")
+
+        insta, insta_author = normalize_search_item_platform(
+            {
+                "post_id": "ig1",
+                "text": "IG content",
+                "author_username": "creator",
+                "like_count": 5,
+                "taken_at": 1767225600,
+            },
+            "instagram",
+        )
+        self.assertEqual(insta["platform"], "instagram")
+        self.assertEqual(insta["note_id"], "ig1")
+        self.assertEqual(insta_author["user_id"], "creator")
+        self.assertEqual(insta_author["profile_url"], "https://www.instagram.com/creator/")
+
+        user = normalize_user_platform("instagram", {"data": {"username": "creator", "follower_count": 10}}, "creator")
+        self.assertEqual(user["platform"], "instagram")
+        self.assertEqual(user["fans"], 10)
+
     def test_round_provider_and_api_call_cost(self) -> None:
+
+
 
         with tempfile.TemporaryDirectory() as tmp:
             with Database(Path(tmp)) as db:

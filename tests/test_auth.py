@@ -140,7 +140,7 @@ class AuthApiTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/rounds").status_code, 200)
         denied = self.client.post(
             "/api/rounds",
-            json={"keywords": ["??"], "pages": 1, "max_creators": 1, "start": False},
+            json={"keywords": ["测试"], "pages": 1, "max_creators": 1, "start": False},
             headers=limited_headers,
         )
         self.assertEqual(denied.status_code, 403)
@@ -161,7 +161,7 @@ class AuthApiTests(unittest.TestCase):
         limited_headers = {"X-CSRF-Token": limited["csrf_token"]}
         allowed = self.client.post(
             "/api/rounds",
-            json={"keywords": ["??"], "pages": 1, "max_creators": 1, "start": False},
+            json={"keywords": ["测试"], "pages": 1, "max_creators": 1, "start": False},
             headers=limited_headers,
         )
         self.assertEqual(allowed.status_code, 200, allowed.text)

@@ -90,7 +90,7 @@ export function TasksPage() {
   const start = async () => {
     if (roundId === null) return;
     if (!canCollect) {
-      toast.error("?????????????");
+      toast.error("当前账号没有发起采集的权限，请联系管理员开通。");
       return;
     }
     const current = taskQuery.data?.job;
@@ -271,7 +271,7 @@ export function TasksPage() {
                       <TableRow key={call.id}>
                         <TableCell className="text-muted-foreground">{fmtDateTime(call.ts)}</TableCell>
                         <TableCell>{call.kind || "—"}</TableCell>
-                        <TableCell>{call.provider === "rnote" ? "Rnote" : call.provider === "dataflow" ? "DataFlow" : "—"}</TableCell>
+                        <TableCell>{call.provider ? PROVIDER_LABELS[call.provider] ?? call.provider : "—"}</TableCell>
                         <TableCell className="max-w-[260px] truncate font-mono text-xs">{call.path || "—"}</TableCell>
                         <TableCell className="text-right tabular-nums">{call.code ?? "—"}</TableCell>
                         <TableCell className="text-right tabular-nums">

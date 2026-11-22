@@ -250,11 +250,12 @@ class Pipeline:
         for entry in to_fetch:
             platform_code = entry["platform"]
             user_id = entry["user_id"]
+            profile_url = entry.get("profile_url") or ""
             payload = self._call(
                 round_id,
                 platform_code,
                 "user",
-                lambda user_id=user_id: provider.user(user_id),
+                lambda user_id=user_id, profile_url=profile_url: provider.user(user_id, profile_url),
                 {"userId": user_id},
                 cost=provider.user_cost_tokens,
                 label=f"round{round_id}_{provider.provider_id}_user_{user_id}",

@@ -991,7 +991,7 @@ def _fetch_extra_balance(provider_id: str) -> dict[str, Any]:
     registry = load_registry(settings)
     provider = registry.provider(provider_id)
     if not provider.configured:
-        return {"remaining": None, "text": "??? API Key", "currency": provider.balance_currency}
+        return {"remaining": None, "text": "未配置 API Key", "currency": provider.balance_currency}
     option = None
     platform_code = "xhs"
     for platform in registry.platforms.values():
@@ -1000,11 +1000,11 @@ def _fetch_extra_balance(provider_id: str) -> dict[str, Any]:
             platform_code = platform.code
             break
     if option is None:
-        return {"remaining": None, "text": "????????????", "currency": provider.balance_currency}
+        return {"remaining": None, "text": "未找到该服务商的平台配置", "currency": provider.balance_currency}
     candidate = build_provider(settings, option, platform_code)
     try:
         if not getattr(candidate, "supports_balance", False):
-            return {"remaining": None, "text": f"{provider.label} ???????", "currency": provider.balance_currency}
+            return {"remaining": None, "text": f"{provider.label} 未提供余额接口", "currency": provider.balance_currency}
         result = candidate.balance()
         return {
             "remaining": result.remaining_tokens,
@@ -1025,21 +1025,21 @@ def api_balance(provider: str = "dataflow") -> dict[str, Any]:
     if provider in {"dataflow", "rnote"}:
         if provider == "rnote":
             if not settings.rnote_api_key:
-                return {"remaining": None, "text": "??? RNOTE_API_KEY", "currency": "USD"}
+                return {"remaining": None, "text": "未配置 RNOTE_API_KEY", "currency": "USD"}
         elif not settings.host or not settings.token:
-            return {"remaining": None, "text": "??? Host/Token", "currency": "token"}
+            return {"remaining": None, "text": "未配置 Host/Token", "currency": "token"}
         try:
             return _fetch_balance(settings, provider)
         except Exception as exc:
             return {
                 "remaining": None,
-                "text": f"?????{exc}",
+                "text": f"查询失败：{exc}",
                 "currency": "USD" if provider == "rnote" else "token",
             }
     try:
         return _fetch_extra_balance(provider)
     except Exception as exc:
-        return {"remaining": None, "text": f"?????{exc}", "currency": ""}
+        return {"remaining": None, "text": f"查询失败：{exc}", "currency": ""}
 
 
 @app.get("/api/rounds")

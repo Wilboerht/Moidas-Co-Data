@@ -13,6 +13,12 @@ def note_url(platform: str, note_id: str) -> str:
         return ""
     if platform == "douyin":
         return f"https://www.douyin.com/video/{note_id}"
+    if platform == "bilibili":
+        return f"https://www.bilibili.com/video/{note_id}"
+    if platform == "instagram":
+        return f"https://www.instagram.com/p/{note_id}/"
+    if platform == "zhihu":
+        return ""
     return f"https://www.xiaohongshu.com/explore/{note_id}"
 
 
@@ -21,6 +27,12 @@ def profile_url(platform: str, user_id: str) -> str:
         return ""
     if platform == "douyin":
         return f"https://www.douyin.com/user/{user_id}"
+    if platform == "bilibili":
+        return f"https://space.bilibili.com/{user_id}"
+    if platform == "instagram":
+        return f"https://www.instagram.com/{user_id}/"
+    if platform == "zhihu":
+        return f"https://www.zhihu.com/people/{user_id}"
     return f"https://www.xiaohongshu.com/user/profile/{user_id}"
 
 
@@ -71,6 +83,7 @@ def _metric(item: dict[str, Any], *keys: str) -> int:
         item,
         first_dict(item.get("interact_info"), item.get("interactInfo")),
         first_dict(item.get("statistics"), item.get("stats")),
+        first_dict(item.get("stat")),
         first_dict(item.get("counts")),
         first_dict(item.get("author_stats"), item.get("authorStats")),
     ]
@@ -89,13 +102,50 @@ def _author(item: dict[str, Any]) -> dict[str, Any]:
         item.get("userInfo"),
         item.get("author_info"),
         item.get("authorInfo"),
+        item.get("owner"),
         item.get("account"),
     )
 
 
+def _id_str(*values: Any) -> str:
+    for value in values:
+        if isinstance(value, bool) or value is None:
+            continue
+        if isinstance(value, (int, float)):
+            return str(int(value))
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 def _author_id(item: dict[str, Any], user: dict[str, Any], platform: str) -> str:
+    if platform == "instagram":
+        return _id_str(
+            user.get("username"),
+            item.get("author_username"),
+            item.get("authorUsername"),
+            user.get("user_id"),
+            item.get("author_id"),
+        )
+    if platform == "bilibili":
+        return _id_str(
+            user.get("mid"),
+            item.get("author_id"),
+            item.get("authorId"),
+            item.get("mid"),
+            user.get("user_id"),
+            user.get("id"),
+        )
+    if platform == "zhihu":
+        return _id_str(
+            user.get("id"),
+            user.get("user_id"),
+            user.get("userId"),
+            item.get("author_id"),
+            item.get("authorId"),
+        )
     if platform == "douyin":
-        return first_str(
+        return _id_str(
             user.get("sec_uid"),
             user.get("secUid"),
             user.get("uid"),
@@ -110,7 +160,7 @@ def _author_id(item: dict[str, Any], user: dict[str, Any], platform: str) -> str
             item.get("user_id"),
             item.get("userId"),
         )
-    return first_str(
+    return _id_str(
         user.get("userid"),
         user.get("user_id"),
         user.get("userId"),
@@ -175,6 +225,9 @@ def normalize_search_item_platform(
         raw.get("workId"),
         raw.get("work_id"),
         raw.get("item_id"),
+        raw.get("bvid"),
+        raw.get("post_id"),
+        raw.get("shortcode"),
         raw.get("id"),
     )
     user_id = _author_id(raw, user, platform)
@@ -206,6 +259,7 @@ def normalize_search_item_platform(
         raw.get("noteType"),
         raw.get("workType"),
         raw.get("media_type"),
+        raw.get("post_type"),
     )
     published_at = as_timestamp(
         raw.get("published_at")
@@ -215,6 +269,7 @@ def normalize_search_item_platform(
         or raw.get("workPublishTime")
         or raw.get("create_time")
         or raw.get("createTime")
+        or raw.get("taken_at")
         or raw.get("timestamp")
         or raw.get("time")
     )
@@ -235,6 +290,7 @@ def normalize_search_item_platform(
             "digg_count",
             "workLikedCount",
             "likes",
+            "like",
         ),
         "collected": _metric(
             raw,
@@ -244,6 +300,8 @@ def normalize_search_item_platform(
             "collectCount",
             "workCollectedCount",
             "collects",
+            "favorite",
+            "favorite_count",
         ),
         "comments": _metric(
             raw,
@@ -252,6 +310,7 @@ def normalize_search_item_platform(
             "comment_count",
             "commentCount",
             "workCommentsCount",
+            "reply",
         ),
         "shares": _metric(
             raw,
@@ -260,6 +319,7 @@ def normalize_search_item_platform(
             "share_count",
             "shareCount",
             "workSharedCount",
+            "share",
         ),
         "url": first_str(raw.get("url"), raw.get("workUrl"), raw.get("share_url"))
         or note_url(platform, note_id),
@@ -290,7 +350,12 @@ def normalize_search_item_platform(
                 raw.get("accountNickname"),
             ),
             "avatar": _avatar(raw, user),
-            "profile_url": profile_url(platform, user_id),
+            "profile_url": first_str(
+                raw.get("author_url"),
+                user.get("url"),
+                user.get("profile_url"),
+                raw.get("url") if platform == "zhihu" else "",
+            ) or profile_url(platform, user_id),
         }
     return note, author
 
@@ -499,7 +564,113 @@ def normalize_douyin_user(payload: Any, user_id: str = "") -> dict[str, Any]:
     }
 
 
+def normalize_bilibili_user(payload: Any, user_id: str = "") -> dict[str, Any]:
+    data = unwrap_data(payload)
+    if not isinstance(data, dict):
+        raise ValueError("B站用户信息响应格式异常")
+    user = _nested_user(payload)
+    merged = {**data, **user}
+    resolved = first_str(user_id, merged.get("mid"), merged.get("user_id"), merged.get("id"))
+    liked = as_int(merged.get("like_count") or merged.get("liked") or merged.get("total_favorited"))
+    return {
+        "platform": "bilibili",
+        "user_id": resolved,
+        "red_id": "",
+        "nickname": first_str(merged.get("name"), merged.get("nickname"), merged.get("uname")),
+        "avatar": _avatar(merged, merged),
+        "fans": as_int(merged.get("follower_count") or merged.get("fans")),
+        "follows": as_int(merged.get("following_count") or merged.get("follows")),
+        "liked": liked,
+        "collected": 0,
+        "posted": as_int(merged.get("video_count") or merged.get("posted")),
+        "interaction": liked,
+        "desc": first_str(merged.get("bio"), merged.get("sign"), merged.get("description")),
+        "tags_json": json.dumps([], ensure_ascii=False),
+        "ip_location": "",
+        "verify_info": first_str(merged.get("verified_title"), merged.get("verify_info")),
+        "profile_url": first_str(merged.get("url"), merged.get("author_url")) or profile_url("bilibili", resolved),
+        "fetched_at": utc_now(),
+        "raw_json": json.dumps(data, ensure_ascii=False),
+    }
+
+
+def normalize_zhihu_user(payload: Any, user_id: str = "") -> dict[str, Any]:
+    data = unwrap_data(payload)
+    if not isinstance(data, dict):
+        raise ValueError("知乎用户信息响应格式异常")
+    user = _nested_user(payload)
+    merged = {**data, **user}
+    resolved = first_str(
+        user_id,
+        merged.get("author_id"),
+        merged.get("user_id"),
+        merged.get("id"),
+    )
+    answered = as_int(merged.get("answer_count"))
+    articles = as_int(merged.get("article_count"))
+    liked = as_int(merged.get("received_upvote_count") or merged.get("like_count"))
+    return {
+        "platform": "zhihu",
+        "user_id": resolved,
+        "red_id": "",
+        "nickname": first_str(
+            merged.get("author_name"),
+            merged.get("display_name"),
+            merged.get("name"),
+        ),
+        "avatar": _avatar(merged, merged),
+        "fans": as_int(merged.get("author_follower_count") or merged.get("follower_count")),
+        "follows": as_int(merged.get("following_count")),
+        "liked": liked,
+        "collected": 0,
+        "posted": answered + articles,
+        "interaction": liked,
+        "desc": first_str(merged.get("author_bio"), merged.get("bio"), merged.get("description")),
+        "tags_json": json.dumps([], ensure_ascii=False),
+        "ip_location": "",
+        "verify_info": first_str(merged.get("author_verification_label"), merged.get("verification_label")),
+        "profile_url": first_str(merged.get("author_url"), merged.get("url")) or profile_url("zhihu", resolved),
+        "fetched_at": utc_now(),
+        "raw_json": json.dumps(data, ensure_ascii=False),
+    }
+
+
+def normalize_instagram_user(payload: Any, user_id: str = "") -> dict[str, Any]:
+    data = unwrap_data(payload)
+    if not isinstance(data, dict):
+        raise ValueError("Instagram 用户信息响应格式异常")
+    user = _nested_user(payload)
+    merged = {**data, **user}
+    username = first_str(merged.get("username"), merged.get("user_name"), user_id)
+    return {
+        "platform": "instagram",
+        "user_id": username,
+        "red_id": "",
+        "nickname": first_str(merged.get("display_name"), merged.get("name"), username),
+        "avatar": _avatar(merged, merged),
+        "fans": as_int(merged.get("follower_count") or merged.get("followers")),
+        "follows": as_int(merged.get("following_count") or merged.get("follows")),
+        "liked": 0,
+        "collected": 0,
+        "posted": as_int(merged.get("post_count") or merged.get("media_count")),
+        "interaction": 0,
+        "desc": first_str(merged.get("bio"), merged.get("biography"), merged.get("description")),
+        "tags_json": json.dumps([], ensure_ascii=False),
+        "ip_location": "",
+        "verify_info": "已认证" if merged.get("is_verified") else "",
+        "profile_url": first_str(merged.get("url")) or profile_url("instagram", username),
+        "fetched_at": utc_now(),
+        "raw_json": json.dumps(data, ensure_ascii=False),
+    }
+
+
 def normalize_user_platform(platform: str, payload: Any, user_id: str = "") -> dict[str, Any]:
     if platform == "douyin":
         return normalize_douyin_user(payload, user_id)
+    if platform == "bilibili":
+        return normalize_bilibili_user(payload, user_id)
+    if platform == "zhihu":
+        return normalize_zhihu_user(payload, user_id)
+    if platform == "instagram":
+        return normalize_instagram_user(payload, user_id)
     return normalize_xhs_user(payload, user_id)

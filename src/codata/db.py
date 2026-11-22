@@ -893,9 +893,10 @@ class Database:
     def round_author_stats(self, round_id: int) -> list[dict[str, Any]]:
         rows = self._conn.execute(
             """
-            SELECT nh.keyword, nh.page, n.*
+            SELECT nh.keyword, nh.page, n.*, c.profile_url AS profile_url
             FROM note_hits nh
             JOIN notes n ON n.platform = nh.platform AND n.note_id = nh.note_id
+            LEFT JOIN creators c ON c.platform = n.platform AND c.user_id = n.author_id
             WHERE nh.round_id = ? AND n.author_id IS NOT NULL AND n.author_id != ''
             """,
             (round_id,),
@@ -912,6 +913,7 @@ class Database:
                 {
                     "platform": row["platform"],
                     "user_id": user_id,
+                    "profile_url": row["profile_url"] or "",
                     "sample_notes": 0,
                     "sample_likes": 0,
                     "sample_collected": 0,

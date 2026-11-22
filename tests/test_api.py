@@ -23,8 +23,17 @@ from helpers import user_payload
 
 
 class ApiTests(unittest.TestCase):
+    PROVIDER_ENV_KEYS = (
+        "EVERYINFRA_API_KEY",
+        "TIKHUB_API_KEY",
+        "JUSTONEAPI_TOKEN",
+        "SOCIALDATAX_API_KEY",
+        "REDFOX_API_KEY",
+    )
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
+        self.provider_env = {key: os.environ.pop(key, None) for key in self.PROVIDER_ENV_KEYS}
         self.settings = Settings(host="", token="", output_dir=Path(self.tmp.name))
         self.old_settings = api_server.settings
         api_server.settings = self.settings
@@ -82,6 +91,11 @@ class ApiTests(unittest.TestCase):
     def tearDown(self) -> None:
         api_server.app.dependency_overrides.clear()
         api_server.settings = self.old_settings
+        for key, value in self.provider_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
         self.tmp.cleanup()
 
     def test_health_and_lists(self) -> None:

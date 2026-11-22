@@ -128,10 +128,10 @@ export function SettingsPage() {
       setProviderTokenInput("");
       setShowProviderToken(false);
       providerTokenMutation.reset();
-      toast.success("??????????");
+      toast.success("服务商访问令牌已保存");
     },
     onError: (error) => {
-      toast.error(error instanceof Error ? error.message : "???????????");
+      toast.error(error instanceof Error ? error.message : "服务商访问令牌保存失败");
     },
   });
   const openProviderTokenDialog = (provider: ProviderSettings) => {
@@ -206,7 +206,7 @@ export function SettingsPage() {
         ...current,
         [providerId]: {
           data: current[providerId]?.data ?? null,
-          error: error instanceof Error ? error.message : "????",
+          error: error instanceof Error ? error.message : "查询失败",
           loading: false,
         },
       }));
@@ -233,14 +233,23 @@ export function SettingsPage() {
   const settings = settingsQuery.data;
   if (!settings) return null;
 
-  const xhsPrices = new Map<string, PlatformProviderPrice>();
-  const douyinPrices = new Map<string, PlatformProviderPrice>();
+  const platformPrices = new Map<string, { code: string; label: string; price: PlatformProviderPrice }[]>();
   for (const platform of settings.platforms) {
     for (const option of platform.providers) {
-      if (platform.code === "xhs") xhsPrices.set(option.id, option);
-      if (platform.code === "douyin") douyinPrices.set(option.id, option);
+      const entries = platformPrices.get(option.id) ?? [];
+      entries.push({ code: platform.code, label: platform.label, price: option });
+      platformPrices.set(option.id, entries);
     }
   }
+  const priceColumns = [
+    { code: "xhs", label: "小红书单价" },
+    { code: "douyin", label: "抖音单价" },
+    { code: "bilibili", label: "B站单价" },
+    { code: "zhihu", label: "知乎单价" },
+    { code: "instagram", label: "Instagram单价" },
+  ];
+  const priceFor = (providerId: string, code: string) =>
+    platformPrices.get(providerId)?.find((entry) => entry.code === code)?.price;
   const outputDir = settings.output_dir.replace(/[\\/]+$/, "");
   const pathSep = outputDir.includes("\\") ? "\\" : "/";
   const databasePath = `${outputDir}${pathSep}codata.sqlite`;
@@ -293,21 +302,20 @@ export function SettingsPage() {
             description="集中管理所有采集接口、令牌和计价；令牌保存后立即生效。"
             contentClassName="px-0"
           >
-            <Table className="min-w-[1040px] table-fixed">
+            <Table className="min-w-[1340px] table-fixed">
               <TableHeader>
                 <TableRow>
                   <TableHead className="w-[150px]">服务商</TableHead>
                   <TableHead className="w-[220px]">接口地址</TableHead>
                   <TableHead className="w-[190px]">访问令牌</TableHead>
-                  <TableHead className="w-[210px]">小红书单价</TableHead>
-                  <TableHead className="w-[190px]">抖音单价</TableHead>
+                  {priceColumns.map((column) => (
+                    <TableHead key={column.code} className="w-[140px]">{column.label}</TableHead>
+                  ))}
                   <TableHead className="w-[150px] text-right">接口余额</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {settings.providers.map((provider) => {
-                  const xhsPrice = xhsPrices.get(provider.id);
-                  const douyinPrice = douyinPrices.get(provider.id);
                   const openToken = provider.id === "dataflow"
                     ? openTokenDialog
                     : provider.id === "rnote"
@@ -354,18 +362,23 @@ export function SettingsPage() {
                           ) : null}
                         </div>
                       </TableCell>
-                      <TableCell className="text-xs">
-                        {xhsPrice
-                          ? `${xhsPrice.search_cost_native} ${xhsPrice.search_currency} ≈ ${xhsPrice.search_cost_tokens} token / ¥${xhsPrice.search_cost_cny}`
-                          : "—"}
-                      </TableCell>
-                      <TableCell className="text-xs">
-                        {provider.id === "dataflow"
-                          ? `${settings.douyin_cost} token / 次`
-                          : douyinPrice
-                            ? `${douyinPrice.search_cost_native} ${douyinPrice.search_currency} ≈ ${douyinPrice.search_cost_tokens} token / ¥${douyinPrice.search_cost_cny}`
-                            : "—"}
-                      </TableCell>
+                      {priceColumns.map((column) => {
+                        const price = priceFor(provider.id, column.code);
+                        return (
+                          <TableCell key={column.code} className="text-xs">
+                            {price ? (
+                              <div className="space-y-0.5">
+                                <div>{price.search_cost_native} {price.search_currency}</div>
+                                <div className="text-[10px] text-muted-foreground">
+                                  ≈ {price.search_cost_tokens}t / ¥{price.search_cost_cny}
+                                </div>
+                              </div>
+                            ) : (
+                              <span className="text-muted-foreground">—</span>
+                            )}
+                          </TableCell>
+                        );
+                      })}
                       <TableCell className="text-right">
                         {!provider.token_configured ? (
                           <span className="text-xs text-muted-foreground">未配置</span>
@@ -756,13 +769,13 @@ export function SettingsPage() {
             }}
           >
             <DialogHeader>
-              <DialogTitle>?? {providerTokenTarget?.label ?? "???"} ????</DialogTitle>
+              <DialogTitle>设置 {providerTokenTarget?.label ?? "服务商"} 访问令牌</DialogTitle>
               <DialogDescription>
-                ????? .env????????????????????????????
+                令牌保存到 .env；新服务商暂不做在线余额验证，保存后可在新建采集里使用。
               </DialogDescription>
             </DialogHeader>
             <div className="space-y-2">
-              <Label htmlFor="provider-token">????</Label>
+              <Label htmlFor="provider-token">访问令牌</Label>
               <div className="relative">
                 <Input
                   id="provider-token"
@@ -776,7 +789,7 @@ export function SettingsPage() {
                     setProviderTokenInput(event.target.value);
                     if (providerTokenMutation.isError) providerTokenMutation.reset();
                   }}
-                  placeholder="?? API Key"
+                  placeholder="粘贴 API Key"
                   autoFocus
                 />
                 <Button
@@ -784,8 +797,8 @@ export function SettingsPage() {
                   variant="ghost"
                   size="icon-xs"
                   className="absolute top-1 right-1 text-muted-foreground"
-                  aria-label={showProviderToken ? "????" : "????"}
-                  title={showProviderToken ? "????" : "????"}
+                  aria-label={showProviderToken ? "隐藏令牌" : "显示令牌"}
+                  title={showProviderToken ? "隐藏令牌" : "显示令牌"}
                   onClick={() => setShowProviderToken((value) => !value)}
                 >
                   {showProviderToken ? <EyeOff /> : <Eye />}
@@ -793,7 +806,7 @@ export function SettingsPage() {
               </div>
               {providerTokenMutation.isError ? (
                 <p className="text-sm text-destructive" role="alert">
-                  {providerTokenMutation.error instanceof Error ? providerTokenMutation.error.message : "????"}
+                  {providerTokenMutation.error instanceof Error ? providerTokenMutation.error.message : "保存失败"}
                 </p>
               ) : null}
             </div>
@@ -804,10 +817,10 @@ export function SettingsPage() {
                 onClick={() => setProviderTokenOpen(false)}
                 disabled={providerTokenMutation.isPending}
               >
-                ??
+                取消
               </Button>
               <Button type="submit" disabled={!providerTokenInput.trim() || providerTokenMutation.isPending}>
-                {providerTokenMutation.isPending ? "????" : "??"}
+                {providerTokenMutation.isPending ? "保存中…" : "保存"}
               </Button>
             </DialogFooter>
           </form>
