@@ -326,6 +326,30 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(user["platform"], "instagram")
         self.assertEqual(user["fans"], 10)
 
+    def test_normalize_everyinfra_profile_results(self) -> None:
+        user = normalize_user_platform(
+            "xhs",
+            {
+                "platform": "xiaohongshu",
+                "action": "profile",
+                "results": {
+                    "user_id": "u1",
+                    "nickname": "creator",
+                    "follower_count": 91,
+                    "following_count": 406,
+                    "like_count": 210,
+                    "collect_count": 52,
+                    "post_count": 18,
+                    "bio": "bio",
+                },
+            },
+            "u1",
+        )
+        self.assertEqual(user["nickname"], "creator")
+        self.assertEqual(user["fans"], 91)
+        self.assertEqual(user["posted"], 18)
+        self.assertEqual(user["interaction"], 262)
+
     def test_round_provider_and_api_call_cost(self) -> None:
 
 

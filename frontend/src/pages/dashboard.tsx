@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useState } from "react";
 import { Link } from "react-router-dom";
 import { ArrowDown, CheckCircle2, Coins, UserCheck, Users } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
@@ -12,6 +12,7 @@ import { Badge } from "@/components/ui/badge";
 import { StatusBadge } from "@/components/status-badge";
 import { RoundStatusOrb } from "@/components/round-status-orb";
 import { Button } from "@/components/ui/button";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
   Card,
   CardAction,
@@ -34,22 +35,24 @@ type CreatorRow = Creator & Record<string, unknown>;
 type RoundRow = Round & Record<string, unknown>;
 
 export function DashboardPage() {
-  const { roundId, meta, rounds, setRoundId, round: contextRound, job, loading } = useRound();
-  const jobActive = job?.status === "running" || job?.status === "pending";
+  const { roundId, meta, rounds, setRoundId, job, activeJob } = useRound();
+  const [selectedRoundId, setSelectedRoundId] = useState<number | null>(null);
+  const selectedJob = selectedRoundId !== null && selectedRoundId === roundId ? job : null;
+  const watchedJob = selectedRoundId === null ? activeJob : selectedJob;
+  const jobActive = watchedJob?.status === "running" || watchedJob?.status === "pending";
   const dashboard = useQuery({
-    queryKey: ["dashboard", roundId],
-    queryFn: () => api.getDashboard(roundId),
-    enabled: roundId !== null,
+    queryKey: ["dashboard", selectedRoundId],
+    queryFn: () => api.getDashboard(selectedRoundId),
     refetchInterval: jobActive ? 2500 : false,
   });
 
-  useEffect(() => {
-    if (roundId === null && rounds.length > 0) {
-      setRoundId(rounds[0].id);
-    }
-  }, [roundId, rounds, setRoundId]);
+  const handleRoundChange = (value: string) => {
+    const next = value === "all" ? null : Number(value);
+    setSelectedRoundId(next);
+    if (next !== null) setRoundId(next);
+  };
 
-  if (dashboard.isLoading || (roundId === null && loading)) {
+  if (dashboard.isLoading) {
     return (
       <Page>
         <Skeleton className="h-8 w-36" />
@@ -70,7 +73,7 @@ export function DashboardPage() {
   }
 
   const data = dashboard.data;
-  if (!data?.round || !data.metrics) {
+  if (!data?.metrics || data.counts.rounds === 0) {
     return (
       <Page>
         <PageHeader title="工作台" />
@@ -86,9 +89,9 @@ export function DashboardPage() {
   const round = data.round;
   const metrics = data.metrics;
   const total = metrics.creators;
-  const keywordsText = round.keywords || contextRound?.keywords || "";
+  const keywordsText = round?.keywords ?? "";
   const keywordCount =
-    (round.keyword_details?.length || contextRound?.keyword_details?.length || 0) ||
+    round?.keyword_details?.length ||
     (keywordsText ? keywordsText.split(/[、,，]/).filter(Boolean).length : 0);
   const completion = total > 0 ? Math.round((metrics.enriched / total) * 100) : 0;
   const statusLabels = new Map((meta?.statuses ?? []).map((item) => [item.code, item.label]));
@@ -123,37 +126,59 @@ export function DashboardPage() {
     };
   });
   const recentRounds = ((data.recent_rounds ?? []) as RoundRow[]).filter(
-    (item) => item.id !== round.id,
+    (item) => item.id !== round?.id,
   );
   const jobPercent =
-    job && job.progress_total > 0 ? Math.round((job.progress_done / job.progress_total) * 100) : null;
+    watchedJob && watchedJob.progress_total > 0
+      ? Math.round((watchedJob.progress_done / watchedJob.progress_total) * 100)
+      : null;
+  const isAllRounds = selectedRoundId === null;
 
   const kpis = [
     { label: "达人总数", value: fmtNumber(metrics.creators), hint: undefined, icon: Users },
     { label: "已补全", value: fmtNumber(metrics.enriched), hint: `${completion}% 完整`, icon: CheckCircle2 },
     { label: "已采用", value: fmtNumber(metrics.adopted), hint: undefined, icon: UserCheck },
-    { label: "总消耗", value: `${fmtNumber(metrics.cost ?? round.cost_tokens)} token`, hint: undefined, icon: Coins },
+    { label: "总消耗", value: `${fmtNumber(metrics.cost ?? 0)} token`, hint: undefined, icon: Coins },
   ];
 
   return (
     <Page>
       <PageHeader
         title="工作台"
-        description={`${round.category ? `${round.category} · ` : ""}${keywordCount} 个关键词 · 每词 ${round.pages} 页`}
+        description={
+          isAllRounds
+            ? `全部 ${data.counts.rounds} 个轮次 · ${fmtNumber(metrics.creators)} 位达人`
+            : `${round?.category ? `${round?.category} · ` : ""}${keywordCount} 个关键词 · 每词 ${round?.pages ?? 1} 页`
+        }
+        actions={
+          <Select value={isAllRounds ? "all" : String(selectedRoundId)} onValueChange={handleRoundChange}>
+            <SelectTrigger className="w-[220px]" aria-label="选择轮次">
+              <SelectValue placeholder="全部轮次" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">全部轮次</SelectItem>
+              {rounds.map((item) => (
+                <SelectItem key={item.id} value={String(item.id)}>
+                  {item.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        }
       />
 
       {jobActive ? (
         <div className="flex flex-wrap items-center gap-3 border bg-muted/30 px-3 py-2">
-          <RoundStatusOrb status={job?.status} size={32} className="text-foreground" />
+          <RoundStatusOrb status={watchedJob?.status} size={32} className="text-foreground" />
           <div className="min-w-0 flex-1">
             <p className="text-sm font-medium">
-              {job?.status_label ?? "采集中"}
+              {watchedJob?.status_label ?? "采集中"}
               {jobPercent !== null ? ` · ${jobPercent}%` : ""}
             </p>
-            <p className="truncate text-xs text-muted-foreground">{job?.stage || "任务正在后台运行"}</p>
+            <p className="truncate text-xs text-muted-foreground">{watchedJob?.stage || "任务正在后台运行"}</p>
           </div>
           <Button asChild variant="outline" size="sm">
-            <Link to="/tasks">查看采集任务</Link>
+            <Link to={`/tasks/${watchedJob?.round_id ?? roundId}`}>查看采集任务</Link>
           </Button>
         </div>
       ) : null}
@@ -268,7 +293,11 @@ export function DashboardPage() {
                     <TableCell className="text-muted-foreground tabular-nums">{index + 1}</TableCell>
                     <TableCell className="font-medium">
                       <Link
-                        to={`/creators?creator=${encodeURIComponent(item.key)}&creator_round=${round.id}`}
+                        to={`/creators?creator=${encodeURIComponent(item.key)}${
+                          (item.round_id ?? selectedRoundId)
+                            ? `&creator_round=${item.round_id ?? selectedRoundId}`
+                            : ""
+                        }`}
                         className="block truncate underline-offset-4 hover:underline"
                       >
                         {item.nickname || "(未补全)"}

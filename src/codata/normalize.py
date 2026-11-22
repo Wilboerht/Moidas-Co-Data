@@ -357,6 +357,9 @@ def normalize_rnote_user(payload: Any, user_id: str = "") -> dict[str, Any]:
     }
 
 
+TIER_LABELS = ("素人", "尾部", "腰部", "头部", "顶流")
+
+
 def fans_tier(fans: Any) -> str:
     value = as_int(fans)
     if value >= 1_000_000:
@@ -368,6 +371,14 @@ def fans_tier(fans: Any) -> str:
     if value >= 10_000:
         return "尾部"
     return "素人"
+
+
+def normalize_tier_label(fans: Any, label: Any = None) -> str:
+    """Return a canonical tier. Fan counts always win over free-text labels."""
+    if fans is not None and str(fans).strip() != "":
+        return fans_tier(fans)
+    text = str(label or "").strip()
+    return text if text in TIER_LABELS else ""
 
 
 def format_fans_wan(fans: Any) -> str:

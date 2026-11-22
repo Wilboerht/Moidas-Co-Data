@@ -103,6 +103,8 @@ class ApiTests(unittest.TestCase):
         rounds = self.client.get("/api/rounds").json()
         self.assertEqual(len(rounds), 1)
         self.assertEqual(rounds[0]["category"], "咖啡")
+        self.assertEqual(rounds[0]["creators"], 1)
+        self.assertIn("job", rounds[0])
         self.assertEqual(rounds[0]["status_label"], "已完成" if rounds[0]["status"] == "done" else rounds[0]["status_label"])
         keywords = self.client.get("/api/keywords").json()
         self.assertEqual(keywords[0]["word"], "咖啡")
@@ -152,11 +154,11 @@ class ApiTests(unittest.TestCase):
 
         patched = self.client.patch(
             f"/api/rounds/{self.round_id}/creators/xhs/u1",
-            json={"status": "candidate", "match_direction": "咖啡", "remark": "测试"},
+            json={"status": "shortlisted", "match_direction": "咖啡", "remark": "测试"},
         )
         self.assertEqual(patched.status_code, 200)
-        self.assertEqual(patched.json()["status"], "candidate")
-        self.assertEqual(patched.json()["status_label"], "候选")
+        self.assertEqual(patched.json()["status"], "shortlisted")
+        self.assertEqual(patched.json()["status_label"], "备选")
 
         batch = self.client.post(
             f"/api/rounds/{self.round_id}/creators/batch",
@@ -167,6 +169,14 @@ class ApiTests(unittest.TestCase):
         )
         self.assertEqual(batch.status_code, 200)
         self.assertEqual(batch.json()["changed"], 1)
+
+    def test_active_job_endpoint(self) -> None:
+        with Database(self.settings.output_dir) as db:
+            job_id = db.claim_job(self.round_id)
+        response = self.client.get("/api/jobs/active")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["id"], job_id)
+        self.assertEqual(response.json()["round_id"], self.round_id)
 
     def test_pagination_facets_and_meta(self) -> None:
         page = self.client.get(
@@ -187,7 +197,8 @@ class ApiTests(unittest.TestCase):
         meta = self.client.get("/api/meta").json()
         codes = {item["code"] for item in meta["statuses"]}
         self.assertIn("pending", codes)
-        self.assertIn("recommended", codes)
+        self.assertIn("adopted", codes)
+        self.assertNotIn("recommended", codes)
 
     def test_fts_search(self) -> None:
         found = self.client.get(
@@ -202,11 +213,11 @@ class ApiTests(unittest.TestCase):
     def test_filtered_export(self) -> None:
         self.client.patch(
             f"/api/rounds/{self.round_id}/creators/xhs/u1",
-            json={"status": "candidate"},
+            json={"status": "shortlisted"},
         )
         response = self.client.get(
             f"/api/rounds/{self.round_id}/export?format=csv&scope=filtered"
-            "&platform=xhs&status=candidate"
+            "&platform=xhs&status=shortlisted"
         )
         self.assertEqual(response.status_code, 200)
         text = response.content.decode("utf-8-sig")
@@ -218,6 +229,11 @@ class ApiTests(unittest.TestCase):
         dashboard = self.client.get(f"/api/dashboard?round_id={self.round_id}").json()
         self.assertEqual(dashboard["metrics"]["creators"], 1)
         self.assertEqual(dashboard["metrics"]["enriched"], 1)
+
+        all_dashboard = self.client.get("/api/dashboard").json()
+        self.assertIsNone(all_dashboard["round"])
+        self.assertEqual(all_dashboard["metrics"]["creators"], 1)
+        self.assertEqual(len(all_dashboard["top_creators"]), 1)
 
         csv_response = self.client.get(f"/api/rounds/{self.round_id}/export?format=csv")
         self.assertEqual(csv_response.status_code, 200)

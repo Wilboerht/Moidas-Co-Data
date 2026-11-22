@@ -7,7 +7,7 @@ from typing import Any
 import pandas as pd
 
 from ..db import Database
-from ..normalize import fans_tier, format_fans_wan, split_tags
+from ..normalize import format_fans_wan, normalize_tier_label, split_tags
 from ..statuses import STATUS_LABELS
 
 PLATFORM_LABELS = {
@@ -157,7 +157,7 @@ def creator_rows(db: Database, round_id: int) -> pd.DataFrame:
         account_id = row.get("account_id")
         if account_id is None:
             account_id = "" if str(user_id).startswith("import:") else user_id
-        tier_label = row.get("tier_label") or (fans_tier(fans) if fans is not None else "")
+        tier_label = normalize_tier_label(fans, row.get("tier_label"))
         data_round = row.get("data_round") or row.get("round_name") or ""
         rows.append(
             {

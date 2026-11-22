@@ -126,6 +126,11 @@ class EveryInfraProvider(JsonProvider):
             state={"page_token": str(next_token)} if next_token else {},
         )
 
+    def search_users(self, keyword: str) -> SearchResponse:
+        action = "search_users" if self.platform == "xhs" else "user_search"
+        payload = self._call(action, {"keyword": keyword}, self.search_cost_tokens)
+        return SearchResponse(payload=payload, items=_items(payload), state={})
+
     def user(self, user_id: str, profile_url: str = "") -> Any:
         if self.platform == "zhihu":
             params = {"url": profile_url or f"https://www.zhihu.com/people/{user_id}"}

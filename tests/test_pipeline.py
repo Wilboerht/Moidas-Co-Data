@@ -75,10 +75,10 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(summary["enriched"], 1)
 
         rows = self.db.creator_table(round_id)
+        self.assertEqual(len(rows), 1)
         u1 = next(row for row in rows if row["user_id"] == "u1")
-        u2 = next(row for row in rows if row["user_id"] == "u2")
         self.assertEqual(u1["fans"], 19360)
-        self.assertIsNone(u2["fans"])
+        self.assertFalse(any(row["user_id"] == "u2" for row in rows))
         self.assertEqual(u1["sample_notes"], 2)
         self.assertEqual(u1["sample_likes"], 150)
 

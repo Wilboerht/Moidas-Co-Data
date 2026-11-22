@@ -43,7 +43,7 @@ from .auth import (
 from .client import DataFlowClient, RnoteClient
 from .config import PROJECT_ROOT, Settings, load_settings
 from .db import Database, JobBusyError
-from .normalize import as_int, fans_tier, format_fans_wan, split_tags
+from .normalize import as_int, format_fans_wan, normalize_tier_label, split_tags
 from .platforms import PlatformConfigError, load_registry
 from .providers import build_provider
 from .panel.queries import EXPORT_COLUMNS, JOB_STATUS_LABELS, PLATFORM_LABELS, ROUND_STATUS_LABELS
@@ -278,7 +278,7 @@ def _creator_dict(row: dict[str, Any]) -> dict[str, Any]:
     account_id = row.get("account_id")
     if account_id is None:
         account_id = "" if str(user_id).startswith("import:") else user_id
-    tier_label = row.get("tier_label") or (fans_tier(fans) if fans is not None else "—")
+    tier_label = normalize_tier_label(fans, row.get("tier_label")) or "—"
     data_round = row.get("data_round") or row.get("round_name") or ""
     return {
         "key": f"{row['platform']}|{row['user_id']}",
@@ -1044,7 +1044,12 @@ def api_balance(provider: str = "dataflow") -> dict[str, Any]:
 
 @app.get("/api/rounds")
 def list_rounds(db: Database = Depends(get_db)) -> list[dict[str, Any]]:
-    return [_round_dict(row) for row in db.list_rounds()]
+    items: list[dict[str, Any]] = []
+    for row in db.list_rounds():
+        payload = _round_dict(row)
+        payload["job"] = _job_dict(db.latest_job(int(row["id"])))
+        items.append(payload)
+    return items
 
 
 @app.post("/api/rounds")
@@ -1310,6 +1315,11 @@ def latest_job(round_id: int, db: Database = Depends(get_db)) -> dict[str, Any] 
     return _job_dict(db.latest_job(round_id))
 
 
+@app.get("/api/jobs/active")
+def active_job(db: Database = Depends(get_db)) -> dict[str, Any] | None:
+    return _job_dict(db.latest_active_job())
+
+
 @app.get("/api/rounds/{round_id}/calls")
 def recent_calls(round_id: int, db: Database = Depends(get_db)) -> list[dict[str, Any]]:
     return db.recent_api_calls(round_id, limit=30)
@@ -1541,6 +1551,27 @@ def dashboard(
     rounds = [_round_dict(row) for row in db.list_rounds()[:8]]
     payload: dict[str, Any] = {"counts": counts, "recent_rounds": rounds}
     if round_id is None:
+        top_rows = []
+        seen: set[tuple[str, str]] = set()
+        for row in db.query_creators(None, sort="interaction", page_size=100)["items"]:
+            key = (str(row["platform"]), str(row["user_id"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            top_rows.append(row)
+            if len(top_rows) >= 5:
+                break
+        metrics = db.all_round_metrics()
+        metrics["cost"] = db.sum_round_cost(None)
+        payload.update(
+            {
+                "round": None,
+                "tier_counts": db.all_tier_counts(),
+                "status_counts": db.all_status_counts(),
+                "top_creators": [_creator_dict(row) for row in top_rows],
+                "metrics": metrics,
+            }
+        )
         return payload
     if not db.get_round(round_id):
         raise HTTPException(404, "轮次不存在")

@@ -169,6 +169,7 @@ export const api = {
       body: JSON.stringify(payload),
     }),
   getJob: (roundId: number) => request<Job | null>(`/rounds/${roundId}/job`),
+  getActiveJob: () => request<Job | null>(`/jobs/active`),
   getCalls: (roundId: number) => request<ApiCall[]>(`/rounds/${roundId}/calls`),
   getLog: (roundId: number, lines = 300) =>
     request<{ path: string; content: string }>(`/rounds/${roundId}/log?lines=${lines}`),

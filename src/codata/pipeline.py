@@ -273,6 +273,9 @@ class Pipeline:
             print(f"[user] {creator.get('nickname') or user_id}: 粉丝 {creator.get('fans', 0)}")
 
         rows = self.db.refresh_creator_rounds(round_id)
+        if max_creators is not None:
+            self.db.prune_round_creators(round_id, max_creators)
+            rows = self.db.round_metrics(round_id)["creators"]
         round_cost = self.db.sum_round_cost(round_id)
         job_cost = self.db.sum_job_cost(job_id)
         self.db.update_round(

@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from .normalize import derive_tags, utc_now
+from .normalize import TIER_LABELS, derive_tags, normalize_tier_label, utc_now
 from .statuses import DEFAULT_STATUS, normalize_status
 
 
@@ -199,6 +199,17 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions (user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions (expires_at);
 
+CREATE TABLE IF NOT EXISTS backfill_attempts (
+    platform TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    query TEXT,
+    matched_user_id TEXT,
+    error TEXT,
+    attempted_at TEXT NOT NULL,
+    PRIMARY KEY (platform, user_id)
+);
+
 CREATE TABLE IF NOT EXISTS audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER,
@@ -213,18 +224,18 @@ CREATE TABLE IF NOT EXISTS audit_log (
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log (ts);
 """
 
-TIER_SQL = """
-COALESCE(
-    NULLIF(cr.tier_label, ''),
-    CASE
-        WHEN c.fans IS NULL THEN '未补全'
-        WHEN c.fans >= 1000000 THEN '顶流'
-        WHEN c.fans >= 500000 THEN '头部'
-        WHEN c.fans >= 100000 THEN '腰部'
-        WHEN c.fans >= 10000 THEN '尾部'
-        ELSE '素人'
-    END
-)
+TIER_LABELS_SQL = "(" + ", ".join(f"'{label}'" for label in TIER_LABELS) + ")"
+
+TIER_SQL = f"""
+CASE
+    WHEN c.fans >= 1000000 THEN '顶流'
+    WHEN c.fans >= 500000 THEN '头部'
+    WHEN c.fans >= 100000 THEN '腰部'
+    WHEN c.fans >= 10000 THEN '尾部'
+    WHEN c.fans IS NOT NULL THEN '素人'
+    WHEN cr.tier_label IN {TIER_LABELS_SQL} THEN cr.tier_label
+    ELSE '未补全'
+END
 """
 
 DATA_ROUND_SQL = "COALESCE(NULLIF(cr.data_round, ''), r.name)"
@@ -375,20 +386,45 @@ class Database:
         ):
             if column not in existing:
                 self._conn.execute(f"ALTER TABLE creator_rounds ADD COLUMN {column} TEXT")
+        canonical_placeholders = ", ".join("?" for _ in TIER_LABELS)
+        self._conn.execute(
+            f"""
+            UPDATE creator_rounds
+            SET tier_label = (
+                SELECT CASE
+                    WHEN c.fans >= 1000000 THEN '顶流'
+                    WHEN c.fans >= 500000 THEN '头部'
+                    WHEN c.fans >= 100000 THEN '腰部'
+                    WHEN c.fans >= 10000 THEN '尾部'
+                    WHEN c.fans IS NOT NULL THEN '素人'
+                END
+                FROM creators c
+                WHERE c.platform = creator_rounds.platform
+                  AND c.user_id = creator_rounds.user_id
+            )
+            WHERE tier_label IS NOT NULL
+              AND tier_label NOT IN ({canonical_placeholders})
+            """,
+            TIER_LABELS,
+        )
         status_map = {
             "待审核": "pending",
-            "候选": "candidate",
+            "候选": "shortlisted",
             "备选": "shortlisted",
-            "已推荐": "recommended",
-            "已联系": "contacted",
+            "已推荐": "adopted",
+            "已联系": "shortlisted",
             "已采用": "adopted",
             "未采用": "rejected",
-            "已淘汰": "dropped",
+            "已淘汰": "rejected",
+            "candidate": "shortlisted",
+            "recommended": "adopted",
+            "contacted": "shortlisted",
+            "dropped": "rejected",
         }
-        for label, code in status_map.items():
+        for old, code in status_map.items():
             self._conn.execute(
                 "UPDATE creator_rounds SET status = ? WHERE status = ?",
-                (code, label),
+                (code, old),
             )
         api_columns = {
             row["name"]
@@ -507,11 +543,16 @@ class Database:
                 ),
             )
 
-    def sum_round_cost(self, round_id: int) -> int:
-        row = self._conn.execute(
-            "SELECT COALESCE(SUM(cost), 0) AS total FROM api_calls WHERE round_id = ?",
-            (round_id,),
-        ).fetchone()
+    def sum_round_cost(self, round_id: int | None) -> int:
+        if round_id is None:
+            row = self._conn.execute(
+                "SELECT COALESCE(SUM(cost), 0) AS total FROM api_calls"
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT COALESCE(SUM(cost), 0) AS total FROM api_calls WHERE round_id = ?",
+                (round_id,),
+            ).fetchone()
         return int(row["total"] or 0)
 
     def sum_job_cost(self, job_id: int) -> int:
@@ -651,7 +692,8 @@ class Database:
                        SELECT GROUP_CONCAT(k.word, '、')
                        FROM round_keywords rk JOIN keywords k ON k.id = rk.keyword_id
                        WHERE rk.round_id = r.id
-                   ), '') AS keywords
+                   ), '') AS keywords,
+                   (SELECT COUNT(*) FROM creator_rounds cr WHERE cr.round_id = r.id) AS creators
             FROM rounds r
             ORDER BY r.id DESC
             """
@@ -720,6 +762,81 @@ class Database:
         counts["raw_files"] = len(raw_files)
         counts["log_files"] = len(log_files)
         return {"id": round_id, "name": row["name"], **counts}
+
+    def cleanup_orphans(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        with self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM api_calls WHERE round_id IS NOT NULL AND NOT EXISTS "
+                "(SELECT 1 FROM rounds r WHERE r.id = api_calls.round_id)"
+            )
+            counts["api_calls"] = max(0, cur.rowcount)
+            cur = self._conn.execute(
+                "DELETE FROM creators WHERE NOT EXISTS "
+                "(SELECT 1 FROM creator_rounds cr WHERE cr.platform = creators.platform "
+                "AND cr.user_id = creators.user_id)"
+            )
+            counts["creators"] = max(0, cur.rowcount)
+            cur = self._conn.execute(
+                "DELETE FROM notes WHERE NOT EXISTS "
+                "(SELECT 1 FROM note_hits nh WHERE nh.platform = notes.platform "
+                "AND nh.note_id = notes.note_id) AND NOT EXISTS "
+                "(SELECT 1 FROM creator_rounds cr WHERE cr.platform = notes.platform "
+                "AND cr.top_note_id = notes.note_id)"
+            )
+            counts["notes"] = max(0, cur.rowcount)
+            if self._has_fts:
+                cur = self._conn.execute(
+                    "DELETE FROM creator_search WHERE NOT EXISTS "
+                    "(SELECT 1 FROM creators c WHERE c.platform = creator_search.platform "
+                    "AND c.user_id = creator_search.user_id)"
+                )
+                counts["search_rows"] = max(0, cur.rowcount)
+        return counts
+
+    def prune_round_creators(self, round_id: int, max_creators: int | None) -> int:
+        if not max_creators or max_creators <= 0:
+            return 0
+        reviewed = [
+            row["user_id"]
+            for row in self._conn.execute(
+                "SELECT user_id FROM creator_rounds WHERE round_id = ? AND status <> 'pending'",
+                (round_id,),
+            ).fetchall()
+        ]
+        remaining = max(0, int(max_creators) - len(reviewed))
+        pending = [
+            row["user_id"]
+            for row in self._conn.execute(
+                """
+                SELECT cr.user_id
+                FROM creator_rounds cr
+                LEFT JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id
+                WHERE cr.round_id = ? AND cr.status = 'pending'
+                ORDER BY
+                    CASE WHEN c.fans IS NULL THEN 1 ELSE 0 END,
+                    COALESCE(c.fans, 0) DESC,
+                    COALESCE(cr.sample_interactions, 0) DESC,
+                    cr.user_id
+                LIMIT ?
+                """,
+                (round_id, remaining),
+            ).fetchall()
+        ]
+        keep = set(reviewed) | set(pending)
+        if not keep:
+            return 0
+        placeholders = ", ".join("?" for _ in keep)
+        with self._conn:
+            cur = self._conn.execute(
+                f"DELETE FROM creator_rounds WHERE round_id = ? AND status = 'pending' "
+                f"AND user_id NOT IN ({placeholders})",
+                (round_id, *keep),
+            )
+            deleted = max(0, cur.rowcount)
+        if deleted and self._has_fts:
+            self.rebuild_search_index(round_id)
+        return deleted
 
     def update_round(self, round_id: int, **fields: Any) -> None:
         updates = {key: value for key, value in fields.items() if key in ROUND_FIELDS}
@@ -888,6 +1005,159 @@ class Database:
             fetched = fetched.replace(tzinfo=timezone.utc)
         return datetime.now(timezone.utc) - fetched < timedelta(days=max(0, cache_days))
 
+    # ---- backfill ----
+
+    def backfill_candidates(
+        self,
+        platform: str,
+        limit: int = 20,
+        retry_days: int = 7,
+    ) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """
+            SELECT cr.platform, cr.user_id, MIN(cr.round_id) AS round_id,
+                   c.nickname, c.raw_json, c.fans, c.fetched_at
+            FROM creator_rounds cr
+            JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id
+            WHERE cr.platform = ?
+              AND cr.status = 'pending'
+              AND c.user_id LIKE 'import:%'
+              AND (c.fans IS NULL OR c.fetched_at IS NULL OR c.fetched_at = '')
+              AND NOT EXISTS (
+                  SELECT 1 FROM backfill_attempts ba
+                  WHERE ba.platform = cr.platform AND ba.user_id = cr.user_id
+                    AND ba.status = 'matched'
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM backfill_attempts ba
+                  WHERE ba.platform = cr.platform AND ba.user_id = cr.user_id
+                    AND ba.status = 'no_match'
+                    AND ba.attempted_at >= datetime('now', ?)
+              )
+            GROUP BY cr.platform, cr.user_id
+            ORDER BY round_id, cr.user_id
+            LIMIT ?
+            """,
+            (platform, f"-{max(0, retry_days)} days", max(1, limit)),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_backfill_attempt(
+        self,
+        platform: str,
+        user_id: str,
+        status: str,
+        query: str = "",
+        matched_user_id: str = "",
+        error: str = "",
+    ) -> None:
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO backfill_attempts
+                (platform, user_id, status, query, matched_user_id, error, attempted_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(platform, user_id) DO UPDATE SET
+                    status = excluded.status,
+                    query = excluded.query,
+                    matched_user_id = excluded.matched_user_id,
+                    error = excluded.error,
+                    attempted_at = excluded.attempted_at
+                """,
+                (platform, user_id, status, query, matched_user_id, error, utc_now()),
+            )
+
+    def enrich_imported_creator(
+        self,
+        platform: str,
+        imported_user_id: str,
+        creator: dict[str, Any],
+        account_id: str,
+        query: str,
+        selection_note: str = "",
+    ) -> None:
+        row = self._conn.execute(
+            "SELECT raw_json FROM creators WHERE platform = ? AND user_id = ?",
+            (platform, imported_user_id),
+        ).fetchone()
+        try:
+            original = json.loads((row["raw_json"] if row else "") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            original = {}
+        if not isinstance(original, dict):
+            original = {}
+        profile_raw = creator.get("raw_json") or "{}"
+        try:
+            profile = json.loads(profile_raw)
+        except (TypeError, json.JSONDecodeError):
+            profile = {}
+        if isinstance(profile, dict):
+            profile.pop("_backfill", None)
+            profile.pop("_profile", None)
+        original["_backfill"] = {
+            "query": query,
+            "matched_user_id": account_id,
+            "imported_user_id": imported_user_id,
+            "selection_note": selection_note,
+        }
+        original["_profile"] = profile
+        enriched_raw = json.dumps(original, ensure_ascii=False)
+        with self._conn:
+            self._conn.execute(
+                """
+                UPDATE creators SET
+                    red_id = COALESCE(?, red_id),
+                    nickname = COALESCE(?, nickname),
+                    avatar = COALESCE(?, avatar),
+                    fans = COALESCE(?, fans),
+                    follows = COALESCE(?, follows),
+                    liked = COALESCE(?, liked),
+                    collected = COALESCE(?, collected),
+                    posted = COALESCE(?, posted),
+                    interaction = COALESCE(?, interaction),
+                    desc = COALESCE(?, desc),
+                    tags_json = COALESCE(?, tags_json),
+                    ip_location = COALESCE(?, ip_location),
+                    verify_info = COALESCE(?, verify_info),
+                    profile_url = COALESCE(?, profile_url),
+                    fetched_at = ?,
+                    raw_json = ?
+                WHERE platform = ? AND user_id = ?
+                """,
+                (
+                    creator.get("red_id"),
+                    creator.get("nickname"),
+                    creator.get("avatar"),
+                    creator.get("fans"),
+                    creator.get("follows"),
+                    creator.get("liked"),
+                    creator.get("collected"),
+                    creator.get("posted"),
+                    creator.get("interaction"),
+                    creator.get("desc"),
+                    creator.get("tags_json"),
+                    creator.get("ip_location"),
+                    creator.get("verify_info"),
+                    creator.get("profile_url"),
+                    utc_now(),
+                    enriched_raw,
+                    platform,
+                    imported_user_id,
+                ),
+            )
+            self._conn.execute(
+                "UPDATE creator_rounds SET account_id = ? WHERE platform = ? AND user_id = ?",
+                (account_id, platform, imported_user_id),
+            )
+        self.record_backfill_attempt(
+            platform,
+            imported_user_id,
+            "matched",
+            query=query,
+            matched_user_id=account_id,
+            error=selection_note,
+        )
+
     # ---- aggregation ----
 
     def round_author_stats(self, round_id: int) -> list[dict[str, Any]]:
@@ -1020,6 +1290,9 @@ class Database:
                 creator = item["creator"]
                 note = item.get("note")
                 row = item["round"]
+                tier_label = (
+                    normalize_tier_label(creator.get("fans"), row.get("tier_label")) or None
+                )
                 self._conn.execute(
                     """
                     INSERT INTO creators
@@ -1150,7 +1423,7 @@ class Database:
                         row.get("tags_manual"),
                         row.get("remark"),
                         row.get("data_round"),
-                        row.get("tier_label"),
+                        tier_label,
                         row.get("account_id"),
                         row.get("executor"),
                         row.get("cooperation_platform"),
@@ -1606,9 +1879,11 @@ class Database:
         ).fetchone()
         return dict(row)
 
-    def round_metrics(self, round_id: int) -> dict[str, int]:
+    def round_metrics(self, round_id: int | None) -> dict[str, int]:
+        where = "" if round_id is None else "WHERE cr.round_id = ?"
+        params = () if round_id is None else (round_id,)
         row = self._conn.execute(
-            """
+            f"""
             SELECT
                 COUNT(*) AS creators,
                 SUM(CASE WHEN c.fans IS NOT NULL THEN 1 ELSE 0 END) AS enriched,
@@ -1616,31 +1891,75 @@ class Database:
                 SUM(CASE WHEN cr.status = 'adopted' THEN 1 ELSE 0 END) AS adopted
             FROM creator_rounds cr
             LEFT JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id
-            WHERE cr.round_id = ?
+            {where}
             """,
-            (round_id,),
+            params,
         ).fetchone()
         return {key: int(row[key] or 0) for key in ("creators", "enriched", "pending", "adopted")}
 
-    def status_counts(self, round_id: int) -> dict[str, int]:
-        rows = self._conn.execute(
-            "SELECT status, COUNT(*) AS n FROM creator_rounds WHERE round_id = ? GROUP BY status",
-            (round_id,),
-        ).fetchall()
-        return {row["status"]: int(row["n"]) for row in rows}
+    def all_round_metrics(self) -> dict[str, int]:
+        row = self._conn.execute(
+            """
+            WITH unique_creators AS (
+                SELECT cr.platform, cr.user_id,
+                       MAX(CASE WHEN c.fans IS NOT NULL THEN 1 ELSE 0 END) AS enriched,
+                       MAX(CASE cr.status
+                           WHEN 'adopted' THEN 3
+                           WHEN 'shortlisted' THEN 2
+                           WHEN 'pending' THEN 1
+                           ELSE 0
+                       END) AS status_rank
+                FROM creator_rounds cr
+                LEFT JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id
+                GROUP BY cr.platform, cr.user_id
+            )
+            SELECT
+                COUNT(*) AS creators,
+                SUM(enriched) AS enriched,
+                SUM(CASE WHEN status_rank = 1 THEN 1 ELSE 0 END) AS pending,
+                SUM(CASE WHEN status_rank = 3 THEN 1 ELSE 0 END) AS adopted
+            FROM unique_creators
+            """
+        ).fetchone()
+        return {key: int(row[key] or 0) for key in ("creators", "enriched", "pending", "adopted")}
 
-    def tier_counts(self, round_id: int) -> dict[str, int]:
+    def all_status_counts(self) -> dict[str, int]:
+        rows = self._conn.execute(
+            """
+            WITH unique_creators AS (
+                SELECT cr.platform, cr.user_id,
+                       MAX(CASE cr.status
+                           WHEN 'adopted' THEN 3
+                           WHEN 'shortlisted' THEN 2
+                           WHEN 'pending' THEN 1
+                           ELSE 0
+                       END) AS status_rank
+                FROM creator_rounds cr
+                GROUP BY cr.platform, cr.user_id
+            )
+            SELECT status_rank, COUNT(*) AS n FROM unique_creators GROUP BY status_rank
+            """
+        ).fetchall()
+        labels = {0: "rejected", 1: "pending", 2: "shortlisted", 3: "adopted"}
+        return {labels[int(row["status_rank"])]: int(row["n"]) for row in rows}
+
+    def all_tier_counts(self) -> dict[str, int]:
         from .normalize import fans_tier
 
         rows = self._conn.execute(
             """
-            SELECT c.fans, cr.tier_label FROM creator_rounds cr
-            LEFT JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id
-            WHERE cr.round_id = ?
-            """,
-            (round_id,),
+            WITH unique_creators AS (
+                SELECT cr.platform, cr.user_id, MAX(c.fans) AS fans,
+                       MAX(cr.tier_label) AS tier_label
+                FROM creator_rounds cr
+                LEFT JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id
+                GROUP BY cr.platform, cr.user_id
+            )
+            SELECT fans, tier_label FROM unique_creators
+            """
         ).fetchall()
-        result = {"素人": 0, "尾部": 0, "腰部": 0, "头部": 0, "顶流": 0, "未补全": 0}
+        result = {label: 0 for label in TIER_LABELS}
+        result["未补全"] = 0
         for row in rows:
             if row["tier_label"]:
                 label = row["tier_label"]
@@ -1649,6 +1968,34 @@ class Database:
             else:
                 label = fans_tier(row["fans"])
             result[label] = result.get(label, 0) + 1
+        return result
+
+    def status_counts(self, round_id: int | None) -> dict[str, int]:
+        where = "" if round_id is None else "WHERE round_id = ?"
+        params = () if round_id is None else (round_id,)
+        rows = self._conn.execute(
+            f"SELECT status, COUNT(*) AS n FROM creator_rounds {where} GROUP BY status",
+            params,
+        ).fetchall()
+        return {row["status"]: int(row["n"]) for row in rows}
+
+    def tier_counts(self, round_id: int | None) -> dict[str, int]:
+        where = "" if round_id is None else "WHERE cr.round_id = ?"
+        params = () if round_id is None else (round_id,)
+        rows = self._conn.execute(
+            f"""
+            SELECT {TIER_SQL} AS label, COUNT(*) AS n
+            FROM creator_rounds cr
+            LEFT JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id
+            {where}
+            GROUP BY label
+            """,
+            params,
+        ).fetchall()
+        result = {label: 0 for label in TIER_LABELS}
+        result["未补全"] = 0
+        for row in rows:
+            result[row["label"]] = result.get(row["label"], 0) + int(row["n"])
         return result
 
     # ---- jobs ----
@@ -1710,6 +2057,13 @@ class Database:
     def latest_job(self, round_id: int) -> dict[str, Any] | None:
         row = self._conn.execute(
             "SELECT * FROM jobs WHERE round_id = ? ORDER BY id DESC LIMIT 1", (round_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def latest_active_job(self) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM jobs WHERE status IN ('pending', 'running') "
+            "ORDER BY id DESC LIMIT 1"
         ).fetchone()
         return dict(row) if row else None
 

@@ -17,6 +17,7 @@ type RoundContextValue = {
   roundId: number | null;
   setRoundId: (id: number) => void;
   job: Job | null;
+  activeJob: Job | null;
   counts: Counts | null;
   meta: Meta | null;
   settings: Settings | null;
@@ -56,6 +57,14 @@ export function RoundProvider({ children }: { children: ReactNode }) {
       return status === "running" || status === "pending" ? 2500 : 30000;
     },
   });
+  const activeJobQuery = useQuery({
+    queryKey: ["active-job"],
+    queryFn: api.getActiveJob,
+    refetchInterval: (query) => {
+      const status = query.state.data?.status;
+      return status === "running" || status === "pending" ? 2500 : 5000;
+    },
+  });
 
   useEffect(() => {
     if (!query.data || rounds.length === 0) {
@@ -81,6 +90,7 @@ export function RoundProvider({ children }: { children: ReactNode }) {
   const refreshRounds = useCallback(async () => {
     await queryClient.invalidateQueries({ queryKey: ["bootstrap"] });
     await queryClient.invalidateQueries({ queryKey: ["job"] });
+    await queryClient.invalidateQueries({ queryKey: ["active-job"] });
     await queryClient.invalidateQueries({ queryKey: ["dashboard"] });
   }, [queryClient]);
 
@@ -91,6 +101,7 @@ export function RoundProvider({ children }: { children: ReactNode }) {
       roundId,
       setRoundId,
       job: jobQuery.data ?? null,
+      activeJob: activeJobQuery.data ?? null,
       counts: query.data?.counts ?? null,
       meta: query.data?.meta ?? null,
       settings: query.data?.settings ?? null,
@@ -98,7 +109,7 @@ export function RoundProvider({ children }: { children: ReactNode }) {
       error: query.error instanceof Error ? query.error.message : "",
       refreshRounds,
     }),
-    [jobQuery.data, query.data, query.error, query.isLoading, refreshRounds, roundId, rounds, setRoundId],
+    [jobQuery.data, activeJobQuery.data, query.data, query.error, query.isLoading, refreshRounds, roundId, rounds, setRoundId],
   );
 
   return <RoundContext.Provider value={value}>{children}</RoundContext.Provider>;

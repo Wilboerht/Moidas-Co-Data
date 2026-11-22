@@ -135,7 +135,7 @@ export function NewRoundPage() {
       await queryClient.invalidateQueries({ queryKey: ["keywords"] });
       setRoundId(result.round.id);
       toast.success("采集任务已创建");
-      navigate("/tasks");
+      navigate(`/tasks/${result.round.id}`);
     } catch (err) {
       const message = err instanceof Error ? err.message : "创建失败";
       setError(message);

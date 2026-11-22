@@ -30,6 +30,29 @@ export function fmtDateTime(value: string | null | undefined): string {
   return date.toLocaleString("zh-CN", { hour12: false });
 }
 
+export function fmtDuration(start: string | null | undefined, end: string | null | undefined): string {
+  if (!start) {
+    return "—";
+  }
+  const startMs = new Date(start).getTime();
+  const endMs = end ? new Date(end).getTime() : Date.now();
+  if (Number.isNaN(startMs) || Number.isNaN(endMs) || endMs < startMs) {
+    return "—";
+  }
+  const totalSeconds = Math.round((endMs - startMs) / 1000);
+  if (totalSeconds < 60) {
+    return `${totalSeconds} 秒`;
+  }
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes < 60) {
+    return seconds ? `${minutes} 分 ${seconds} 秒` : `${minutes} 分`;
+  }
+  const hours = Math.floor(minutes / 60);
+  const restMinutes = minutes % 60;
+  return restMinutes ? `${hours} 小时 ${restMinutes} 分` : `${hours} 小时`;
+}
+
 export function shorten(value: string | null | undefined, limit = 36): string {
   const text = String(value || "").replace(/\s+/g, " ").trim();
   if (text.length <= limit) {

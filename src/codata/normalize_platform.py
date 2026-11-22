@@ -364,7 +364,7 @@ def _nested_user(payload: Any) -> dict[str, Any]:
     data = unwrap_data(payload)
     if not isinstance(data, dict):
         return {}
-    for key in ("user", "user_info", "userInfo", "author", "result", "data"):
+    for key in ("user", "user_info", "userInfo", "author", "result", "results", "data"):
         nested = data.get(key)
         if isinstance(nested, dict):
             return nested
@@ -425,6 +425,7 @@ def normalize_xhs_user(payload: Any, user_id: str = "") -> dict[str, Any]:
         "posted": as_int(
             merged.get("posted")
             or merged.get("note_count")
+            or merged.get("post_count")
             or merged.get("accountTotalWorks")
             or merged.get("video_count")
         ),
@@ -432,6 +433,7 @@ def normalize_xhs_user(payload: Any, user_id: str = "") -> dict[str, Any]:
             merged.get("interaction")
             or merged.get("liked")
             or merged.get("liked_count")
+            or merged.get("like_count")
             or merged.get("accountLikes")
         )
         + as_int(
@@ -443,6 +445,7 @@ def normalize_xhs_user(payload: Any, user_id: str = "") -> dict[str, Any]:
         "desc": first_str(
             merged.get("desc"),
             merged.get("description"),
+            merged.get("bio"),
             merged.get("signature"),
             merged.get("accountDesc"),
         ),

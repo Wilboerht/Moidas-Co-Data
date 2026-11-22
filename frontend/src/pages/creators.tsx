@@ -290,6 +290,22 @@ export function CreatorsPage() {
     onError: (error) => toast.error(error instanceof Error ? error.message : "批量更新失败"),
   });
 
+  const statusMutation = useMutation({
+    mutationFn: async ({ item, status }: { item: CreatorRow; status: string }) => {
+      const targetRound = item.round_id ?? roundFilter ?? rounds[0]?.id;
+      if (targetRound == null) throw new Error("无法确定该达人所属轮次");
+      return api.updateCreator(targetRound, item.platform, item.user_id, { status });
+    },
+    onSuccess: async (_updated, variables) => {
+      const label = statuses.find((item) => item.code === variables.status)?.label ?? variables.status;
+      toast.success(`已将「${variables.item.nickname || variables.item.key}」改为${label}`);
+      await queryClient.invalidateQueries({ queryKey: ["creators"] });
+      await queryClient.invalidateQueries({ queryKey: ["facets"] });
+      await queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+    },
+    onError: (error) => toast.error(error instanceof Error ? error.message : "状态更新失败"),
+  });
+
   const clearFilters = () => {
     setSearch("");
     setStatusFilter([]);
@@ -350,7 +366,14 @@ export function CreatorsPage() {
       case "fans": return fmtNumber(item.fans);
       case "fans_wan": return item.fans_wan || "—";
       case "fans_tier": return item.fans_tier || "—";
-      case "status": return <StatusBadge status={item.status} label={item.status_label} />;
+      case "status": return (
+        <InlineStatusSelect
+          item={item}
+          statuses={statuses}
+          pending={statusMutation.isPending && statusMutation.variables?.item.key === item.key}
+          onChange={(status) => statusMutation.mutate({ item, status })}
+        />
+      );
       case "match_direction": return shorten(item.match_direction, 36) || "—";
       case "top_title": return shorten(item.top_title, 48) || "—";
       case "posted": return fmtNumber(item.posted);
@@ -811,6 +834,43 @@ export function CreatorsPage() {
   );
 }
 
+
+function InlineStatusSelect({
+  item,
+  statuses,
+  pending,
+  onChange,
+}: {
+  item: CreatorRow;
+  statuses: { code: string; label: string }[];
+  pending: boolean;
+  onChange: (status: string) => void;
+}) {
+  return (
+    <Select
+      value={item.status}
+      onValueChange={(value) => {
+        if (value !== item.status) onChange(value);
+      }}
+      disabled={pending}
+    >
+      <SelectTrigger
+        size="sm"
+        className="h-7 w-auto max-w-[130px] border-0 bg-transparent px-0.5 shadow-none hover:bg-muted/60 focus-visible:ring-2"
+        aria-label={`?? ${item.nickname || item.key} ?????`}
+      >
+        <StatusBadge status={item.status} label={item.status_label} />
+      </SelectTrigger>
+      <SelectContent position="popper" align="start" sideOffset={4}>
+        {statuses.map((status) => (
+          <SelectItem key={status.code} value={status.code}>
+            {status.label}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  );
+}
 
 function summarize(values: string[], labels?: Map<string, string>) {
   const first = labels?.get(values[0]) ?? values[0];

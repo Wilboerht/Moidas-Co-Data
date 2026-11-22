@@ -14,7 +14,14 @@ from .api import DOUYIN_COST, XHS_COST, DataFlowAPI
 from .client import DataFlowClient, DataFlowError
 from .config import load_settings
 from .db import Database
-from .normalize import as_int, normalize_search_item, normalize_user_info, split_tags, utc_now
+from .normalize import (
+    as_int,
+    normalize_search_item,
+    normalize_tier_label,
+    normalize_user_info,
+    split_tags,
+    utc_now,
+)
 from .panel.queries import PLATFORM_LABELS
 from .pipeline import Pipeline
 from .statuses import normalize_status
@@ -455,7 +462,7 @@ def cmd_import_excel(settings: Any, args: argparse.Namespace) -> None:
                 posted = _cell_int(row.get("笔记数"))
                 liked = _cell_int(row.get("总点赞"))
                 interaction = _cell_int(row.get("互动量"))
-                tier_label = _cell_text(row.get("粉丝层级"))
+                tier_label = normalize_tier_label(fans)
                 data_round = _cell_text(row.get("数据轮次"))
                 status = normalize_status(_cell_text(row.get("采用状态")))
                 direction = _cell_text(row.get("匹配方向"))

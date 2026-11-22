@@ -14,6 +14,7 @@ from codata.normalize import (
     fans_tier,
     format_fans_wan,
     normalize_search_item,
+    normalize_tier_label,
     normalize_user_info,
 )
 from helpers import search_item, user_payload
@@ -57,6 +58,10 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(fans_tier(100_000), "腰部")
         self.assertEqual(fans_tier(500_000), "头部")
         self.assertEqual(fans_tier(1_000_000), "顶流")
+        self.assertEqual(normalize_tier_label(19_360), "尾部")
+        self.assertEqual(normalize_tier_label(None, "腰部"), "腰部")
+        self.assertEqual(normalize_tier_label(None, "腰部（30-100w）"), "")
+        self.assertEqual(normalize_tier_label(123_456, "头部（100w+）"), "腰部")
         self.assertEqual(format_fans_wan(19_360), "1.9万")
         self.assertEqual(format_fans_wan(500), "500")
         self.assertEqual(format_fans_wan(100_000_000), "1.00亿")

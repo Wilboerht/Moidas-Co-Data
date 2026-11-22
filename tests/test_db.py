@@ -191,20 +191,45 @@ class DatabaseTests(unittest.TestCase):
                         "cooperation_platform": "小红书",
                         "raw_title": "原始标题",
                     },
-                }
+                },
+                {
+                    "creator": {
+                        "platform": "xhs",
+                        "user_id": "import:nofans",
+                        "nickname": "缺粉丝数",
+                        "raw_json": "{}",
+                    },
+                    "round": {
+                        "platform": "xhs",
+                        "user_id": "import:nofans",
+                        "status": "待审核",
+                        "tier_label": "中小（1-30w）",
+                    },
+                },
             ],
         )
-        row = self.db.creator_table(round_id)[0]
+        rows = {
+            row["user_id"]: row for row in self.db.creator_table(round_id)
+        }
+        row = rows["import:abc"]
         self.assertEqual(row["nickname"], "导入达人")
         self.assertEqual(row["account_id"], "")
         self.assertEqual(row["data_round"], "第1轮")
-        self.assertEqual(row["tier_label"], "腰部（30-100w）")
+        self.assertEqual(row["tier_label"], "腰部")
         self.assertEqual(row["executor"], "执行者A")
         self.assertEqual(row["cooperation_platform"], "小红书")
         self.assertEqual(row["raw_title"], "原始标题")
-        self.assertEqual(row["status"], "recommended")
+        self.assertEqual(row["status"], "adopted")
         self.assertEqual(row["top_title"], "代表作标题")
-        self.assertEqual(self.db.tier_counts(round_id)["腰部（30-100w）"], 1)
+        self.assertIsNone(rows["import:nofans"]["tier_label"])
+        tiers = self.db.tier_counts(round_id)
+        self.assertEqual(
+            set(tiers), {"素人", "尾部", "腰部", "头部", "顶流", "未补全"}
+        )
+        self.assertEqual(tiers["腰部"], 1)
+        self.assertEqual(tiers["未补全"], 1)
+        facet_values = {item["value"] for item in self.db.creator_facets(round_id)["tiers"]}
+        self.assertTrue(facet_values <= set(tiers))
         self.assertEqual(self.db.round_summary(round_id)["notes"], 1)
 
     def test_bulk_update_review(self) -> None:
@@ -212,13 +237,13 @@ class DatabaseTests(unittest.TestCase):
         changed = self.db.bulk_update_review(
             round_id,
             [("xhs", "u1"), ("xhs", "u2")],
-            status="candidate",
+            status="shortlisted",
             match_direction="咖啡",
             remark="批量",
         )
         self.assertEqual(changed, 2)
         rows = {row["user_id"]: row for row in self.db.creator_table(round_id)}
-        self.assertEqual(rows["u1"]["status"], "candidate")
+        self.assertEqual(rows["u1"]["status"], "shortlisted")
         self.assertEqual(rows["u2"]["match_direction"], "咖啡")
         self.assertEqual(rows["u2"]["remark"], "批量")
 

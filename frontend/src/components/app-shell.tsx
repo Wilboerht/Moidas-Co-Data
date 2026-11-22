@@ -12,6 +12,7 @@ import logo from "@/assets/logo.svg";
 import { AccountMenu } from "@/components/account-menu";
 import { Breadcrumb, BreadcrumbItem, BreadcrumbLink, BreadcrumbList, BreadcrumbPage, BreadcrumbSeparator } from "@/components/ui/breadcrumb";
 import { ThinkingOrb } from "@/components/dissolve/thinking-orb";
+import { roundOrbState } from "@/components/round-status-orb";
 import { Separator } from "@/components/ui/separator";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
@@ -60,6 +61,11 @@ const TITLES: Record<string, string> = {
   "/keywords": "关键词",
   "/settings": "设置",
 };
+
+function titleForPath(pathname: string) {
+  if (pathname.startsWith("/tasks/")) return "任务详情";
+  return TITLES[pathname] ?? "工作台";
+}
 
 function SidebarToggle() {
   const { state, isMobile } = useSidebar();
@@ -205,21 +211,29 @@ export function AppShell() {
   const location = useLocation();
   const [sidebarDefaultOpen] = useState(readSidebarOpen);
   const { user } = useAuth();
-  const { error, job, round } = useRound();
+  const { error, job, round, activeJob, rounds } = useRound();
   const canCollect = user?.role === "admin" || Boolean(user?.can_collect);
-  const status = job?.status ?? round?.status;
-  const statusLabel = job?.status_label ?? round?.status_label;
+  const statusJob = activeJob ?? job;
+  const status = statusJob?.status ?? round?.status;
+  const statusLabel = statusJob?.status_label ?? round?.status_label;
   const statusActive = status === "running" || status === "pending";
   const statusPercent =
-    job && job.progress_total > 0 ? Math.round((job.progress_done / job.progress_total) * 100) : null;
+    statusJob && statusJob.progress_total > 0
+      ? Math.round((statusJob.progress_done / statusJob.progress_total) * 100)
+      : null;
+  const statusRound = statusJob
+    ? rounds.find((item) => item.id === statusJob.round_id) ?? null
+    : round;
   const statusText = status
     ? `${statusLabel ?? status}${statusActive && statusPercent !== null ? ` · ${statusPercent}%` : ""}`
     : "空闲";
+  const orbState = roundOrbState(status);
+  const pageTitle = titleForPath(location.pathname);
+  const isTaskDetail = location.pathname.startsWith("/tasks/");
 
   useEffect(() => {
-    const base = location.pathname.startsWith("/creators/") ? "/creators" : location.pathname;
-    document.title = `${TITLES[base] ?? "工作台"} · Moidas Co-data`;
-  }, [location.pathname]);
+    document.title = `${pageTitle} · Moidas Co-data`;
+  }, [pageTitle]);
 
   return (
     <SidebarProvider defaultOpen={sidebarDefaultOpen}>
@@ -240,9 +254,23 @@ export function AppShell() {
                 )}
               </BreadcrumbItem>
               <BreadcrumbSeparator />
-              <BreadcrumbItem>
-                <BreadcrumbPage>{TITLES[location.pathname] ?? "工作台"}</BreadcrumbPage>
-              </BreadcrumbItem>
+              {isTaskDetail ? (
+                <>
+                  <BreadcrumbItem>
+                    <BreadcrumbLink asChild>
+                      <Link to="/tasks">采集任务</Link>
+                    </BreadcrumbLink>
+                  </BreadcrumbItem>
+                  <BreadcrumbSeparator />
+                  <BreadcrumbItem>
+                    <BreadcrumbPage>{pageTitle}</BreadcrumbPage>
+                  </BreadcrumbItem>
+                </>
+              ) : (
+                <BreadcrumbItem>
+                  <BreadcrumbPage>{pageTitle}</BreadcrumbPage>
+                </BreadcrumbItem>
+              )}
             </BreadcrumbList>
           </Breadcrumb>
           <span className="text-sm font-medium text-[#1C316A] md:hidden">Moidas</span>
@@ -259,8 +287,8 @@ export function AppShell() {
                       size={32}
                       dots={80}
                       dotSize={2}
-                      state="idle"
-                      color="currentColor"
+                      state={orbState}
+                      color={orbState === "error" ? "#ff3b30" : "currentColor"}
                       haptics={false}
                     />
                   </span>
@@ -269,7 +297,7 @@ export function AppShell() {
                 </Link>
               </TooltipTrigger>
               <TooltipContent side="bottom" align="end" sideOffset={6}>
-                采集状态：{statusText}
+                采集状态：{statusText}{statusRound ? ` · ${statusRound.name}` : ""}
               </TooltipContent>
               </Tooltip>
             ) : null}

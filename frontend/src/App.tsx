@@ -5,6 +5,7 @@ import { DashboardPage } from "@/pages/dashboard";
 import { CreatorsPage } from "@/pages/creators";
 import { NewRoundPage } from "@/pages/new-round";
 import { TasksPage } from "@/pages/tasks";
+import { TaskDetailPage } from "@/pages/task-detail";
 import { KeywordsPage } from "@/pages/keywords";
 import { SettingsPage } from "@/pages/settings";
 import { UsersPage } from "@/pages/users";
@@ -40,6 +41,7 @@ export function App() {
           <Route path="/creators" element={<CreatorsPage />} />
           <Route path="/new" element={<NewRoundPage />} />
           <Route path="/tasks" element={<TasksPage />} />
+          <Route path="/tasks/:roundId" element={<TaskDetailPage />} />
           <Route path="/keywords" element={<KeywordsPage />} />
           <Route path="/users" element={<UsersPage />} />
           <Route path="/settings" element={<SettingsPage />} />
