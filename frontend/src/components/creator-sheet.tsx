@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ExternalLink, LoaderCircle, UserCheck } from "lucide-react";
+import { Copy, ExternalLink, Info, LoaderCircle, UserCheck } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/shared/api";
 import { fmtDate, fmtDateTime, fmtNumber, safeHttpUrl, shorten } from "@/shared/format";
@@ -37,6 +37,8 @@ import {
 } from "@/components/ui/sheet";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { cn } from "cn";
 
 export function CreatorSheet({
   roundId,
@@ -60,6 +62,12 @@ export function CreatorSheet({
     enabled: Boolean(platform && userId),
   });
   const profileHref = safeHttpUrl(detail.data?.profile_url);
+  const isEnriched = detail.data
+    ? Boolean(detail.data.fetched_at) ||
+      (detail.data.fans != null &&
+        detail.data.posted != null &&
+        detail.data.liked != null)
+    : false;
   const requestClose = () => {
     if (dirtyRef.current) {
       setCloseConfirmOpen(true);
@@ -88,7 +96,7 @@ export function CreatorSheet({
               <SheetDescription className="flex flex-wrap items-center gap-x-2 gap-y-1">
                 <span>
                   {detail.data?.platform_label || platform}
-                  {detail.data?.fetched_at ? " · 资料已补全" : " · 资料未补全"}
+                  {isEnriched ? " · 资料已补全" : " · 资料待补全"}
                 </span>
                 {profileHref ? (
                   <a
@@ -105,38 +113,42 @@ export function CreatorSheet({
             </div>
           </div>
         </SheetHeader>
-        <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
-          {detail.isLoading ? (
+        {detail.isLoading ? (
+          <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
             <div className="space-y-3">
               <Skeleton className="h-8 w-1/2" />
               <Skeleton className="h-24 w-full" />
               <Skeleton className="h-40 w-full" />
             </div>
-          ) : detail.error ? (
+          </div>
+        ) : detail.error ? (
+          <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
             <p className="text-sm text-destructive">
               {detail.error instanceof Error ? detail.error.message : "加载详情失败"}
             </p>
-          ) : detail.data ? (
-            <CreatorDetailForm
-              roundId={roundId}
-              detail={detail.data}
-              statuses={statuses}
-              onSaved={async (updated) => {
-                await queryClient.invalidateQueries({ queryKey: ["creators"] });
-                await queryClient.invalidateQueries({ queryKey: ["facets"] });
-                await queryClient.invalidateQueries({ queryKey: ["dashboard"] });
-                await queryClient.invalidateQueries({ queryKey: ["activity"] });
-                await refreshRounds();
-                queryClient.setQueryData(["creator", roundId, platform, userId], updated);
-              }}
-              onDirtyChange={(dirty) => { dirtyRef.current = dirty; }}
-            />
-          ) : (
+          </div>
+        ) : detail.data ? (
+          <CreatorDetailForm
+            roundId={roundId}
+            detail={detail.data}
+            statuses={statuses}
+            onSaved={async (updated) => {
+              await queryClient.invalidateQueries({ queryKey: ["creators"] });
+              await queryClient.invalidateQueries({ queryKey: ["facets"] });
+              await queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+              await queryClient.invalidateQueries({ queryKey: ["activity"] });
+              await refreshRounds();
+              queryClient.setQueryData(["creator", roundId, platform, userId], updated);
+            }}
+            onDirtyChange={(dirty) => { dirtyRef.current = dirty; }}
+          />
+        ) : (
+          <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
             <p className="text-sm text-muted-foreground">
               未找到该达人，链接可能已失效。
             </p>
-          )}
-        </div>
+          </div>
+        )}
         <AlertDialog open={closeConfirmOpen} onOpenChange={setCloseConfirmOpen}>
           <AlertDialogContent>
             <AlertDialogHeader>
@@ -180,6 +192,7 @@ function CreatorDetailForm({
   const [direction, setDirection] = useState(detail.match_direction || "");
   const [tags, setTags] = useState(detail.tags_manual || "");
   const [remark, setRemark] = useState(detail.remark || "");
+  const [descExpanded, setDescExpanded] = useState(false);
   const [pendingOwner, setPendingOwner] = useState<{ userId: number | null; username: string } | null>(null);
   const { user } = useAuth();
   const canEdit = true;
@@ -194,6 +207,7 @@ function CreatorDetailForm({
     setDirection(detail.match_direction || "");
     setTags(detail.tags_manual || "");
     setRemark(detail.remark || "");
+    setDescExpanded(false);
   }, [detail]);
 
   const dirty =
@@ -313,12 +327,16 @@ function CreatorDetailForm({
   ] as const;
   const hasSampleData = sampleStats.some(([, value]) => value > 0);
 
+  const sourceRound =
+    detail.data_round && detail.data_round !== detail.round_name
+      ? detail.data_round
+      : "";
   const concreteMetadata: [string, string][] = [
     ["粉丝层级", detail.fans_tier],
     ["账号 ID", detail.account_id],
     ["小红书号", detail.red_id],
     ["当前轮次", detail.round_name],
-    ["数据轮次", detail.data_round],
+    ["来源轮次", sourceRound],
     ["IP 属地", detail.ip_location],
     ["关注数", detail.follows != null ? fmtNumber(detail.follows) : ""],
     ["总收藏", detail.collected != null ? fmtNumber(detail.collected) : ""],
@@ -330,9 +348,18 @@ function CreatorDetailForm({
     ["来源标签", sourceLabels.join("、")],
     ["原始标题", detail.raw_title],
   ].filter((entry): entry is [string, string] => Boolean(entry[1]?.trim()));
+  const copyValue = async (value: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      toast.success("已复制");
+    } catch {
+      toast.error("复制失败");
+    }
+  };
 
   return (
     <>
+    <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
     <div className="space-y-6">
       <div className="grid grid-cols-2 gap-px border bg-border sm:grid-cols-4">
         {metrics.map(([label, value]) => (
@@ -343,12 +370,43 @@ function CreatorDetailForm({
         ))}
       </div>
 
-      {detail.desc ? <p className="text-sm text-muted-foreground">{detail.desc}</p> : null}
+      {detail.desc ? (
+        <div className="space-y-1">
+          <p className={cn("text-sm text-muted-foreground", !descExpanded && "line-clamp-3")}>
+            {detail.desc}
+          </p>
+          {detail.desc.length > 120 ? (
+            <button
+              type="button"
+              onClick={() => setDescExpanded((value) => !value)}
+              className="text-xs text-muted-foreground underline underline-offset-4 hover:text-foreground"
+            >
+              {descExpanded ? "收起" : "展开"}
+            </button>
+          ) : null}
+        </div>
+      ) : null}
 
       <div className="space-y-2">
         <div className="flex flex-wrap items-center justify-between gap-3 border bg-muted/20 px-3 py-2.5">
           <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1">
-            <span className="text-xs text-muted-foreground">跟进人</span>
+            <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+              跟进人
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="查看跟进人说明"
+                    className="inline-flex size-4 items-center justify-center rounded-full transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+                  >
+                    <Info className="size-3" aria-hidden="true" />
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" className="max-w-xs">
+                  跟进人仅表示当前跟进人，不限制编辑；未分配时首次保存标注或状态会自动归你跟进。
+                </TooltipContent>
+              </Tooltip>
+            </span>
             {!canAssignOwner ? (
               <span className="text-sm font-medium">
                 {detail.owner_username || (detail.owner_user_id ? "未知用户" : "未分配")}
@@ -463,7 +521,22 @@ function CreatorDetailForm({
             {concreteMetadata.map(([label, value]) => (
               <div key={label} className="min-w-0">
                 <dt className="text-xs text-muted-foreground">{label}</dt>
-                <dd className="truncate text-sm" title={value}>{value}</dd>
+                {label === "账号 ID" ? (
+                  <dd className="flex min-w-0 items-center gap-1">
+                    <span className="truncate text-sm" title={value}>{value}</span>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      aria-label="复制账号 ID"
+                      onClick={() => void copyValue(value)}
+                    >
+                      <Copy className="size-3" />
+                    </Button>
+                  </dd>
+                ) : (
+                  <dd className="truncate text-sm" title={value}>{value}</dd>
+                )}
               </div>
             ))}
           </dl>
@@ -541,34 +614,16 @@ function CreatorDetailForm({
             />
           </div>
         </div>
-        {mutation.isError ? (
-          <p className="text-sm text-destructive">
-            {mutation.error instanceof Error ? mutation.error.message : "保存失败"}
-          </p>
-        ) : null}
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <p className={`text-xs ${dirty ? "text-amber-600" : "text-muted-foreground"}`}>
-            {dirty ? "有未保存的修改" : "当前标注已是最新"}
-          </p>
-          <Button onClick={() => mutation.mutate()} disabled={!canEdit || !dirty || mutation.isPending}>
-            {mutation.isPending ? (
-              <>
-                <LoaderCircle className="animate-spin" />
-                保存中…
-              </>
-            ) : (
-              "保存标注"
-            )}
-          </Button>
-        </div>
       </section>
 
-      <section className="space-y-3 border-t pt-4">
-        <h3 className="text-sm font-semibold">样本笔记</h3>
+      <details className="group border-t pt-4">
+        <summary className="cursor-pointer text-sm font-semibold">
+          样本笔记（{notes.length}）
+        </summary>
         {notes.length === 0 ? (
-          <p className="text-sm text-muted-foreground">没有样本笔记。</p>
+          <p className="mt-3 text-sm text-muted-foreground">没有样本笔记。</p>
         ) : (
-          <div className="divide-y border-y">
+          <div className="mt-3 divide-y border-y">
             {notes.map((note) => {
               const title = shorten(note.title, 72) || "无标题";
               return (
@@ -597,7 +652,44 @@ function CreatorDetailForm({
             })}
           </div>
         )}
-      </section>
+      </details>
+    </div>
+    </div>
+    <div className="shrink-0 border-t bg-background px-4 py-3">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <p
+          className={cn(
+            "min-w-0 flex-1 text-xs",
+            mutation.isError
+              ? "text-destructive"
+              : dirty
+                ? "text-amber-600"
+                : "text-muted-foreground",
+          )}
+        >
+          {mutation.isError
+            ? mutation.error instanceof Error
+              ? mutation.error.message
+              : "保存失败"
+            : dirty
+              ? "有未保存的修改"
+              : "当前标注已是最新"}
+        </p>
+        <Button
+          className="shrink-0"
+          onClick={() => mutation.mutate()}
+          disabled={!canEdit || !dirty || mutation.isPending}
+        >
+          {mutation.isPending ? (
+            <>
+              <LoaderCircle className="animate-spin" />
+              保存中…
+            </>
+          ) : (
+            "保存标注"
+          )}
+        </Button>
+      </div>
     </div>
     <AlertDialog open={pendingOwner !== null} onOpenChange={(open) => !open && setPendingOwner(null)}>
       <AlertDialogContent>

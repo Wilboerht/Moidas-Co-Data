@@ -50,16 +50,16 @@ const UPDATED_AT = new Date(BUILD_TIME).toLocaleString("zh-CN", {
 });
 
 const DATA_POLICY = [
-  { label: "数据存储", value: "SQLite 数据库保存在本机 data 目录，启用 WAL 与安全写入。" },
+  { label: "数据存储", value: "SQLite 数据库保存在当前部署实例的 data 目录，启用 WAL 与安全写入。" },
   {
     label: "自动备份",
     value:
-      "数据库结构升级前自动备份；默认保留 90 天、最多 10 份，可用 CODATA_BACKUP_RETENTION_DAYS / CODATA_BACKUP_RETENTION_COUNT 调整（0 关闭）。",
+      "数据库结构升级前自动备份；默认保留 90 天、最多 10 份，可用 CODATA_BACKUP_RETENTION_DAYS / CODATA_BACKUP_RETENTION_COUNT 调整（0 表示对应规则不限制）。",
   },
   { label: "原始响应", value: "服务商原始响应保存在 data/raw，便于复核与重新解析。" },
   { label: "运行日志", value: "采集与运行日志保存在 data/logs。" },
   { label: "访问凭据", value: "访问令牌仅写入 .env，界面只显示配置状态。" },
-  { label: "网络边界", value: "面板默认只监听本机；公网访问需 Nginx/HTTPS 与账号登录。" },
+  { label: "网络边界", value: "默认只监听本机；也支持通过 Nginx/HTTPS 在单台服务器上进行内网或公网部署，所有用户均需登录。" },
   { label: "采集边界", value: "仅采集公开数据，并遵守各服务商的使用条款。" },
 ];
 
@@ -557,10 +557,10 @@ export function SettingsPage() {
               <Section className="ring-0" title="Moidas Co-data" description="多平台信息数据处理工作台">
                 <div className="max-w-5xl space-y-3 text-sm text-muted-foreground">
                   <p>
-                    这是一个本地运行的研究工作台，把关键词搜索、作者去重、资料补全和人工标注放在同一流程里。
+                    这是一个支持本机使用与单机部署的研究工作台，把关键词搜索、作者去重、资料补全和人工标注放在同一流程里。
                   </p>
                   <p>
-                    数据默认保存在本机 data 目录；只有采集请求会访问 .env 中配置的 DataFlow 或 Rnote 地址。面板默认只监听本机，公网部署请使用 Nginx/HTTPS 和账号登录。
+                    默认只监听本机；通过 Nginx/HTTPS 也可部署到单台服务器，供内网或公网团队访问。数据保存在当前部署实例的 data 目录，采集请求只访问 .env 中配置的服务商地址。当前采用单实例架构，用户共享业务数据，不提供多实例或多租户隔离。
                   </p>
                   <div className="flex flex-nowrap items-center gap-1 overflow-x-auto pt-1 text-xs">
                     {[
@@ -635,7 +635,7 @@ export function SettingsPage() {
                   ))}
                 </ol>
               </AboutInfoCard>
-              <AboutInfoCard title="数据与安全" description="数据仅保存在本机，令牌不会在界面回显">
+              <AboutInfoCard title="数据与安全" description="数据保存在当前部署实例，令牌不会在界面回显">
                 <dl className="space-y-3">
                   {DATA_POLICY.map((item) => (
                     <div key={item.label} className="grid grid-cols-[76px_1fr] gap-3">
