@@ -1,13 +1,13 @@
-import { useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { useEffect, useState } from "react";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft } from "lucide-react";
+import { Archive, ArrowLeft, RotateCcw, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/shared/api";
 import { fmtDateTime, fmtDuration, fmtNumber } from "@/shared/format";
 import { useAuth } from "@/shared/auth-context";
 import { useRound } from "@/shared/round-context";
-import type { ApiCall, Round } from "@/shared/types";
+import type { ApiCall, Round, RoundImpact } from "@/shared/types";
 import { ErrorState, Page, PageHeader, Section } from "@/components/page";
 import {
   AlertDialog,
@@ -20,6 +20,22 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { StatusBadge } from "@/components/status-badge";
 import { RoundStatusOrb } from "@/components/round-status-orb";
 import { Button } from "@/components/ui/button";
@@ -63,14 +79,34 @@ export function TaskDetailPage() {
   const parsedId = Number(params.roundId);
   const roundId = Number.isInteger(parsedId) && parsedId > 0 ? parsedId : null;
   const { user } = useAuth();
-  const { refreshRounds } = useRound();
-  const canCollect = user?.role === "admin" || Boolean(user?.can_collect);
+  const { refreshRounds, settings } = useRound();
+  const navigate = useNavigate();
+  const isAdmin = user?.role === "admin";
+  const canCollect = isAdmin || Boolean(user?.can_collect);
   const queryClient = useQueryClient();
   const [forceRefresh, setForceRefresh] = useState(false);
+  const [forceRun, setForceRun] = useState(false);
+  const [providerOverride, setProviderOverride] = useState("");
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [starting, setStarting] = useState(false);
   const [cancelOpen, setCancelOpen] = useState(false);
   const [cancelling, setCancelling] = useState(false);
+  const [archiveBusy, setArchiveBusy] = useState(false);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [impact, setImpact] = useState<RoundImpact | null>(null);
+  const [confirmName, setConfirmName] = useState("");
+  const [deleting, setDeleting] = useState(false);
+
+  useEffect(() => {
+    setForceRefresh(false);
+    setForceRun(false);
+    setProviderOverride("");
+    setConfirmOpen(false);
+    setCancelOpen(false);
+    setDeleteOpen(false);
+    setImpact(null);
+    setConfirmName("");
+  }, [roundId]);
 
   const taskQuery = useQuery({
     queryKey: ["task", roundId],
@@ -118,7 +154,16 @@ export function TaskDetailPage() {
     }
     setStarting(true);
     try {
-      await api.runRound(roundId, forceRefresh, false);
+      const roundPlatform = taskQuery.data?.round.platform ?? "xhs";
+      const providerOptions =
+        settings?.platforms.find((item) => item.code === roundPlatform)?.providers ?? [];
+      const providerValue =
+        providerOverride || taskQuery.data?.round.provider || "auto";
+      const provider =
+        providerValue === "auto" || providerOptions.some((item) => item.id === providerValue)
+          ? providerValue
+          : undefined;
+      await api.runRound(roundId, forceRefresh, forceRun, provider);
       setConfirmOpen(false);
       toast.success(forceRefresh ? "已开始强制刷新采集" : "已开始采集");
       await queryClient.invalidateQueries({ queryKey: ["task", roundId] });
@@ -150,6 +195,55 @@ export function TaskDetailPage() {
     }
   };
 
+  const setArchived = async (archived: boolean) => {
+    if (roundId === null) return;
+    setArchiveBusy(true);
+    try {
+      if (archived) await api.archiveRound(roundId);
+      else await api.restoreRound(roundId);
+      toast.success(archived ? "已归档轮次" : "已恢复轮次");
+      await queryClient.invalidateQueries({ queryKey: ["task", roundId] });
+      await queryClient.invalidateQueries({ queryKey: ["task-list"] });
+      await refreshRounds();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "操作失败");
+    } finally {
+      setArchiveBusy(false);
+    }
+  };
+
+  const openDelete = async () => {
+    if (roundId === null) return;
+    try {
+      const nextImpact = await api.getRoundImpact(roundId);
+      setImpact(nextImpact);
+      setConfirmName("");
+      setDeleteOpen(true);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "加载影响范围失败");
+    }
+  };
+
+  const purge = async () => {
+    if (roundId === null || !impact) return;
+    if (confirmName.trim() !== impact.name) {
+      toast.error("请输入完整的轮次名称");
+      return;
+    }
+    setDeleting(true);
+    try {
+      await api.deleteRound(roundId, confirmName.trim());
+      setDeleteOpen(false);
+      toast.success("轮次已永久删除");
+      await refreshRounds();
+      navigate("/tasks");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "删除失败");
+    } finally {
+      setDeleting(false);
+    }
+  };
+
   if (roundId === null) {
     return (
       <Page>
@@ -178,6 +272,11 @@ export function TaskDetailPage() {
   const round = taskQuery.data?.round as Round | undefined;
   const job = taskQuery.data?.job ?? null;
   const calls = taskQuery.data?.calls ?? [];
+  const roundPlatform = round?.platform ?? "xhs";
+  const providerOptions =
+    settings?.platforms.find((item) => item.code === roundPlatform)?.providers ?? [];
+  const providerValue = providerOverride || round?.provider || "auto";
+  const canCancel = isAdmin || (job?.created_by != null && job.created_by === user?.id);
   const running = job?.status === "running" || job?.status === "pending";
   const taskBusy = running || taskQuery.isLoading || taskQuery.isFetching || !canCollect;
   const progress = job && job.progress_total > 0
@@ -197,8 +296,8 @@ export function TaskDetailPage() {
       <PageHeader
         title={round?.name ?? `轮次 ${roundId}`}
         description={`${round?.platform_label ?? "小红书"} / ${round?.provider_label ?? "自动"} · 创建于 ${fmtDateTime(round?.created_at)}${
-          running ? " · 运行中每 2.5 秒自动刷新" : ""
-        }`}
+          round?.archived ? " · 已归档" : ""
+        }${running ? " · 运行中每 2.5 秒自动刷新" : ""}`}
         actions={
           <>
             <Button variant="outline" onClick={() => { void taskQuery.refetch(); void logQuery.refetch(); }}>
@@ -211,9 +310,14 @@ export function TaskDetailPage() {
         }
       />
 
-      {job?.error ? (
+      {job?.error && job.status !== "cancelled" ? (
         <div className="border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive">
           任务失败：{job.error}
+        </div>
+      ) : null}
+      {job?.status === "cancelled" ? (
+        <div className="border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+          任务已取消，已产生的数据和费用会保留。
         </div>
       ) : null}
 
@@ -303,9 +407,9 @@ export function TaskDetailPage() {
           <Section
             title="运行日志"
             description={
-              logQuery.data?.path
+              logQuery.data?.path && isAdmin
                 ? `最近一次运行 · ${logQuery.data.path}`
-                : "任务开始后会生成日志"
+                : "任务开始后生成日志"
             }
             actions={
               <Button variant="outline" size="sm" onClick={() => void logQuery.refetch()}>
@@ -313,8 +417,15 @@ export function TaskDetailPage() {
               </Button>
             }
           >
-            <pre className="max-h-[420px] overflow-auto border bg-muted/30 p-3 font-mono text-xs whitespace-pre-wrap">
-              {logQuery.data?.content || "暂无日志"}
+            <pre
+              aria-live="polite"
+              className="max-h-[420px] overflow-auto border bg-muted/30 p-3 font-mono text-xs whitespace-pre-wrap"
+            >
+              {logQuery.isLoading
+                ? "加载中…"
+                : logQuery.error
+                  ? `日志加载失败：${logQuery.error instanceof Error ? logQuery.error.message : "未知错误"}`
+                  : logQuery.data?.content || "暂无日志"}
             </pre>
           </Section>
 
@@ -368,18 +479,81 @@ export function TaskDetailPage() {
                 <Label htmlFor="force-refresh" className="text-sm font-medium">强制刷新达人资料</Label>
                 <Switch id="force-refresh" checked={forceRefresh} onCheckedChange={setForceRefresh} />
               </div>
+              <div className="flex items-center justify-between gap-4">
+                <Label htmlFor="force-run" className="text-sm font-medium">跳过余额检查</Label>
+                <Switch id="force-run" checked={forceRun} onCheckedChange={setForceRun} />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="run-provider">本次服务商</Label>
+                <Select value={providerValue} onValueChange={setProviderOverride}>
+                  <SelectTrigger id="run-provider" className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="auto">自动（最便宜可用）</SelectItem>
+                    {providerOptions.map((option) => (
+                      <SelectItem
+                        key={option.id}
+                        value={option.id}
+                        disabled={!option.enabled || !option.ready}
+                      >
+                        {option.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
               <Button
                 variant="outline"
                 className="w-full"
-                disabled={taskBusy}
+                disabled={taskBusy || Boolean(round?.archived)}
                 onClick={() => setConfirmOpen(true)}
               >
                 {job ? "重新采集" : "开始采集"}
               </Button>
+              {running ? (
+                <Button
+                  variant="destructive"
+                  className="w-full"
+                  disabled={!canCancel || cancelling}
+                  onClick={() => setCancelOpen(true)}
+                >
+                  {cancelling ? "取消中…" : "取消任务"}
+                </Button>
+              ) : null}
               {running ? <p className="text-xs text-muted-foreground">任务正在运行，请等待当前任务结束。</p> : null}
+              {round?.archived ? <p className="text-xs text-muted-foreground">轮次已归档，恢复后才能重新采集。</p> : null}
               {!canCollect ? <p className="text-xs text-muted-foreground">当前账号没有发起采集的权限。</p> : null}
             </div>
           </Section>
+
+          {isAdmin ? (
+            <Section title="轮次管理">
+              <div className="space-y-3">
+                <Button
+                  variant="outline"
+                  className="w-full"
+                  disabled={archiveBusy || running}
+                  onClick={() => void setArchived(!round?.archived)}
+                >
+                  {round?.archived ? <RotateCcw /> : <Archive />}
+                  {round?.archived ? "恢复轮次" : "归档轮次"}
+                </Button>
+                <Button
+                  variant="ghost"
+                  className="w-full text-destructive hover:bg-destructive/10 hover:text-destructive"
+                  disabled={running}
+                  onClick={() => void openDelete()}
+                >
+                  <Trash2 />
+                  永久删除
+                </Button>
+                <p className="text-xs text-muted-foreground">
+                  归档保留全部数据和线索关联；关联线索的轮次不能永久删除。
+                </p>
+              </div>
+            </Section>
+          ) : null}
 
           <Section title="采集配置">
             <dl className="space-y-3 text-sm">
@@ -460,6 +634,7 @@ export function TaskDetailPage() {
             <AlertDialogTitle>{job ? "重新运行采集？" : "开始采集？"}</AlertDialogTitle>
             <AlertDialogDescription>
               会再次调用接口读取数据。已缓存的内容默认不会重复扣费。
+              {forceRun ? " 本次已选择跳过余额检查。" : ""}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -470,6 +645,68 @@ export function TaskDetailPage() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      <Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>永久删除轮次？</DialogTitle>
+            <DialogDescription>
+              此操作会删除轮次、达人-轮次关系、笔记关联、任务和接口记录，并清理孤立数据。删除前会自动备份数据库。
+            </DialogDescription>
+          </DialogHeader>
+          {impact ? (
+            <div className="space-y-3 text-sm">
+              <div className="grid grid-cols-2 gap-2 border p-3">
+                <span>达人-轮次：{fmtNumber(impact.creators)}</span>
+                <span>已审核/负责：{fmtNumber(impact.creators_reviewed)}</span>
+                <span>笔记：{fmtNumber(impact.notes)}</span>
+                <span>关联线索：{fmtNumber(impact.leads)}</span>
+                <span>已转线索：{fmtNumber(impact.leads_converted)}</span>
+                <span>接口调用：{fmtNumber(impact.api_calls)}</span>
+                <span>原始文件：{fmtNumber(impact.raw_files)}</span>
+                <span>日志文件：{fmtNumber(impact.log_files)}</span>
+              </div>
+              {!impact.can_purge ? (
+                <p className="border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+                  {impact.jobs_active > 0
+                    ? "该轮次仍有运行中的任务，请先取消。"
+                    : "该轮次仍关联线索，不能永久删除；请使用归档。"}
+                </p>
+              ) : (
+                <>
+                  <p className="text-muted-foreground">
+                    请输入轮次名称 <strong>{impact.name}</strong> 以确认：
+                  </p>
+                  <Input
+                    value={confirmName}
+                    onChange={(event) => setConfirmName(event.target.value)}
+                    placeholder={impact.name}
+                    autoComplete="off"
+                  />
+                </>
+              )}
+            </div>
+          ) : (
+            <Skeleton className="h-24 w-full" />
+          )}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDeleteOpen(false)} disabled={deleting}>
+              取消
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={() => void purge()}
+              disabled={
+                deleting ||
+                !impact?.can_purge ||
+                confirmName.trim() !== impact?.name
+              }
+            >
+              {deleting ? "删除中…" : "确认永久删除"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </Page>
   );
 }

@@ -9,19 +9,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
 
-from codata.client import RnoteClient
+from codata.client import DataFlowClient, ProviderError, RnoteClient
 from codata.config import Settings
 from codata.db import Database
 from codata.normalize import normalize_rnote_user, normalize_search_item
 from codata.normalize_platform import normalize_search_item_platform, normalize_user_platform
-from codata.platforms import PlatformConfigError, Price, load_registry, validate_provider_host
+from codata.platforms import (
+    PlatformConfigError,
+    Price,
+    _validate_path,
+    load_registry,
+    validate_provider_host,
+)
 from codata.pipeline import Pipeline
 from codata.providers import BalanceResponse, RnoteProvider, SearchResponse
-from codata.providers_multi import EveryInfraProvider
+from codata.providers_multi import EveryInfraProvider, _has_more
 from helpers import search_item, user_payload
 
 
@@ -52,6 +59,120 @@ class ProviderTests(unittest.TestCase):
             validate_provider_host("https://rnote.dev", ("rnote.dev",)),
             "rnote.dev",
         )
+
+    def test_balance_path_must_be_relative(self) -> None:
+        with self.assertRaises(PlatformConfigError):
+            _validate_path("//evil.example/steal", "balance_path")
+        with self.assertRaises(PlatformConfigError):
+            _validate_path("https://evil.example/steal", "balance_path")
+        self.assertEqual(_validate_path("/api/balance", "balance_path"), "/api/balance")
+
+    def test_rnote_falsy_success_is_rejected(self) -> None:
+        settings = Settings(
+            host="",
+            token="",
+            rnote_host="https://rnote.dev",
+            rnote_api_key="key",
+            rnote_allowed_hosts=("rnote.dev",),
+            retries=1,
+            delay=0,
+        )
+        client = RnoteClient(settings, None)
+        client._client.close()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"success": 0, "error": "nope"})
+
+        client._client = httpx.Client(
+            base_url="https://rnote.dev", transport=httpx.MockTransport(handler)
+        )
+        try:
+            with self.assertRaises(ProviderError):
+                client.get("/api/v2/crawler/search/notes")
+        finally:
+            client.close()
+
+    def test_dataflow_accepts_string_success_code(self) -> None:
+        settings = Settings(
+            host="https://dataflowserver.org",
+            token="key",
+            dataflow_allowed_hosts=("dataflowserver.org",),
+            retries=1,
+            delay=0,
+        )
+        client = DataFlowClient(settings)
+        client._client.close()
+        responses = iter(
+            [
+                httpx.Response(200, json={"code": "0", "data": {"ok": True}}),
+                httpx.Response(200, json={"code": 1, "msg": "bad"}),
+            ]
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return next(responses)
+
+        client._client = httpx.Client(
+            base_url="https://dataflowserver.org", transport=httpx.MockTransport(handler)
+        )
+        try:
+            self.assertTrue(client.get("/api/xhs/v3/appsearch")["data"]["ok"])
+            with self.assertRaises(ProviderError):
+                client.get("/api/xhs/v3/appsearch")
+        finally:
+            client.close()
+
+    def test_retry_cost_is_counted_per_upstream_response(self) -> None:
+        settings = Settings(
+            host="https://dataflowserver.org",
+            token="key",
+            dataflow_allowed_hosts=("dataflowserver.org",),
+            retries=2,
+            delay=0,
+        )
+        client = DataFlowClient(settings)
+        client._client.close()
+        responses = iter(
+            [
+                httpx.Response(503, json={"code": 503, "msg": "busy"}),
+                httpx.Response(200, json={"code": 0, "data": {"ok": True}}),
+            ]
+        )
+        client._client = httpx.Client(
+            base_url="https://dataflowserver.org",
+            transport=httpx.MockTransport(lambda request: next(responses)),
+        )
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                with Database(Path(tmp)) as db:
+                    pipeline = Pipeline(settings, db)
+                    provider = SimpleNamespace(client=client)
+                    result = pipeline._call(
+                        1,
+                        "xhs",
+                        "search",
+                        lambda: client.get("/api/xhs/v3/appsearch", cost=45),
+                        {},
+                        45,
+                        "retry-test",
+                        "/api/xhs/v3/appsearch",
+                        cost_native=Price(45, "token"),
+                        provider_obj=provider,
+                    )
+                    self.assertTrue(result["data"]["ok"])
+                    call = db.recent_api_calls(1, limit=1)[0]
+                    self.assertEqual(call["attempt"], 2)
+                    self.assertEqual(call["cost"], 90)
+                    self.assertEqual(call["estimated_cost"], 90)
+                    self.assertEqual(client.cost, 90)
+                    self.assertEqual(client.last_cost, 90)
+        finally:
+            client.close()
+
+    def test_has_more_handles_string_false(self) -> None:
+        self.assertFalse(_has_more({"hasMore": "false"}))
+        self.assertTrue(_has_more({"hasMore": "true"}))
+        self.assertIsNone(_has_more({}))
 
     def test_rnote_pagination_state(self) -> None:
         payload = {

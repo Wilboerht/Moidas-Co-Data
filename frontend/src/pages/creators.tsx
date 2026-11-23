@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -13,7 +13,8 @@ import {
   X,
 } from "lucide-react";
 import { toast } from "sonner";
-import { api, exportUrl } from "@/shared/api";
+import { api, downloadFile, exportUrl } from "@/shared/api";
+import { canonicalSearch } from "@/shared/query-string";
 import { fmtNumber, safeHttpUrl, shorten } from "@/shared/format";
 import { useAuth } from "@/shared/auth-context";
 import { useRound } from "@/shared/round-context";
@@ -80,8 +81,8 @@ const ALL_COLUMNS = [
   ["profile_url", "主页"],
   ["data_round", "数据轮次"],
   ["source_keywords", "命中关键词"],
-  ["source", "数据来源"],
-  ["owner_username", "经手人"],
+  ["source", "来源标签"],
+  ["owner_username", "跟进人"],
   ["platform_label", "平台"],
   ["cooperation_platform", "合作主平台"],
   ["raw_title", "原始标题"],
@@ -112,6 +113,7 @@ const SORT_OPTIONS = [
   { value: "fans", label: "粉丝数" },
   { value: "interaction", label: "互动量" },
   { value: "sample_likes", label: "样本点赞" },
+  { value: "sample_average", label: "样本篇均互动" },
   { value: "nickname", label: "昵称" },
 ];
 
@@ -143,7 +145,7 @@ function facetOptions(items: { value: string; count: number }[] | undefined) {
 
 export function CreatorsPage() {
   const { user } = useAuth();
-  const { meta, rounds, refreshRounds, loading, error: bootstrapError } = useRound();
+  const { meta, rounds, round, refreshRounds, loading, error: bootstrapError } = useRound();
   const queryClient = useQueryClient();
   const [params, setParams] = useSearchParams();
   const statuses = meta?.statuses ?? [];
@@ -154,7 +156,13 @@ export function CreatorsPage() {
     const parsed = value ? Number(value) : NaN;
     return value && value !== "all" && Number.isFinite(parsed) ? parsed : null;
   });
-  const [platform, setPlatform] = useState(params.get("platform") ?? "xhs");
+  const [platform, setPlatform] = useState(() => {
+    const fromUrl = params.get("platform");
+    if (fromUrl !== null) return fromUrl;
+    if (roundFilter === null) return "";
+    const targetRound = rounds.find((item) => item.id === roundFilter);
+    return targetRound?.platform ?? "xhs";
+  });
   const [page, setPage] = useState(() => {
     const value = Number(params.get("page") ?? 1);
     return Number.isFinite(value) && value > 0 ? Math.floor(value) : 1;
@@ -169,10 +177,15 @@ export function CreatorsPage() {
   const [tierFilter, setTierFilter] = useState<string[]>(params.get("tier")?.split(",").filter(Boolean) ?? []);
   const [directionFilter, setDirectionFilter] = useState<string[]>(params.get("direction")?.split(",").filter(Boolean) ?? []);
   const [sourceFilter, setSourceFilter] = useState<string[]>(params.get("source")?.split(",").filter(Boolean) ?? []);
+  const [sourceMode, setSourceMode] = useState<"any" | "all">(
+    params.get("source_mode") === "all" ? "all" : "any",
+  );
+  const [labelFilter, setLabelFilter] = useState<string[]>(params.get("label")?.split(",").filter(Boolean) ?? []);
   const [ownerFilter, setOwnerFilter] = useState(params.get("owner") ?? "");
   const [minFans, setMinFans] = useState(params.get("min_fans") ?? "");
   const [maxFans, setMaxFans] = useState(params.get("max_fans") ?? "");
   const [onlyUnenriched, setOnlyUnenriched] = useState(params.get("only_unenriched") === "true");
+  const [needsAction, setNeedsAction] = useState(params.get("needs_action") === "true");
   const [sort, setSort] = useState(params.get("sort") ?? "fans");
   const [order, setOrder] = useState<"asc" | "desc">(params.get("order") === "asc" ? "asc" : "desc");
   const [showMore, setShowMore] = useState(false);
@@ -182,21 +195,60 @@ export function CreatorsPage() {
   const [batchStatus, setBatchStatus] = useState("none");
   const [batchDirection, setBatchDirection] = useState("");
   const [batchRemark, setBatchRemark] = useState("");
+  const [batchOwner, setBatchOwner] = useState("keep");
   const detailKey = params.get("creator");
   const detailRoundParam = params.get("creator_round");
   const parsedDetailRound = detailRoundParam ? Number(detailRoundParam) : NaN;
   const detailRoundId = Number.isFinite(parsedDetailRound)
     ? parsedDetailRound
     : roundFilter ?? rounds[0]?.id ?? null;
+  const lastUrlRef = useRef(canonicalSearch(params));
+  const syncingFromUrlRef = useRef(false);
+
+  useEffect(() => {
+    const serialized = canonicalSearch(params);
+    if (serialized === lastUrlRef.current) return;
+    lastUrlRef.current = serialized;
+    syncingFromUrlRef.current = true;
+    const roundValue = params.get("round");
+    const parsedRound = roundValue ? Number(roundValue) : NaN;
+    const nextRound = roundValue && roundValue !== "all" && Number.isFinite(parsedRound) ? parsedRound : null;
+    setRoundFilter(nextRound);
+    setPlatform(params.get("platform") ?? (nextRound === null ? "" : rounds.find((item) => item.id === nextRound)?.platform ?? "xhs"));
+    const nextPage = Number(params.get("page") ?? 1);
+    setPage(Number.isFinite(nextPage) && nextPage > 0 ? Math.floor(nextPage) : 1);
+    const nextPageSize = Number(params.get("page_size") ?? 50);
+    setPageSize(Number.isFinite(nextPageSize) ? Math.min(200, Math.max(25, Math.floor(nextPageSize))) : 50);
+    setSearch(params.get("search") ?? "");
+    setStatusFilter(params.get("status")?.split(",").filter(Boolean) ?? []);
+    setTierFilter(params.get("tier")?.split(",").filter(Boolean) ?? []);
+    setDirectionFilter(params.get("direction")?.split(",").filter(Boolean) ?? []);
+    setSourceFilter(params.get("source")?.split(",").filter(Boolean) ?? []);
+    setSourceMode(params.get("source_mode") === "all" ? "all" : "any");
+    setLabelFilter(params.get("label")?.split(",").filter(Boolean) ?? []);
+    setOwnerFilter(params.get("owner") ?? "");
+    setMinFans(params.get("min_fans") ?? "");
+    setMaxFans(params.get("max_fans") ?? "");
+    setOnlyUnenriched(params.get("only_unenriched") === "true");
+    setNeedsAction(params.get("needs_action") === "true");
+    setSort(params.get("sort") ?? "fans");
+    setOrder(params.get("order") === "asc" ? "asc" : "desc");
+  }, [params, rounds]);
 
   const facetsQuery = useQuery({
     queryKey: ["facets", roundFilter, platform],
     queryFn: () => api.getFacets(roundFilter, platform),
   });
+  const ownerOptionsQuery = useQuery({
+    queryKey: ["creator-owners"],
+    queryFn: api.getCreatorOwners,
+    staleTime: 300_000,
+  });
+  const ownerOptions = ownerOptionsQuery.data ?? [];
 
   useEffect(() => {
     const available = facetsQuery.data?.platforms ?? [];
-    if (available.length > 0 && !available.some((item) => item.value === platform)) {
+    if (platform && available.length > 0 && !available.some((item) => item.value === platform)) {
       setPlatform(available.find((item) => item.value === "xhs")?.value ?? available[0].value);
     }
   }, [facetsQuery.data, platform]);
@@ -211,52 +263,72 @@ export function CreatorsPage() {
     }
   }, [roundFilter, rounds]);
 
+  const currentParams = new URLSearchParams();
+  if (roundFilter !== null) currentParams.set("round", String(roundFilter));
+  if (platform) currentParams.set("platform", platform);
+  if (page > 1) currentParams.set("page", String(page));
+  if (pageSize !== 50) currentParams.set("page_size", String(pageSize));
+  if (debouncedSearch) currentParams.set("search", debouncedSearch);
+  if (statusFilter.length) currentParams.set("status", statusFilter.join(","));
+  if (tierFilter.length) currentParams.set("tier", tierFilter.join(","));
+  if (directionFilter.length) currentParams.set("direction", directionFilter.join(","));
+  if (sourceFilter.length) currentParams.set("source", sourceFilter.join(","));
+  if (sourceFilter.length && sourceMode === "all") currentParams.set("source_mode", "all");
+  if (labelFilter.length) currentParams.set("label", labelFilter.join(","));
+  if (ownerFilter) currentParams.set("owner", ownerFilter);
+  if (minFans) currentParams.set("min_fans", minFans);
+  if (maxFans) currentParams.set("max_fans", maxFans);
+  if (onlyUnenriched) currentParams.set("only_unenriched", "true");
+  if (needsAction) currentParams.set("needs_action", "true");
+  currentParams.set("sort", sort);
+  currentParams.set("order", order);
+  if (detailKey) {
+    currentParams.set("creator", detailKey);
+    if (detailRoundParam) currentParams.set("creator_round", detailRoundParam);
+  }
+
   useEffect(() => {
-    const next = new URLSearchParams();
-    if (roundFilter !== null) next.set("round", String(roundFilter));
-    if (platform) next.set("platform", platform);
-    if (page > 1) next.set("page", String(page));
-    if (pageSize !== 50) next.set("page_size", String(pageSize));
-    if (debouncedSearch) next.set("search", debouncedSearch);
-    if (statusFilter.length) next.set("status", statusFilter.join(","));
-    if (tierFilter.length) next.set("tier", tierFilter.join(","));
-    if (directionFilter.length) next.set("direction", directionFilter.join(","));
-    if (sourceFilter.length) next.set("source", sourceFilter.join(","));
-    if (ownerFilter) next.set("owner", ownerFilter);
-    if (minFans) next.set("min_fans", minFans);
-    if (maxFans) next.set("max_fans", maxFans);
-    if (onlyUnenriched) next.set("only_unenriched", "true");
-    next.set("sort", sort);
-    next.set("order", order);
-    if (detailKey) {
-      next.set("creator", detailKey);
-      if (detailRoundParam) next.set("creator_round", detailRoundParam);
+    if (syncingFromUrlRef.current) return;
+    if (canonicalSearch(currentParams) === lastUrlRef.current) return;
+    setPage(1);
+    setSelected({});
+  }, [roundFilter, platform, debouncedSearch, statusFilter, tierFilter, directionFilter, sourceFilter, sourceMode, labelFilter, ownerFilter, minFans, maxFans, onlyUnenriched, needsAction]);
+
+  useEffect(() => {
+    if (syncingFromUrlRef.current) {
+      if (debouncedSearch === (params.get("search") ?? "")) syncingFromUrlRef.current = false;
+      return;
     }
-    setParams(next, { replace: true });
+    const serialized = canonicalSearch(currentParams);
+    if (serialized === canonicalSearch(params)) return;
+    lastUrlRef.current = serialized;
+    setParams(currentParams, { replace: true });
   }, [
     roundFilter, platform, page, pageSize, debouncedSearch, statusFilter, tierFilter,
-    directionFilter, sourceFilter, ownerFilter, minFans, maxFans, onlyUnenriched, sort, order,
-    detailKey, detailRoundParam, setParams,
+    directionFilter, sourceFilter, sourceMode, labelFilter, ownerFilter, minFans, maxFans, onlyUnenriched, needsAction, sort, order,
+    detailKey, detailRoundParam, params, setParams,
   ]);
 
   useEffect(() => {
-    setPage(1);
-    setSelected({});
-  }, [roundFilter, platform, debouncedSearch, statusFilter, tierFilter, directionFilter, sourceFilter, ownerFilter, minFans, maxFans, onlyUnenriched]);
+    if (sourceFilter.length < 2) setSourceMode("any");
+  }, [sourceFilter.length]);
 
   const creatorQuery: CreatorQuery = useMemo(
     () => ({
       platform, page, page_size: pageSize, search: debouncedSearch,
       statuses: statusFilter, tiers: tierFilter, directions: directionFilter, sources: sourceFilter,
-      owner: ownerFilter, min_fans: minFans, max_fans: maxFans, only_unenriched: onlyUnenriched, sort, order,
+      source_mode: sourceMode,
+      labels: labelFilter,
+      owner: ownerFilter, min_fans: minFans, max_fans: maxFans,
+      only_unenriched: onlyUnenriched, needs_action: needsAction, sort, order,
     }),
-    [platform, page, pageSize, debouncedSearch, statusFilter, tierFilter, directionFilter, sourceFilter, ownerFilter, minFans, maxFans, onlyUnenriched, sort, order],
+    [platform, page, pageSize, debouncedSearch, statusFilter, tierFilter, directionFilter, sourceFilter, sourceMode, labelFilter, ownerFilter, minFans, maxFans, onlyUnenriched, needsAction, sort, order],
   );
 
   const creatorsQuery = useQuery({
     queryKey: ["creators", roundFilter, creatorQuery],
     queryFn: () => api.getCreators(roundFilter, creatorQuery),
-    enabled: Boolean(platform),
+    enabled: true,
   });
 
   const batchMutation = useMutation({
@@ -274,10 +346,17 @@ export function CreatorsPage() {
           chunk(items).map((part) =>
             api.batchUpdate(targetRound, {
               items: part,
-              status: batchStatus === "none" ? null : batchStatus,
-              match_direction: batchDirection || null,
-              remark: batchRemark || null,
-            }),
+        status: batchStatus === "none" ? null : batchStatus,
+        match_direction: batchDirection || null,
+        remark: batchRemark || null,
+        set_owner: user?.role === "admin" && batchOwner !== "keep",
+        owner_user_id:
+          batchOwner === "unassigned"
+            ? null
+            : batchOwner !== "keep"
+              ? Number(batchOwner)
+              : undefined,
+      }),
           ),
         ),
       );
@@ -290,9 +369,11 @@ export function CreatorsPage() {
       setBatchStatus("none");
       setBatchDirection("");
       setBatchRemark("");
+      setBatchOwner("keep");
       await queryClient.invalidateQueries({ queryKey: ["creators"] });
       await queryClient.invalidateQueries({ queryKey: ["facets"] });
       await queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+      await queryClient.invalidateQueries({ queryKey: ["activity"] });
       await refreshRounds();
     },
     onError: (error) => toast.error(error instanceof Error ? error.message : "批量更新失败"),
@@ -302,7 +383,11 @@ export function CreatorsPage() {
     mutationFn: async ({ item, status }: { item: CreatorRow; status: string }) => {
       const targetRound = item.round_id ?? roundFilter ?? rounds[0]?.id;
       if (targetRound == null) throw new Error("无法确定该达人所属轮次");
-      return api.updateCreator(targetRound, item.platform, item.user_id, { status });
+      return api.updateCreator(targetRound, item.platform, item.user_id, {
+        status,
+        expected_status: item.status,
+        expected_updated_at: item.updated_at || undefined,
+      });
     },
     onSuccess: async (_updated, variables) => {
       const label = statuses.find((item) => item.code === variables.status)?.label ?? variables.status;
@@ -310,6 +395,7 @@ export function CreatorsPage() {
       await queryClient.invalidateQueries({ queryKey: ["creators"] });
       await queryClient.invalidateQueries({ queryKey: ["facets"] });
       await queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+      await queryClient.invalidateQueries({ queryKey: ["activity"] });
     },
     onError: (error) => toast.error(error instanceof Error ? error.message : "状态更新失败"),
   });
@@ -340,9 +426,9 @@ export function CreatorsPage() {
       );
     },
     onSuccess: async (result) => {
-      const parts = [`已认领 ${result.claimed} 位`];
-      if (result.already_mine > 0) parts.push(`${result.already_mine} 位已在你名下`);
-      if (result.skipped > 0) parts.push(`${result.skipped} 位已被其他成员认领`);
+      const parts = [`已设为我跟进 ${result.claimed} 位`];
+      if (result.already_mine > 0) parts.push(`${result.already_mine} 位已由你跟进`);
+      if (result.skipped > 0) parts.push(`${result.skipped} 位已由其他成员跟进`);
       if (result.missing > 0) parts.push(`${result.missing} 位不存在`);
       if (result.claimed > 0) toast.success(parts.join("，"));
       else toast.warning(parts.join("，"));
@@ -350,8 +436,9 @@ export function CreatorsPage() {
       await queryClient.invalidateQueries({ queryKey: ["creators"] });
       await queryClient.invalidateQueries({ queryKey: ["facets"] });
       await queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+      await queryClient.invalidateQueries({ queryKey: ["activity"] });
     },
-    onError: (error) => toast.error(error instanceof Error ? error.message : "认领失败"),
+    onError: (error) => toast.error(error instanceof Error ? error.message : "跟进设置失败"),
   });
 
   const clearFilters = () => {
@@ -360,13 +447,25 @@ export function CreatorsPage() {
     setTierFilter([]);
     setDirectionFilter([]);
     setSourceFilter([]);
+    setSourceMode("any");
+    setLabelFilter([]);
     setOwnerFilter("");
     setMinFans("");
     setMaxFans("");
     setOnlyUnenriched(false);
+    setNeedsAction(false);
   };
 
   const currentRound = rounds.find((item) => item.id === roundFilter);
+  const runExport = (format: "csv" | "xlsx", scope: "filtered" | "all") => {
+    void downloadFile(
+      exportUrl(roundFilter, format, scope, creatorQuery),
+      `codata_export.${format}`,
+    ).catch((err) => {
+      toast.error(err instanceof Error ? err.message : "导出失败");
+    });
+  };
+
   const scopeLabel =
     roundFilter === null
       ? "全部轮次"
@@ -377,27 +476,31 @@ export function CreatorsPage() {
   const items = (creatorsQuery.data?.items ?? []) as CreatorRow[];
   const selectedCount = Object.values(selected).length;
   const batchHasChanges =
-    batchStatus !== "none" || Boolean(batchDirection.trim()) || Boolean(batchRemark.trim());
+    batchStatus !== "none" ||
+    Boolean(batchDirection.trim()) ||
+    Boolean(batchRemark.trim()) ||
+    (user?.role === "admin" && batchOwner !== "keep");
   const advancedFilterCount =
     directionFilter.length + sourceFilter.length +
-    (minFans ? 1 : 0) + (maxFans ? 1 : 0) + (onlyUnenriched ? 1 : 0);
+    (minFans ? 1 : 0) + (maxFans ? 1 : 0) + (onlyUnenriched ? 1 : 0) + (needsAction ? 1 : 0);
   const activeFilters =
     statusFilter.length + tierFilter.length + advancedFilterCount +
-    (debouncedSearch ? 1 : 0) + (ownerFilter ? 1 : 0);
+    (debouncedSearch ? 1 : 0) + (ownerFilter ? 1 : 0) + labelFilter.length;
   const platformTabs = facetsQuery.data?.platforms ?? [];
   const visibleKeys = ALL_COLUMNS.filter(([key]) => key === "nickname" || visibleColumns[key] !== false).map(([key]) => key);
   const pageAllSelected = items.length > 0 && items.every((item) => Boolean(selected[item.key]));
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   useEffect(() => {
-    if (page > totalPages) setPage(totalPages);
-  }, [page, totalPages]);
+    if (creatorsQuery.data && page > totalPages) setPage(totalPages);
+  }, [page, totalPages, creatorsQuery.data]);
+  const selectedOwner = ownerOptions.find((owner) => String(owner.id) === ownerFilter);
   const ownerFilterLabel =
     ownerFilter === "unassigned"
-      ? "未认领"
+      ? "未分配"
       : ownerFilter && ownerFilter === String(user?.id)
-        ? "我认领的"
+        ? "我跟进的"
         : ownerFilter
-          ? `用户 ${ownerFilter}`
+          ? selectedOwner?.username ?? `用户 ${ownerFilter}`
           : "";
 
   const togglePageSelection = () => {
@@ -446,15 +549,28 @@ export function CreatorsPage() {
       case "account_id": return <span className="font-mono text-xs">{item.account_id || "—"}</span>;
       case "profile_url": return safeHttpUrl(item.profile_url) ? <a className="underline underline-offset-4" href={safeHttpUrl(item.profile_url)} target="_blank" rel="noreferrer">打开</a> : "—";
       case "data_round": return item.data_round || "—";
-      case "source_keywords": return shorten(item.source_keywords.join("、"), 48) || "—";
-      case "source": return item.source || "—";
+      case "source_keywords": {
+        const keywords = item.source_keywords ?? [];
+        if (keywords.length === 0) return "—";
+        return (
+          <span className="inline-flex flex-wrap items-center gap-1" title={keywords.join("、")}>
+            {keywords.slice(0, 2).map((keyword) => (
+              <Badge key={keyword} variant="secondary" className="font-normal">{keyword}</Badge>
+            ))}
+            {keywords.length > 2 ? (
+              <Badge variant="outline" className="font-normal">+{keywords.length - 2}</Badge>
+            ) : null}
+          </span>
+        );
+      }
+      case "source": return <span title={item.source}>{shorten(item.source, 48) || "—"}</span>;
       case "owner_username": return item.owner_username ? (
         <span>
           {item.owner_username}
           {item.owner_user_id === user?.id ? "（我）" : ""}
         </span>
       ) : (
-        <span className="text-muted-foreground">{item.owner_user_id ? "未知用户" : "未认领"}</span>
+        <span className="text-muted-foreground">{item.owner_user_id ? "未知用户" : "未分配"}</span>
       );
       case "platform_label": return item.platform_label || "—";
       case "cooperation_platform": return item.cooperation_platform || "—";
@@ -521,11 +637,12 @@ export function CreatorsPage() {
                 ))}
               </SelectContent>
             </Select>
-            <Select value={platform} onValueChange={setPlatform} disabled={platformTabs.length === 0}>
+            <Select value={platform || "all"} onValueChange={(value) => setPlatform(value === "all" ? "" : value)} disabled={platformTabs.length === 0}>
               <SelectTrigger className="w-[220px] max-w-full" aria-label="平台">
                 <SelectValue placeholder="选择平台" />
               </SelectTrigger>
               <SelectContent>
+                <SelectItem value="all">全部平台</SelectItem>
                 {platformTabs.map((item) => (
                   <SelectItem key={item.value} value={item.value}>
                     {platformLabels.get(item.value) ?? item.value} · {fmtNumber(item.count)} 位
@@ -583,7 +700,7 @@ export function CreatorsPage() {
                 spellCheck={false}
                 value={search}
                 onChange={(event) => setSearch(event.target.value)}
-                placeholder="昵称、账号 ID 或标题"
+                placeholder="昵称、账号 ID、标题、关键词或来源标签"
               />
             </div>
             <div className="space-y-2">
@@ -611,16 +728,23 @@ export function CreatorsPage() {
               />
             </div>
             <div className="space-y-2">
-              <Label>经手人</Label>
+              <Label title="跟进人跨轮次保持，不随新采集重置">跟进人</Label>
               <Select
                 value={ownerFilter || "all"}
                 onValueChange={(value) => setOwnerFilter(value === "all" ? "" : value)}
               >
-                <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                <SelectTrigger className="w-full" aria-label="跟进人"><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="all">全部经手人</SelectItem>
-                  {user ? <SelectItem value={String(user.id)}>我认领的</SelectItem> : null}
-                  <SelectItem value="unassigned">未认领</SelectItem>
+                  <SelectItem value="all">全部跟进人</SelectItem>
+                  {user ? <SelectItem value={String(user.id)}>我跟进的</SelectItem> : null}
+                  {ownerOptions
+                    .filter((owner) => owner.id !== user?.id)
+                    .map((owner) => (
+                      <SelectItem key={owner.id} value={String(owner.id)}>
+                        {owner.username}
+                      </SelectItem>
+                    ))}
+                  <SelectItem value="unassigned">未分配</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -628,7 +752,7 @@ export function CreatorsPage() {
               <Label>排序</Label>
               <div className="flex gap-2">
                 <Select value={sort} onValueChange={setSort}>
-                  <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                  <SelectTrigger className="w-full" aria-label="排序"><SelectValue /></SelectTrigger>
                   <SelectContent>
                     {SORT_OPTIONS.map((item) => <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>)}
                   </SelectContent>
@@ -661,16 +785,48 @@ export function CreatorsPage() {
                 />
               </div>
               <div className="space-y-2">
-                <Label>数据来源</Label>
+                <Label>命中关键词</Label>
                 <MultiSelect
-                  label="数据来源"
+                  label="命中关键词"
                   options={facetOptions(facetsQuery.data?.sources)}
                   value={sourceFilter}
                   onChange={setSourceFilter}
-                  placeholder="全部来源"
-                  searchPlaceholder="搜索来源…"
-                  emptyText="暂无来源"
+                  placeholder="全部关键词"
+                  searchPlaceholder="搜索关键词…"
+                  emptyText="暂无关键词"
                 />
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-muted-foreground">匹配方式</span>
+                  <Select
+                    value={sourceMode}
+                    onValueChange={(value) => setSourceMode(value as "any" | "all")}
+                    disabled={sourceFilter.length < 2}
+                  >
+                    <SelectTrigger className="h-8 w-[120px]" aria-label="关键词匹配方式">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="any">任一命中</SelectItem>
+                      <SelectItem value="all">全部命中</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  关键词是多标签统计，同一达人可计入多个关键词；全部轮次视图会合并历史命中关键词，状态取最新轮次，跟进人跨轮次保持。
+                </p>
+              </div>
+              <div className="space-y-2">
+                <Label>来源标签</Label>
+                <MultiSelect
+                  label="来源标签"
+                  options={facetOptions(facetsQuery.data?.labels)}
+                  value={labelFilter}
+                  onChange={setLabelFilter}
+                  placeholder="全部来源标签"
+                  searchPlaceholder="搜索来源标签…"
+                  emptyText="暂无来源标签"
+                />
+                <p className="text-xs text-muted-foreground">来自 Excel 导入的「数据来源」，与采集命中关键词分开。</p>
               </div>
               <div className="space-y-2">
                 <Label htmlFor="min-fans">最低粉丝</Label>
@@ -683,6 +839,10 @@ export function CreatorsPage() {
               <div className="flex items-center gap-2 pt-1">
                 <Switch id="only-unenriched" checked={onlyUnenriched} onCheckedChange={setOnlyUnenriched} />
                 <Label htmlFor="only-unenriched">只看未补全</Label>
+              </div>
+              <div className="flex items-center gap-2 pt-1">
+                <Switch id="needs-action" checked={needsAction} onCheckedChange={setNeedsAction} />
+                <Label htmlFor="needs-action">仅看待处理</Label>
               </div>
             </div>
           ) : null}
@@ -703,14 +863,21 @@ export function CreatorsPage() {
                 <FilterChip label={`方向：${summarize(directionFilter)}`} onRemove={() => setDirectionFilter([])} />
               ) : null}
               {sourceFilter.length > 0 ? (
-                <FilterChip label={`来源：${summarize(sourceFilter)}`} onRemove={() => setSourceFilter([])} />
+                <FilterChip
+                  label={`关键词：${summarize(sourceFilter)}${sourceMode === "all" ? "（全部命中）" : ""}`}
+                  onRemove={() => setSourceFilter([])}
+                />
+              ) : null}
+              {labelFilter.length > 0 ? (
+                <FilterChip label={`来源标签：${summarize(labelFilter)}`} onRemove={() => setLabelFilter([])} />
               ) : null}
               {ownerFilter ? (
-                <FilterChip label={`经手人：${ownerFilterLabel}`} onRemove={() => setOwnerFilter("")} />
+                <FilterChip label={`跟进人：${ownerFilterLabel}`} onRemove={() => setOwnerFilter("")} />
               ) : null}
               {minFans ? <FilterChip label={`粉丝 ≥ ${minFans}`} onRemove={() => setMinFans("")} /> : null}
               {maxFans ? <FilterChip label={`粉丝 ≤ ${maxFans}`} onRemove={() => setMaxFans("")} /> : null}
               {onlyUnenriched ? <FilterChip label="只看未补全" onRemove={() => setOnlyUnenriched(false)} /> : null}
+              {needsAction ? <FilterChip label="仅看待处理" onRemove={() => setNeedsAction(false)} /> : null}
             </div>
           ) : null}
         </div>
@@ -745,14 +912,14 @@ export function CreatorsPage() {
               </div>
             </div>
             <div className="hidden flex-wrap items-center gap-2 md:flex">
-              <Button asChild variant="outline" size="sm">
-                <a href={exportUrl(roundFilter, "csv", "filtered", creatorQuery)}><Download />导出 CSV</a>
+              <Button variant="outline" size="sm" onClick={() => runExport("csv", "filtered")}>
+                <Download />导出 CSV
               </Button>
-              <Button asChild variant="outline" size="sm">
-                <a href={exportUrl(roundFilter, "xlsx", "filtered", creatorQuery)}><Download />导出 Excel</a>
+              <Button variant="outline" size="sm" onClick={() => runExport("xlsx", "filtered")}>
+                <Download />导出 Excel
               </Button>
-              <Button asChild variant="ghost" size="sm">
-                <a href={exportUrl(roundFilter, "csv", "all")}>导出全部 CSV</a>
+              <Button variant="ghost" size="sm" onClick={() => runExport("csv", "all")}>
+                导出全部 CSV
               </Button>
             </div>
             <DropdownMenu>
@@ -762,14 +929,14 @@ export function CreatorsPage() {
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
-                <DropdownMenuItem asChild>
-                  <a href={exportUrl(roundFilter, "csv", "filtered", creatorQuery)}>导出当前筛选 CSV</a>
+                <DropdownMenuItem onSelect={() => runExport("csv", "filtered")}>
+                  导出当前筛选 CSV
                 </DropdownMenuItem>
-                <DropdownMenuItem asChild>
-                  <a href={exportUrl(roundFilter, "xlsx", "filtered", creatorQuery)}>导出当前筛选 Excel</a>
+                <DropdownMenuItem onSelect={() => runExport("xlsx", "filtered")}>
+                  导出当前筛选 Excel
                 </DropdownMenuItem>
-                <DropdownMenuItem asChild>
-                  <a href={exportUrl(roundFilter, "csv", "all")}>导出全部 CSV</a>
+                <DropdownMenuItem onSelect={() => runExport("csv", "all")}>
+                  导出全部 CSV
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
@@ -778,9 +945,11 @@ export function CreatorsPage() {
                 <span className="text-sm text-muted-foreground">已选 {selectedCount} 位</span>
                 <Button size="sm" variant="outline" onClick={() => claimMutation.mutate()} disabled={claimMutation.isPending}>
                   <UserCheck />
-                  {claimMutation.isPending ? "认领中…" : "认领所选"}
+                  {claimMutation.isPending ? "设置中…" : "批量跟进"}
                 </Button>
-                <Button size="sm" onClick={() => setBatchOpen(true)}>批量修改</Button>
+                <Button size="sm" onClick={() => setBatchOpen(true)}>
+                  批量修改
+                </Button>
                 <Button variant="ghost" size="sm" onClick={() => setSelected({})}>取消选择</Button>
               </>
             ) : (
@@ -814,6 +983,7 @@ export function CreatorsPage() {
                       <TableHead
                         key={key}
                         className={`${NUMERIC_COLUMNS.has(key) ? "text-right" : ""} ${WIDE_COLUMNS.has(key) ? "min-w-[180px]" : "whitespace-nowrap"}`}
+                        title={key === "owner_username" ? "跟进人跨轮次保持，不随新采集重置" : undefined}
                       >
                         {ALL_COLUMNS.find(([column]) => column === key)?.[1] ?? key}
                       </TableHead>
@@ -892,19 +1062,38 @@ export function CreatorsPage() {
         <DialogContent>
           <DialogHeader>
             <DialogTitle>批量修改 {selectedCount} 位达人</DialogTitle>
-            <DialogDescription>留空的字段不会被修改。</DialogDescription>
+            <DialogDescription>留空的字段不会被修改；未分配的达人默认会自动归你跟进，管理员显式设置跟进人时以设置为准。</DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
             <div className="space-y-2">
               <Label>采用状态</Label>
               <Select value={batchStatus} onValueChange={setBatchStatus}>
-                <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                <SelectTrigger className="w-full" aria-label="批量采用状态"><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="none">不修改</SelectItem>
                   {statuses.map((item) => <SelectItem key={item.code} value={item.code}>{item.label}</SelectItem>)}
                 </SelectContent>
               </Select>
             </div>
+            {user?.role === "admin" ? (
+              <div className="space-y-2">
+                <Label htmlFor="batch-owner">跟进人</Label>
+                <Select value={batchOwner} onValueChange={setBatchOwner}>
+                  <SelectTrigger id="batch-owner" className="w-full"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="keep">不修改跟进人</SelectItem>
+                    <SelectItem value="unassigned">未分配</SelectItem>
+                    {ownerOptions.map((owner) => (
+                      <SelectItem key={owner.id} value={String(owner.id)}>
+                        {owner.username}
+                        {owner.id === user?.id ? "（我）" : ""}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">管理员可批量转交或清空跟进人。</p>
+              </div>
+            ) : null}
             <div className="space-y-2">
               <Label htmlFor="batch-direction">匹配方向</Label>
               <Input id="batch-direction" value={batchDirection} onChange={(event) => setBatchDirection(event.target.value)} placeholder="不修改" />
@@ -962,8 +1151,9 @@ function InlineStatusSelect({
     >
       <SelectTrigger
         size="sm"
-        className="h-7 w-auto max-w-[130px] border-0 bg-transparent px-0.5 shadow-none hover:bg-muted/60 focus-visible:ring-2"
+        className="h-7 w-auto max-w-[130px] border-0 bg-transparent px-0.5 shadow-none hover:bg-muted/60 focus-visible:ring-2 [&>svg]:hidden"
         aria-label={`更改 ${item.nickname || item.key} 的采用状态`}
+        title={item.owner_user_id == null ? "修改状态后将自动归你跟进" : undefined}
       >
         <StatusBadge status={item.status} label={item.status_label} />
       </SelectTrigger>

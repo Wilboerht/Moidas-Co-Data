@@ -30,12 +30,15 @@ ROUND_STATUS_LABELS = {
     "running": "运行中",
     "done": "已完成",
     "failed": "失败",
+    "cancelled": "已取消",
+    "archived": "已归档",
 }
 JOB_STATUS_LABELS = {
     "pending": "排队中",
     "running": "运行中",
     "done": "已完成",
     "failed": "失败",
+    "cancelled": "已取消",
 }
 
 REQUESTED_COLUMNS = [
@@ -53,13 +56,14 @@ REQUESTED_COLUMNS = [
     "主页URL",
     "账号ID",
     "代表作",
-    "数据来源",
+    "命中关键词",
+    "来源标签",
     "平台",
 ]
 
 EXTRA_COLUMNS = [
     "备注",
-    "经手人",
+    "负责人",
     "合作主平台",
     "原始标题",
     "样本笔记",
@@ -140,6 +144,7 @@ def creator_rows(db: Database, round_id: int) -> pd.DataFrame:
     rows = []
     for row in db.creator_table(round_id):
         keywords = _loads(row.get("source_keywords"), [])
+        source_labels = _loads(row.get("source_labels"), [])
         auto_tags = _loads(row.get("auto_tags"), [])
         tags = []
         for tag in [*auto_tags, *split_tags(row.get("tags_manual"))]:
@@ -180,9 +185,10 @@ def creator_rows(db: Database, round_id: int) -> pd.DataFrame:
                 "主页URL": row.get("profile_url") or "",
                 "账号ID": account_id,
                 "代表作": top_title,
-                "数据来源": "、".join(str(word) for word in keywords),
+                "命中关键词": "、".join(str(word) for word in keywords),
+                "来源标签": "、".join(str(word) for word in source_labels),
                 "平台": PLATFORM_LABELS.get(row["platform"], row["platform"]),
-                "经手人": row.get("owner_username") or "",
+                "负责人": row.get("owner_username") or "",
                 "合作主平台": row.get("cooperation_platform") or "",
                 "原始标题": row.get("raw_title") or "",
                 "样本笔记": row.get("sample_notes") or 0,
@@ -214,7 +220,7 @@ def filter_rows(
     if directions:
         mask &= df["匹配方向"].isin(directions)
     if keywords:
-        mask &= df["数据来源"].apply(
+        mask &= df["命中关键词"].apply(
             lambda value: any(word in str(value).split("、") for word in keywords)
         )
     if search:
@@ -232,18 +238,32 @@ def filter_rows(
     return df[mask]
 
 
+def _safe_frame(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    frame = df[columns].copy()
+    for column in frame.columns:
+        if pd.api.types.is_string_dtype(frame[column]) or frame[column].dtype == object:
+            frame[column] = frame[column].map(
+                lambda value: "'" + value
+                if isinstance(value, str)
+                and value.lstrip(" \t\r\n")[:1] in ("=", "+", "-", "@")
+                else value
+            )
+    return frame
+
+
 def to_csv_bytes(df: pd.DataFrame, columns: list[str]) -> bytes:
-    return df[columns].to_csv(index=False).encode("utf-8-sig")
+    return _safe_frame(df, columns).to_csv(index=False).encode("utf-8-sig")
 
 
 def to_excel_bytes(df: pd.DataFrame, columns: list[str], sheet_name: str = "达人库") -> bytes:
+    frame = _safe_frame(df, columns)
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df[columns].to_excel(writer, index=False, sheet_name=sheet_name)
+        frame.to_excel(writer, index=False, sheet_name=sheet_name)
         sheet = writer.sheets[sheet_name]
         sheet.freeze_panes = "A2"
-        for index, column in enumerate(df[columns].columns, 1):
-            values = df[column].astype(str) if column in df.columns else pd.Series(dtype=str)
+        for index, column in enumerate(frame.columns, 1):
+            values = frame[column].astype(str) if column in frame.columns else pd.Series(dtype=str)
             width = min(max(10, int(values.str.len().max() or 10) + 2), 50)
             sheet.column_dimensions[sheet.cell(row=1, column=index).column_letter].width = width
     return buffer.getvalue()

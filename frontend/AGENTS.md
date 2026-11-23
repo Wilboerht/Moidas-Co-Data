@@ -8,4 +8,4 @@ Frontend stack: React 19, Vite, Tailwind CSS v4, shadcn/ui (Radix), Recharts, Ta
 - Data helpers and API contracts live in `src/shared`.
 - Icons use `lucide-react` only; do not mix icon families.
 - Charts use Recharts through `src/components/charts.tsx`.
-- Run `npm run build` before delivering. There is no separate lint script.
+- Run `npm test` and `npm run build` before delivering. There is no separate lint script.

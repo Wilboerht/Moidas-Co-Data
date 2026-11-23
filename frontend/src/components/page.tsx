@@ -79,7 +79,10 @@ export function EmptyState({
   actions?: ReactNode;
 }) {
   return (
-    <div className="flex flex-col items-center justify-center gap-2 border border-dashed p-8 text-center">
+    <div
+      role="status"
+      className="flex flex-col items-center justify-center gap-2 border border-dashed p-8 text-center"
+    >
       <p className="font-medium">{title}</p>
       {description ? <p className="max-w-md text-sm text-muted-foreground">{description}</p> : null}
       {actions ? <div className="mt-2 flex gap-2">{actions}</div> : null}
@@ -89,7 +92,10 @@ export function EmptyState({
 
 export function ErrorState({ message }: { message: string }) {
   return (
-    <div className="border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive">
+    <div
+      role="alert"
+      className="border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive"
+    >
       {message}
     </div>
   );

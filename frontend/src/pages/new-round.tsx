@@ -21,7 +21,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 
-const YUAN_PER_TOKEN = 0.001;
+const DEFAULT_YUAN_PER_TOKEN = 0.001;
 
 function wordsOf(value: string) {
   return value
@@ -41,7 +41,7 @@ export function NewRoundPage() {
   const [newWords, setNewWords] = useState("");
   const [vertical, setVertical] = useState("");
   const [pages, setPages] = useState(1);
-  const [maxCreators, setMaxCreators] = useState(20);
+  const [maxCreators, setMaxCreators] = useState<number | null>(20);
   const [platform, setPlatform] = useState("xhs");
   const [provider, setProvider] = useState("auto");
   const [roundName, setRoundName] = useState("");
@@ -62,6 +62,7 @@ export function NewRoundPage() {
     () => Array.from(new Set([...selected, ...wordsOf(newWords)])),
     [selected, newWords],
   );
+  const yuanPerToken = settings?.token_cny ?? DEFAULT_YUAN_PER_TOKEN;
   const platformConfig = settings?.platforms.find((item) => item.code === platform);
   const providerOptions = platformConfig?.providers ?? [];
   const effectiveProviderId =
@@ -69,26 +70,34 @@ export function NewRoundPage() {
       ? platformConfig?.default_provider ?? providerOptions.find((item) => item.ready)?.id
       : provider;
   const selectedProvider = providerOptions.find((item) => item.id === effectiveProviderId);
-  const cost = selectedProvider?.search_cost_tokens ?? settings?.xhs_cost ?? 45;
+  const cost = selectedProvider?.search_cost_tokens ?? 0;
   const userCost = selectedProvider?.user_cost_tokens ?? cost;
   const searchCalls = words.length * pages;
-  const userCalls = maxCreators === 0 ? searchCalls * 10 : maxCreators;
+  const userCalls = maxCreators === null ? searchCalls * 10 : maxCreators;
   const totalCalls = words.length === 0 ? 0 : searchCalls + userCalls;
   const tokens = words.length === 0 ? 0 : searchCalls * cost + userCalls * userCost;
-  const estimatedYuan = tokens * YUAN_PER_TOKEN;
+  const estimatedYuan = tokens * yuanPerToken;
   const yuanText = (Math.round(estimatedYuan * 100) / 100).toFixed(2);
-  const credentialsOk = selectedProvider ? selectedProvider.ready : Boolean(settings?.credentials_ok);
-  const canCreate =
-    words.length > 0 &&
-    words.length <= 50 &&
-    words.every((word) => word.length <= 50) &&
-    vertical.trim().length > 0 &&
-    vertical.trim().length <= 40 &&
-    roundName.trim().length <= 100 &&
-    pages >= 1 &&
-    pages <= 20 &&
-    credentialsOk &&
-    !creating;
+  const credentialsOk = Boolean(selectedProvider?.ready);
+  const validationMessage =
+    words.length === 0
+      ? "请至少选择或输入一个关键词"
+      : words.length > 50
+        ? "关键词最多 50 个"
+        : words.some((word) => word.length > 50)
+          ? "单个关键词最多 50 个字符"
+          : !vertical.trim()
+            ? "请填写轮次定位"
+            : vertical.trim().length > 40
+              ? "轮次定位最多 40 个字符"
+              : roundName.trim().length > 100
+                ? "轮次名称最多 100 个字符"
+                : pages < 1 || pages > 20
+                  ? "页码需在 1 到 20 之间"
+                  : !credentialsOk
+                    ? "当前平台没有可用的采集服务商，请先在设置中配置"
+                    : "";
+  const canCreate = !validationMessage && !creating;
   const providerLabel =
     provider === "auto"
       ? `自动（当前最优：${selectedProvider?.label ?? "未配置"}）`
@@ -106,12 +115,7 @@ export function NewRoundPage() {
   const handleSubmit = (event: FormEvent) => {
     event.preventDefault();
     if (!canCreate) {
-      const message = !credentialsOk
-        ? "请在设置页配置一个可用的采集服务商"
-        : !vertical.trim()
-          ? "请填写轮次垂类"
-          : "请至少选择一个关键词";
-      setError(message);
+      setError(validationMessage || "请检查表单");
       return;
     }
     setConfirmOpen(true);
@@ -119,12 +123,7 @@ export function NewRoundPage() {
 
   const createRound = async () => {
     if (!canCreate) {
-      const message = !credentialsOk
-        ? "请在设置页配置一个可用的采集服务商"
-        : !vertical.trim()
-          ? "请填写轮次垂类"
-          : "请至少选择一个关键词";
-      setError(message);
+      setError(validationMessage || "请检查表单");
       return;
     }
     setConfirmOpen(false);
@@ -135,7 +134,7 @@ export function NewRoundPage() {
         keywords: words,
         category: vertical.trim() || null,
         pages,
-        max_creators: maxCreators === 0 ? null : maxCreators,
+        max_creators: maxCreators,
         name: roundName.trim() || null,
         platform,
         provider,
@@ -267,7 +266,7 @@ export function NewRoundPage() {
                     setProvider("auto");
                   }}
                 >
-                  <SelectTrigger className="w-full">
+                  <SelectTrigger className="w-full" aria-label="平台">
                     <SelectValue placeholder="选择平台" />
                   </SelectTrigger>
                   <SelectContent>
@@ -282,7 +281,7 @@ export function NewRoundPage() {
               <div className="space-y-2">
                 <Label>采集服务商</Label>
                 <Select value={provider} onValueChange={setProvider}>
-                  <SelectTrigger className="w-full">
+                  <SelectTrigger className="w-full" aria-label="采集服务商">
                     <SelectValue placeholder="选择服务商" />
                   </SelectTrigger>
                   <SelectContent>
@@ -295,7 +294,7 @@ export function NewRoundPage() {
                   </SelectContent>
                 </Select>
                 <p className="text-xs text-muted-foreground">
-                  {providerLabel} · {cost} token/次 · ¥{(cost * YUAN_PER_TOKEN).toFixed(3)}
+                  {providerLabel} · {cost} token/次 · ¥{(cost * yuanPerToken).toFixed(3)}
                 </p>
               </div>
             </div>
@@ -328,12 +327,24 @@ export function NewRoundPage() {
                     id="max-creators"
                     name="max-creators"
                     type="number"
-                    min={0}
+                    min={1}
                     max={500}
-                    value={maxCreators}
-                    onChange={(event) => setMaxCreators(Math.min(500, Math.max(0, Number(event.target.value) || 0)))}
+                    value={maxCreators ?? ""}
+                    onChange={(event) => {
+                      const raw = event.target.value;
+                      if (!raw) {
+                        setMaxCreators(null);
+                        return;
+                      }
+                      const parsed = Number(raw);
+                      setMaxCreators(
+                        Number.isFinite(parsed) && parsed > 0
+                          ? Math.min(500, Math.floor(parsed))
+                          : null,
+                      );
+                    }}
                   />
-                  <p className="text-xs text-muted-foreground">0 表示不限制。</p>
+                  <p className="text-xs text-muted-foreground">留空表示不限制。</p>
                 </div>
               </div>
               <div className="grid gap-4 sm:grid-cols-2">
@@ -413,6 +424,9 @@ export function NewRoundPage() {
               <div className="flex justify-between gap-2"><dt className="text-muted-foreground">页数 / 词</dt><dd className="tabular-nums">{pages}</dd></div>
               <div className="flex justify-between gap-2"><dt className="text-muted-foreground">缓存策略</dt><dd>{refreshUsers ? "强制刷新" : "优先使用缓存"}</dd></div>
             </dl>
+            {!canCreate && validationMessage ? (
+              <p className="text-xs text-destructive">{validationMessage}</p>
+            ) : null}
             <Button type="submit" className="hidden w-full lg:flex" disabled={!canCreate}>
               {creating ? "创建中…" : "创建并开始采集"}
             </Button>
@@ -436,6 +450,9 @@ export function NewRoundPage() {
                   token · ¥{yuanText}
                 </span>
               </div>
+              {!canCreate && validationMessage ? (
+                <p className="truncate text-xs text-destructive">{validationMessage}</p>
+              ) : null}
             </div>
             <Button type="submit" disabled={!canCreate}>
               {creating ? "创建中…" : "创建采集"}
@@ -467,7 +484,7 @@ export function NewRoundPage() {
             </div>
             <div className="flex gap-3">
               <span className="w-20 shrink-0 text-muted-foreground">采集范围</span>
-              <span>{pages} 页 / 词 · 最多补全 {maxCreators === 0 ? "不限" : `${maxCreators} 位`}</span>
+              <span>{pages} 页 / 词 · 最多补全 {maxCreators === null ? "不限" : `${maxCreators} 位`}</span>
             </div>
             <div className="flex gap-3">
               <span className="w-20 shrink-0 text-muted-foreground">轮次名称</span>

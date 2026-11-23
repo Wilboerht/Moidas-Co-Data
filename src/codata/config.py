@@ -45,16 +45,20 @@ class Settings:
     login_window_minutes: int = 15
     max_active_jobs: int = 2
     job_stale_minutes: int = 30
+    lead_match_enabled: bool = True
     trusted_proxies: tuple[str, ...] = ("127.0.0.1", "localhost", "::1")
     max_request_bytes: int = 5_000_000
     audit_retention_days: int = 365
     log_retention_days: int = 90
+    backup_retention_days: int = 90
+    backup_retention_count: int = 10
     rnote_host: str = ""
     rnote_api_key: str = ""
     dataflow_allowed_hosts: tuple[str, ...] = ()
     rnote_allowed_hosts: tuple[str, ...] = ()
     usd_cny: float = 7.2
     token_cny: float = 0.001
+    provider_trust_env: bool = False
 
 
 def load_settings(require_credentials: bool = True) -> Settings:
@@ -111,6 +115,7 @@ def load_settings(require_credentials: bool = True) -> Settings:
         login_window_minutes=max(1, int(os.getenv("CODATA_LOGIN_WINDOW_MINUTES", "15"))),
         max_active_jobs=max(1, int(os.getenv("CODATA_MAX_ACTIVE_JOBS", "2"))),
         job_stale_minutes=max(1, int(os.getenv("CODATA_JOB_STALE_MINUTES", "30"))),
+        lead_match_enabled=_env_bool("CODATA_LEAD_MATCH", True),
         trusted_proxies=_env_csv(
             "CODATA_TRUSTED_PROXIES", ("127.0.0.1", "localhost", "::1")
         ),
@@ -119,10 +124,13 @@ def load_settings(require_credentials: bool = True) -> Settings:
         ),
         audit_retention_days=max(1, int(os.getenv("CODATA_AUDIT_RETENTION_DAYS", "365"))),
         log_retention_days=max(1, int(os.getenv("CODATA_LOG_RETENTION_DAYS", "90"))),
+        backup_retention_days=max(0, int(os.getenv("CODATA_BACKUP_RETENTION_DAYS", "90"))),
+        backup_retention_count=max(0, int(os.getenv("CODATA_BACKUP_RETENTION_COUNT", "10"))),
         rnote_host=rnote_host,
         rnote_api_key=rnote_api_key,
         dataflow_allowed_hosts=_env_csv("DATAFLOW_ALLOWED_HOSTS", ("dataflowserver.org",)),
         rnote_allowed_hosts=_env_csv("RNOTE_ALLOWED_HOSTS", ("rnote.dev",)),
         usd_cny=float(os.getenv("CODATA_USD_CNY", "7.2")),
         token_cny=float(os.getenv("CODATA_TOKEN_CNY", "0.001")),
+        provider_trust_env=_env_bool("CODATA_PROVIDER_TRUST_ENV", False),
     )

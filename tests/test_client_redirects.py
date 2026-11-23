@@ -40,6 +40,44 @@ class RedirectTests(unittest.TestCase):
         finally:
             client.close()
 
+    def test_rejects_absolute_initial_url(self) -> None:
+        requests: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(str(request.url))
+            return httpx.Response(200, json={"code": 0})
+
+        client = DataFlowClient(self._settings())
+        client._client.close()
+        client._client = httpx.Client(
+            base_url="https://dataflowserver.org", transport=httpx.MockTransport(handler)
+        )
+        try:
+            with self.assertRaises(ProviderError):
+                client.get("https://evil.example/steal")
+            with self.assertRaises(ProviderError):
+                client.get("//evil.example/steal")
+            self.assertEqual(requests, [])
+        finally:
+            client.close()
+
+    def test_rejects_redirect_to_different_port(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                301, headers={"location": "https://dataflowserver.org:8443/token"}
+            )
+
+        client = DataFlowClient(self._settings())
+        client._client.close()
+        client._client = httpx.Client(
+            base_url="https://dataflowserver.org", transport=httpx.MockTransport(handler)
+        )
+        try:
+            with self.assertRaises(ProviderError):
+                client.get("/user/callremain/count")
+        finally:
+            client.close()
+
     def test_rejects_cross_host_redirect(self) -> None:
         requests: list[str] = []
 

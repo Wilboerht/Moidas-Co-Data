@@ -8,10 +8,11 @@ Pipeline:
 
 ## Features
 
-- **Rounds & tasks** — create collection rounds by platform, category, and keyword set; background jobs with live progress and logs.
-- **Creator library** — server-side pagination, filtering, sorting, 23 fields, detail drawer, batch review, CSV/Excel export.
-- **Provider fallback** — pick the cheapest configured provider automatically, pre-flight balance checks, retry with the next provider on failure.
-- **Cost tracking** — per-request price config, token/USD conversion, and API call audit.
+- **Rounds & tasks** — create collection rounds by platform, category, and keyword set; background jobs with live progress, logs, cancel, forced runs, and archive/restore.
+- **Creator library** — server-side pagination, filtering, sorting, detail drawer, batch review, CSV/Excel export. Creator ownership is a responsibility marker, not an edit lock.
+- **Lead library** — manual/bulk lead intake, local identity matching against collected creators, ownership, conversion to creators with cost-aware fetch options.
+- **Provider selection** — pick the cheapest configured provider automatically and pre-flight balance checks; transient per-item failures are recorded instead of aborting the whole round.
+- **Cost tracking** — per-request price config, token/USD conversion, live job costs, and API call audit.
 - **Admin panel** — user management, credential rotation, keyword library, and system settings.
 - **Safety** — per-provider host allowlists, redirect protection, export formula-injection escaping; tokens live only in `.env`.
 
@@ -60,12 +61,22 @@ uv run codata-web                          # start the panel
 uv run codata balance                      # check provider balances
 uv run codata round list                   # list collection rounds
 uv run codata round run 1                  # run a round
-uv run python -m unittest discover -s tests -v   # tests
+uv run codata-admin leads-dedupe           # report duplicate leads (add --apply)
+uv run codata-admin leads-backfill-matches # report historical matches (add --apply)
+uv run codata-admin backups-prune          # report expired backups (add --apply)
+uv run codata-backfill                     # report import candidates (add --apply to fetch)
+uv run python -m unittest discover -s tests -v   # backend tests
+npm --prefix frontend test                    # frontend interaction tests
 ```
 
 ## Notes
 
 - `.env` contains real credentials and is gitignored.
+- The first start after a schema upgrade automatically creates a backup in `data/` before migrating.
+- Backups are retained for 90 days and capped at 10 recent files by default (`CODATA_BACKUP_RETENTION_DAYS` / `CODATA_BACKUP_RETENTION_COUNT`; 0 disables the corresponding rule). Use `codata-admin backups-prune` for a dry-run.
+- New/reset passwords require at least 6 characters (max 200) and must differ from the current password.
+- Provider requests do not inherit `HTTP_PROXY`/`HTTPS_PROXY` by default; set `CODATA_PROVIDER_TRUST_ENV=true` only if a proxy is required.
 - Raw upstream responses are kept under `data/raw/` for re-parsing.
+- Rounds should be archived rather than purged; permanent deletion is admin-only, requires confirmation, refuses rounds linked to leads, and creates a database backup.
 - Only collect publicly available data and follow each provider's terms of service.
 - For public deployment, use Nginx + HTTPS and see `deploy/README.md`.

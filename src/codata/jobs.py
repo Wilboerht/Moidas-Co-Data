@@ -36,19 +36,15 @@ def main(argv: list[str] | None = None) -> None:
                 try:
                     current = db.get_job(job_id)
                     if current and current.get("status") in ("pending", "running"):
-                        finished = utc_now()
-                        db.update_job(
+                        db.finish_job(
                             job_id,
+                            args.round_id,
                             status="failed",
                             stage="中断",
                             error="任务被系统终止",
-                            finished_at=finished,
-                        )
-                        db.update_round(
-                            args.round_id,
-                            status="failed",
-                            error="任务被系统终止",
-                            finished_at=finished,
+                            cost=db.sum_job_cost(job_id),
+                            round_cost=db.sum_round_cost(args.round_id),
+                            finished_at=utc_now(),
                         )
                 except Exception:
                     pass

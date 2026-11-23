@@ -1,9 +1,10 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Ban, CircleCheck, KeyRound, LogOut, MoreHorizontal, Shield, UserCheck, UserPlus, UserX } from "lucide-react";
+import { Ban, CircleCheck, Eye, EyeOff, KeyRound, LogOut, MoreHorizontal, Shield, UserCheck, UserPlus, UserX } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/shared/api";
 import { useAuth } from "@/shared/auth-context";
+import { MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH } from "@/shared/constants";
 import { fmtDateTime } from "@/shared/format";
 import type { AuthUser } from "@/shared/types";
 import { ErrorState, Page, PageHeader, Section } from "@/components/page";
@@ -54,9 +55,13 @@ export function UsersPage() {
   const [resetTarget, setResetTarget] = useState<AuthUser | null>(null);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [passwordConfirm, setPasswordConfirm] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [role, setRole] = useState("member");
   const [canCollect, setCanCollect] = useState(false);
   const [newPassword, setNewPassword] = useState("");
+  const [newPasswordConfirm, setNewPasswordConfirm] = useState("");
+  const [showNewPassword, setShowNewPassword] = useState(false);
   const [error, setError] = useState("");
   const [confirm, setConfirm] = useState<{
     title: string;
@@ -67,16 +72,46 @@ export function UsersPage() {
 
   const refresh = () => queryClient.invalidateQueries({ queryKey: ["users"] });
 
+  const resetCreateForm = () => {
+    setUsername("");
+    setPassword("");
+    setPasswordConfirm("");
+    setShowPassword(false);
+    setRole("member");
+    setCanCollect(false);
+    setError("");
+  };
+
+  const resetPasswordForm = () => {
+    setNewPassword("");
+    setNewPasswordConfirm("");
+    setShowNewPassword(false);
+  };
+
+  const closeCreateDialog = () => {
+    if (createMutation.isPending) return;
+    setCreateOpen(false);
+    resetCreateForm();
+  };
+
+  const closeResetDialog = () => {
+    if (resetMutation.isPending) return;
+    setResetTarget(null);
+    resetPasswordForm();
+  };
+
   const createMutation = useMutation({
-    mutationFn: () => api.createUser({ username, password, role, can_collect: canCollect }),
+    mutationFn: () =>
+      api.createUser({
+        username,
+        password,
+        role,
+        can_collect: role === "admin" ? false : canCollect,
+      }),
     onSuccess: async () => {
-      toast.success("用户已创建");
+      toast.success("用户已创建，首次登录需要修改密码");
       setCreateOpen(false);
-      setUsername("");
-      setPassword("");
-      setRole("member");
-      setCanCollect(false);
-      setError("");
+      resetCreateForm();
       await refresh();
     },
     onError: (err) => setError(err instanceof Error ? err.message : "创建失败"),
@@ -95,9 +130,9 @@ export function UsersPage() {
   const resetMutation = useMutation({
     mutationFn: () => api.resetUserPassword(resetTarget!.id, newPassword),
     onSuccess: async () => {
-      toast.success("密码已重置，相关会话已注销");
+      toast.success("密码已重置，相关会话已注销，下次登录需修改密码");
       setResetTarget(null);
-      setNewPassword("");
+      resetPasswordForm();
       await refresh();
     },
     onError: (err) => toast.error(err instanceof Error ? err.message : "重置失败"),
@@ -105,8 +140,12 @@ export function UsersPage() {
 
   const revokeMutation = useMutation({
     mutationFn: (id: number) => api.revokeUserSessions(id),
-    onSuccess: async () => {
-      toast.success("已注销该用户的全部会话");
+    onSuccess: async (result, id) => {
+      if (id === user?.id && result.kept_current) {
+        toast.success(`已注销其他 ${result.revoked} 个会话，当前会话保持登录`);
+      } else {
+        toast.success("已注销该用户的全部会话");
+      }
       await refresh();
     },
     onError: (err) => toast.error(err instanceof Error ? err.message : "操作失败"),
@@ -129,7 +168,12 @@ export function UsersPage() {
         title="用户管理"
         description="账号由管理员创建，所有用户共享同一批采集数据。"
         actions={
-          <Button onClick={() => { setError(""); setCreateOpen(true); }}>
+          <Button
+            onClick={() => {
+              resetCreateForm();
+              setCreateOpen(true);
+            }}
+          >
             <UserPlus />
             新建用户
           </Button>
@@ -219,7 +263,12 @@ export function UsersPage() {
                   <TableCell className="text-right">
                     <DropdownMenu>
                       <DropdownMenuTrigger asChild>
-                        <Button variant="ghost" size="icon-sm" aria-label={`管理 ${item.username}`}>
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          aria-label={`管理 ${item.username}`}
+                          disabled={updateMutation.isPending || revokeMutation.isPending}
+                        >
                           <MoreHorizontal />
                         </Button>
                       </DropdownMenuTrigger>
@@ -240,31 +289,50 @@ export function UsersPage() {
                         </DropdownMenuItem>
                         <DropdownMenuItem
                           disabled={item.role === "admin"}
-                          onClick={() => updateMutation.mutate({ id: item.id, payload: { can_collect: !item.can_collect } })}
+                          onClick={() =>
+                            setConfirm({
+                              title: item.can_collect ? "取消采集权限？" : "允许发起采集？",
+                              description: item.can_collect
+                                ? `${item.username} 将不能再新建或重新运行采集任务，已有数据不受影响。`
+                                : `${item.username} 将可以新建和重新运行采集任务。`,
+                              variant: item.can_collect ? "destructive" : "default",
+                              action: () =>
+                                updateMutation.mutate({
+                                  id: item.id,
+                                  payload: { can_collect: !item.can_collect },
+                                }),
+                            })
+                          }
                         >
                           {item.can_collect ? <UserX /> : <UserCheck />}
                           {item.can_collect ? "取消采集权限" : "允许发起采集"}
                         </DropdownMenuItem>
                         <DropdownMenuItem
                           disabled={item.id === user.id}
-                          onClick={() => setResetTarget(item)}
+                          title={item.id === user.id ? "请通过右上角“修改密码”修改自己的密码" : undefined}
+                          onClick={() => {
+                            resetPasswordForm();
+                            setResetTarget(item);
+                          }}
                         >
                           <KeyRound />
                           重置密码
                         </DropdownMenuItem>
                         <DropdownMenuItem
-                          disabled={item.id === user.id}
                           onClick={() =>
                             setConfirm({
-                              title: "注销全部会话？",
-                              description: `用户 ${item.username} 的所有登录会话将立即失效，需要重新登录。`,
+                              title: item.id === user.id ? "注销其他会话？" : "注销全部会话？",
+                              description:
+                                item.id === user.id
+                                  ? "当前会话会保持登录，其他设备上的登录会话将立即失效。"
+                                  : `用户 ${item.username} 的所有登录会话将立即失效，需要重新登录。`,
                               variant: "destructive",
                               action: () => revokeMutation.mutate(item.id),
                             })
                           }
                         >
                           <LogOut />
-                          注销全部会话
+                          {item.id === user.id ? "注销其他会话" : "注销全部会话"}
                         </DropdownMenuItem>
                         <DropdownMenuSeparator />
                         <DropdownMenuItem
@@ -319,35 +387,89 @@ export function UsersPage() {
       <Dialog
         open={createOpen}
         onOpenChange={(open) => {
-          setCreateOpen(open);
           if (!open) {
-            setError("");
-            setPassword("");
+            closeCreateDialog();
+            return;
           }
+          setCreateOpen(true);
         }}
       >
         <DialogContent>
-          <form onSubmit={(event) => { event.preventDefault(); createMutation.mutate(); }}>
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (
+                createMutation.isPending ||
+                username.trim().length < 2 ||
+                password.length < MIN_PASSWORD_LENGTH ||
+                password !== passwordConfirm
+              ) {
+                return;
+              }
+              createMutation.mutate();
+            }}
+          >
             <DialogHeader>
               <DialogTitle>新建用户</DialogTitle>
-              <DialogDescription>创建后把用户名和初始密码交给用户，首次登录后建议修改密码。</DialogDescription>
+              <DialogDescription>
+                创建后把用户名和初始密码交给用户，首次登录时系统会强制要求修改密码。
+              </DialogDescription>
             </DialogHeader>
             <div className="space-y-4 py-4">
               <div className="space-y-2">
                 <Label htmlFor="new-username">用户名</Label>
-                <Input id="new-username" value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="off" autoFocus />
+                <Input
+                  id="new-username"
+                  value={username}
+                  maxLength={32}
+                  onChange={(event) => setUsername(event.target.value)}
+                  autoComplete="off"
+                  autoFocus
+                />
+                <p className="text-xs text-muted-foreground">
+                  2-32 个字符，支持字母、数字、下划线、点、@ 和 -。
+                </p>
               </div>
               <div className="space-y-2">
                 <Label htmlFor="new-user-password">初始密码</Label>
+                <div className="relative">
+                  <Input
+                    id="new-user-password"
+                    type={showPassword ? "text" : "password"}
+                    value={password}
+                    minLength={MIN_PASSWORD_LENGTH}
+                    maxLength={MAX_PASSWORD_LENGTH}
+                    onChange={(event) => setPassword(event.target.value)}
+                    autoComplete="new-password"
+                    className="pr-9"
+                  />
+                  <button
+                    type="button"
+                    className="absolute top-1/2 right-1 inline-flex size-7 -translate-y-1/2 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
+                    aria-label={showPassword ? "隐藏密码" : "显示密码"}
+                    onClick={() => setShowPassword((visible) => !visible)}
+                  >
+                    {showPassword ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+                  </button>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  至少 {MIN_PASSWORD_LENGTH} 个字符，最多 {MAX_PASSWORD_LENGTH} 个字符。
+                </p>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="new-user-password-confirm">确认密码</Label>
                 <Input
-                  id="new-user-password"
-                  type="password"
-                  value={password}
-                  minLength={10}
-                  onChange={(event) => setPassword(event.target.value)}
+                  id="new-user-password-confirm"
+                  type={showPassword ? "text" : "password"}
+                  value={passwordConfirm}
+                  minLength={MIN_PASSWORD_LENGTH}
+                  maxLength={MAX_PASSWORD_LENGTH}
+                  onChange={(event) => setPasswordConfirm(event.target.value)}
                   autoComplete="new-password"
                 />
-                <p className="text-xs text-muted-foreground">至少 10 个字符。</p>
+                {passwordConfirm && password !== passwordConfirm ? (
+                  <p className="text-xs text-destructive">两次输入的密码不一致</p>
+                ) : null}
               </div>
               <div className="space-y-2">
                 <Label htmlFor="new-user-role">角色</Label>
@@ -362,19 +484,34 @@ export function UsersPage() {
               <div className="flex items-center justify-between gap-4 border-t pt-4">
                 <div className="space-y-1">
                   <Label htmlFor="create-can-collect">允许发起采集</Label>
-                  <p className="text-xs text-muted-foreground">成员开启后才能新建和重新运行采集。</p>
+                  <p className="text-xs text-muted-foreground">
+                    {role === "admin"
+                      ? "管理员默认拥有采集权限，无需单独设置。"
+                      : "成员开启后才能新建和重新运行采集。"}
+                  </p>
                 </div>
                 <Switch
                   id="create-can-collect"
-                  checked={canCollect}
+                  checked={role === "admin" ? true : canCollect}
                   onCheckedChange={setCanCollect}
+                  disabled={role === "admin"}
                 />
               </div>
               {error ? <p className="text-sm text-destructive" role="alert">{error}</p> : null}
             </div>
             <DialogFooter>
-              <Button type="button" variant="outline" onClick={() => setCreateOpen(false)} disabled={createMutation.isPending}>取消</Button>
-              <Button type="submit" disabled={createMutation.isPending || !username.trim() || password.length < 10}>
+              <Button type="button" variant="outline" onClick={closeCreateDialog} disabled={createMutation.isPending}>
+                取消
+              </Button>
+              <Button
+                type="submit"
+                disabled={
+                  createMutation.isPending ||
+                  username.trim().length < 2 ||
+                  password.length < MIN_PASSWORD_LENGTH ||
+                  password !== passwordConfirm
+                }
+              >
                 {createMutation.isPending ? "创建中…" : "创建"}
               </Button>
             </DialogFooter>
@@ -382,29 +519,92 @@ export function UsersPage() {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={resetTarget !== null} onOpenChange={(open) => { if (!open) { setResetTarget(null); setNewPassword(""); } }}>
+      <Dialog
+        open={resetTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) {
+            closeResetDialog();
+            return;
+          }
+          setResetTarget(resetTarget);
+        }}
+      >
         <DialogContent>
-          <form onSubmit={(event) => { event.preventDefault(); resetMutation.mutate(); }}>
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (
+                resetMutation.isPending ||
+                newPassword.length < MIN_PASSWORD_LENGTH ||
+                newPassword !== newPasswordConfirm
+              ) {
+                return;
+              }
+              resetMutation.mutate();
+            }}
+          >
             <DialogHeader>
               <DialogTitle>重置 {resetTarget?.username} 的密码</DialogTitle>
-              <DialogDescription>重置后该用户的所有会话会立即失效。</DialogDescription>
+              <DialogDescription>
+                重置后该用户的所有会话会立即失效，下次登录时需要修改密码。
+              </DialogDescription>
             </DialogHeader>
-            <div className="space-y-2 py-4">
-              <Label htmlFor="reset-password">新密码</Label>
-              <Input
-                id="reset-password"
-                type="password"
-                value={newPassword}
-                minLength={10}
-                onChange={(event) => setNewPassword(event.target.value)}
-                autoComplete="new-password"
-                autoFocus
-              />
-              <p className="text-xs text-muted-foreground">至少 10 个字符。</p>
+            <div className="space-y-3 py-4">
+              <div className="space-y-2">
+                <Label htmlFor="reset-password">新密码</Label>
+                <div className="relative">
+                  <Input
+                    id="reset-password"
+                    type={showNewPassword ? "text" : "password"}
+                    value={newPassword}
+                    minLength={MIN_PASSWORD_LENGTH}
+                    maxLength={MAX_PASSWORD_LENGTH}
+                    onChange={(event) => setNewPassword(event.target.value)}
+                    autoComplete="new-password"
+                    autoFocus
+                    className="pr-9"
+                  />
+                  <button
+                    type="button"
+                    className="absolute top-1/2 right-1 inline-flex size-7 -translate-y-1/2 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
+                    aria-label={showNewPassword ? "隐藏密码" : "显示密码"}
+                    onClick={() => setShowNewPassword((visible) => !visible)}
+                  >
+                    {showNewPassword ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+                  </button>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  至少 {MIN_PASSWORD_LENGTH} 个字符，最多 {MAX_PASSWORD_LENGTH} 个字符。
+                </p>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="reset-password-confirm">确认密码</Label>
+                <Input
+                  id="reset-password-confirm"
+                  type={showNewPassword ? "text" : "password"}
+                  value={newPasswordConfirm}
+                  minLength={MIN_PASSWORD_LENGTH}
+                  maxLength={MAX_PASSWORD_LENGTH}
+                  onChange={(event) => setNewPasswordConfirm(event.target.value)}
+                  autoComplete="new-password"
+                />
+                {newPasswordConfirm && newPassword !== newPasswordConfirm ? (
+                  <p className="text-xs text-destructive">两次输入的密码不一致</p>
+                ) : null}
+              </div>
             </div>
             <DialogFooter>
-              <Button type="button" variant="outline" onClick={() => setResetTarget(null)} disabled={resetMutation.isPending}>取消</Button>
-              <Button type="submit" disabled={resetMutation.isPending || newPassword.length < 10}>
+              <Button type="button" variant="outline" onClick={closeResetDialog} disabled={resetMutation.isPending}>
+                取消
+              </Button>
+              <Button
+                type="submit"
+                disabled={
+                  resetMutation.isPending ||
+                  newPassword.length < MIN_PASSWORD_LENGTH ||
+                  newPassword !== newPasswordConfirm
+                }
+              >
                 {resetMutation.isPending ? "重置中…" : "重置密码"}
               </Button>
             </DialogFooter>

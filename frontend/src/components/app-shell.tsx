@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
+import { toast } from "sonner";
 import {
   LayoutDashboard,
   ContactRound,
@@ -34,6 +35,8 @@ import {
 } from "@/components/ui/sidebar";
 import { useAuth } from "@/shared/auth-context";
 import { useRound } from "@/shared/round-context";
+import { fmtNumber } from "@/shared/format";
+import type { Job } from "@/shared/types";
 import { APP_VERSION } from "@/shared/version";
 
 const NAV_ITEMS = [
@@ -106,7 +109,7 @@ function AppSidebar() {
             <SidebarMenuItem>
               <SidebarMenuButton size="lg" asChild tooltip="Moidas">
                 <Link to="/" aria-label="Moidas 首页">
-                  <img src={logo} alt="" aria-hidden="true" className="h-7 w-auto shrink-0" />
+                  <img src={logo} alt="" aria-hidden="true" width={481} height={424} className="h-7 w-auto shrink-0" />
                   <div className="grid flex-1 text-left text-sm leading-tight group-data-[collapsible=icon]:hidden">
                     <span className="truncate font-semibold text-[#1C316A]">Moidas</span>
                     <span className="truncate text-[11px] text-muted-foreground">多平台信息数据处理工作台</span>
@@ -214,34 +217,79 @@ export function AppShell() {
   const location = useLocation();
   const [sidebarDefaultOpen] = useState(readSidebarOpen);
   const { user } = useAuth();
-  const { error, job, round, activeJob, rounds } = useRound();
+  const { error, job, activeJob, latestJob, rounds } = useRound();
   const canCollect = user?.role === "admin" || Boolean(user?.can_collect);
-  const statusJob = activeJob ?? job;
-  const status = statusJob?.status ?? round?.status;
-  const statusLabel = statusJob?.status_label ?? round?.status_label;
-  const statusActive = status === "running" || status === "pending";
+  const statusJob =
+    [activeJob, job].find(
+      (item) => item && (item.status === "running" || item.status === "pending"),
+    ) ?? null;
+  const status = statusJob?.status ?? null;
+  const statusLabel = statusJob?.status_label ?? status;
   const statusPercent =
     statusJob && statusJob.progress_total > 0
       ? Math.round((statusJob.progress_done / statusJob.progress_total) * 100)
       : null;
   const statusRound = statusJob
     ? rounds.find((item) => item.id === statusJob.round_id) ?? null
-    : round;
-  const statusText = status
-    ? `${statusLabel ?? status}${statusActive && statusPercent !== null ? ` · ${statusPercent}%` : ""}`
+    : null;
+  const activeCount = statusJob?.active_count ?? (statusJob ? 1 : 0);
+  const statusText = statusJob
+    ? `${statusLabel ?? "采集中"}${statusPercent !== null ? ` · ${statusPercent}%` : ""}${
+        activeCount > 1 ? ` · ${activeCount} 个任务` : ""
+      }`
     : "空闲";
+  const statusDescription = statusJob
+    ? `采集状态：${statusText}${statusJob.stage ? ` · ${statusJob.stage}` : ""}${
+        statusRound ? ` · ${statusRound.name}` : ""
+      }。${activeCount > 1 ? "点击查看全部任务。" : "点击查看任务详情。"}`
+    : "当前没有运行中的采集任务。点击查看采集记录。";
+  const statusHref =
+    statusJob?.round_id && activeCount <= 1 ? `/tasks/${statusJob.round_id}` : "/tasks";
   const orbState = roundOrbState(status);
   const pageTitle = titleForPath(location.pathname);
   const isTaskDetail = location.pathname.startsWith("/tasks/");
+  const previousJobRef = useRef<Job | null>(null);
+  const notifiedJobRef = useRef("");
 
   useEffect(() => {
     document.title = `${pageTitle} · Moidas Co-data`;
   }, [pageTitle]);
 
+  useEffect(() => {
+    const previous = previousJobRef.current;
+    previousJobRef.current = latestJob;
+    if (!previous || !latestJob || previous.id !== latestJob.id) return;
+    if (previous.status !== "running" && previous.status !== "pending") return;
+    if (latestJob.status !== "done" && latestJob.status !== "failed") return;
+    const key = `${latestJob.id}:${latestJob.status}`;
+    if (notifiedJobRef.current === key) return;
+    notifiedJobRef.current = key;
+    const roundName = rounds.find((item) => item.id === latestJob.round_id)?.name;
+    const suffix = roundName ? ` · ${roundName}` : "";
+    if (latestJob.status === "done") {
+      toast.success(`采集完成${suffix}`, {
+        description: `处理 ${latestJob.progress_done} / ${latestJob.progress_total} · 花费 ${fmtNumber(latestJob.cost)} token`,
+        duration: 6000,
+      });
+      return;
+    }
+    if (latestJob.stage === "已取消" || latestJob.error === "任务已取消") return;
+    toast.error(`采集失败${suffix}`, {
+      description: latestJob.error || "请进入采集记录查看详情",
+      duration: 8000,
+    });
+  }, [latestJob, rounds]);
+
   return (
     <SidebarProvider defaultOpen={sidebarDefaultOpen}>
+      <a
+        href="#main-content"
+        className="fixed start-4 top-4 z-[100] -translate-y-24 rounded-md bg-primary px-3 py-2 text-sm text-primary-foreground shadow-md transition-transform focus:translate-y-0"
+      >
+        跳到主内容
+      </a>
       <AppSidebar />
-      <SidebarInset className="min-w-0">
+      <SidebarInset id="main-content" tabIndex={-1} className="min-w-0 scroll-mt-20">
         <header className="sticky top-0 z-20 flex h-16 shrink-0 items-center gap-2 md:rounded-t-xl border-b bg-background px-4 md:px-6 lg:px-8">
           <SidebarToggle />
           <Separator orientation="vertical" className="mx-1 h-4 md:hidden" />
@@ -277,15 +325,19 @@ export function AppShell() {
             </BreadcrumbList>
           </Breadcrumb>
           <span className="text-sm font-medium text-[#1C316A] md:hidden">Moidas</span>
-          <div className="ml-auto flex items-center">
-            {canCollect ? (
-              <Tooltip>
+          <div className="ml-auto flex items-center gap-3">
+            <Tooltip>
               <TooltipTrigger asChild>
                 <Link
-                  to="/new"
-                  className="group flex h-9 items-center gap-3 rounded-lg px-1 text-sm font-medium text-foreground outline-none transition-colors hover:text-primary focus-visible:ring-3 focus-visible:ring-ring/50"
+                  to={statusHref}
+                  aria-label={statusDescription}
+                  className={`group flex h-9 items-center gap-2 text-sm font-medium outline-none transition-colors focus-visible:ring-3 focus-visible:ring-ring/50 ${
+                    statusJob
+                      ? "text-foreground hover:text-primary"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
                 >
-                  <span aria-hidden="true" className="flex size-8 items-center justify-center">
+                  <span className="flex size-8 items-center justify-center" aria-hidden="true">
                     <ThinkingOrb
                       size={32}
                       dots={80}
@@ -295,14 +347,23 @@ export function AppShell() {
                       haptics={false}
                     />
                   </span>
-                  <Separator orientation="vertical" className="h-4" style={{ alignSelf: "center" }} />
-                  <span className="underline-offset-4 group-hover:underline">新建采集</span>
+                  <span className="hidden max-w-[180px] truncate sm:inline">{statusText}</span>
                 </Link>
               </TooltipTrigger>
               <TooltipContent side="bottom" align="end" sideOffset={6}>
-                采集状态：{statusText}{statusRound ? ` · ${statusRound.name}` : ""}
+                {statusDescription}
               </TooltipContent>
-              </Tooltip>
+            </Tooltip>
+            {canCollect ? (
+              <>
+                <span aria-hidden="true" className="h-4 w-px shrink-0 self-center bg-border" />
+                <Link
+                  to="/new"
+                  className="group flex h-9 items-center text-sm font-medium text-foreground outline-none transition-colors hover:text-primary focus-visible:ring-3 focus-visible:ring-ring/50"
+                >
+                  <span className="underline-offset-4 group-hover:underline">新建采集</span>
+                </Link>
+              </>
             ) : null}
           </div>
         </header>

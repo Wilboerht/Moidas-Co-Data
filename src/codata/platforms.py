@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import sys
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -71,6 +73,7 @@ class ProviderRuntime:
     api_key_env: str
     balance_path: str
     balance_currency: str
+    balance_token_rate: Decimal
     timeout: float
     retries: int
     delay: float
@@ -139,6 +142,24 @@ class Registry:
             options,
             key=lambda option: (
                 option.search.price.tokens(self.usd_cny, self.token_cny),
+                list(self.platform(platform_code).providers).index(option.provider.id),
+            ),
+        )
+
+    def cheapest_user(
+        self, platform_code: str, require_ready: bool = True
+    ) -> PlatformProviderRuntime | None:
+        options = [
+            option
+            for option in self.options(platform_code)
+            if not require_ready or option.ready
+        ]
+        if not options:
+            return None
+        return min(
+            options,
+            key=lambda option: (
+                option.user.price.tokens(self.usd_cny, self.token_cny),
                 list(self.platform(platform_code).providers).index(option.provider.id),
             ),
         )
@@ -223,6 +244,8 @@ def _decimal(value: Any, field: str) -> Decimal:
         result = Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError) as exc:
         raise PlatformConfigError(f"{field} 必须是数字") from exc
+    if not result.is_finite():
+        raise PlatformConfigError(f"{field} 必须是有限数字")
     if result < 0:
         raise PlatformConfigError(f"{field} 不能为负数")
     return result
@@ -230,6 +253,16 @@ def _decimal(value: Any, field: str) -> Decimal:
 
 def _env_list(name: str) -> tuple[str, ...]:
     return tuple(item.strip().lower() for item in os.getenv(name, "").split(",") if item.strip())
+
+
+def _as_bool(value: Any, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "0", "false", "no", "off", "disabled"}
+    return bool(value)
 
 
 def _validate_path(path: str, field: str) -> str:
@@ -280,11 +313,15 @@ def load_registry(
     config_path = path or Path(
         os.getenv("CODATA_PLATFORMS_FILE", str(PROJECT_ROOT / "config" / "platforms.json"))
     )
+    if not config_path.is_absolute():
+        config_path = PROJECT_ROOT / config_path
     data = _read_config(config_path)
     token_cny = _decimal(settings.token_cny, "CODATA_TOKEN_CNY")
     usd_cny = _decimal(settings.usd_cny, "CODATA_USD_CNY")
     if token_cny <= 0:
         raise PlatformConfigError("CODATA_TOKEN_CNY 必须大于 0")
+    if usd_cny <= 0:
+        raise PlatformConfigError("CODATA_USD_CNY 必须大于 0")
 
     providers_raw = data.get("providers") if isinstance(data.get("providers"), dict) else {}
     providers: dict[str, ProviderRuntime] = {}
@@ -324,8 +361,28 @@ def load_registry(
             if isinstance(configured, list):
                 allowed = tuple(str(value).strip().lower() for value in configured if str(value).strip())
         if base_url:
-            validate_provider_host(base_url, allowed)
+            try:
+                validate_provider_host(base_url, allowed)
+            except PlatformConfigError as exc:
+                print(f"[provider] 跳过 {provider_id}: {exc}", file=sys.stderr)
+                continue
 
+        raw_codes = item.get("success_codes", [])
+        if not isinstance(raw_codes, list):
+            raw_codes = []
+        try:
+            success_codes = tuple(int(value) for value in raw_codes)
+        except (TypeError, ValueError):
+            success_codes = ()
+        raw_balance_path = str(item.get("balance_path") or "").strip()
+        balance_path = (
+            _validate_path(raw_balance_path, f"{provider_id}.balance_path")
+            if raw_balance_path
+            else ""
+        )
+        auth_query = str(item.get("auth_query") or "").strip()
+        if auth_query and not re.fullmatch(r"[A-Za-z0-9_.-]+", auth_query):
+            auth_query = ""
         providers[provider_id] = ProviderRuntime(
             id=provider_id,
             label=label,
@@ -335,11 +392,14 @@ def load_registry(
             allowed_hosts=allowed,
             auth_header=str(item.get("auth_header") or "Authorization"),
             auth_prefix=str(item.get("auth_prefix") or ""),
-            auth_query=str(item.get("auth_query") or ""),
-            success_codes=tuple(int(value) for value in item.get("success_codes", [])),
+            auth_query=auth_query,
+            success_codes=success_codes,
             api_key_env=str(item.get("api_key_env") or ""),
-            balance_path=str(item.get("balance_path") or ""),
+            balance_path=balance_path,
             balance_currency=str(item.get("balance_currency") or "token"),
+            balance_token_rate=_decimal(
+                item.get("balance_token_rate", 0), f"{provider_id}.balance_token_rate"
+            ),
             timeout=float(os.getenv("CODATA_PROVIDER_TIMEOUT", settings.timeout)),
             retries=max(1, int(os.getenv("CODATA_PROVIDER_RETRY", settings.retries))),
             delay=max(0.0, float(os.getenv("CODATA_PROVIDER_DELAY", settings.delay))),
@@ -378,13 +438,16 @@ def load_registry(
                         f"{platform_code}.{provider_id}.user.cost",
                     ),
                 ),
-                enabled=bool(endpoint_data.get("enabled", True)),
+                enabled=_as_bool(endpoint_data.get("enabled", True)),
             )
+        default_provider = str(item.get("default_provider") or "cheapest").strip().lower()
+        if default_provider not in {"auto", "cheapest", "default"} and default_provider not in providers_for_platform:
+            default_provider = "cheapest"
         platforms[platform_code] = PlatformRuntime(
             code=platform_code,
             label=str(item.get("label") or platform_code),
-            enabled=bool(item.get("enabled", True)),
-            default_provider=str(item.get("default_provider") or "cheapest"),
+            enabled=_as_bool(item.get("enabled", True)),
+            default_provider=default_provider,
             providers=providers_for_platform,
         )
 

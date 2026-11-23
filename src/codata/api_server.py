@@ -18,6 +18,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import set_key
+from starlette.concurrency import run_in_threadpool
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 from pydantic import BaseModel, Field, StringConstraints
@@ -40,12 +41,18 @@ from .auth import (
     session_expiry,
     validate_password,
     validate_username,
+    verify_dummy_password,
     verify_password,
 )
 from .client import DataFlowClient, RnoteClient
 from .config import PROJECT_ROOT, Settings, load_settings
 from .db import Database, JobBusyError, SCHEMA_VERSION
-from .normalize import as_int, format_fans_wan, normalize_tier_label, split_tags
+from .normalize import (
+    as_optional_int,
+    format_fans_wan,
+    normalize_tier_label,
+    split_tags,
+)
 from .platforms import PlatformConfigError, load_registry
 from .providers import build_provider
 from .panel.queries import EXPORT_COLUMNS, JOB_STATUS_LABELS, PLATFORM_LABELS, ROUND_STATUS_LABELS
@@ -60,6 +67,7 @@ from .lead_statuses import (
     normalize_lead_status,
 )
 from .leads import convert_lead
+from .matching import match_lead_against_creators
 from .statuses import STATUS_CODES, STATUS_DEFS, STATUS_LABELS, normalize_status
 from .storage import unwrap_data
 
@@ -73,6 +81,19 @@ login_limiter = LoginRateLimiter(
     max_attempts=settings.max_login_attempts,
     window_seconds=settings.login_window_minutes * 60,
 )
+action_limiter = LoginRateLimiter(max_attempts=60, window_seconds=60)
+
+
+def _enforce_action_limit(key: str) -> None:
+    bucket = f"action:{key}"
+    if action_limiter.blocked(bucket):
+        retry = action_limiter.retry_after(bucket)
+        raise HTTPException(
+            429,
+            "操作过于频繁，请稍后再试",
+            headers={"Retry-After": str(retry or 1)},
+        )
+    action_limiter.fail(bucket)
 
 
 class LocalOriginMiddleware(BaseHTTPMiddleware):
@@ -93,6 +114,13 @@ class RequestSizeMiddleware(BaseHTTPMiddleware):
                     return JSONResponse({"detail": "请求体过大"}, status_code=413)
             except ValueError:
                 return JSONResponse({"detail": "无效的 Content-Length"}, status_code=400)
+        elif request.method not in SAFE_METHODS and request.headers.get(
+            "transfer-encoding"
+        ):
+            return JSONResponse(
+                {"detail": "分块请求体不受支持，请提供 Content-Length"},
+                status_code=411,
+            )
         return await call_next(request)
 
 
@@ -108,11 +136,15 @@ class AuthMiddleware(BaseHTTPMiddleware):
         token = request.cookies.get(SESSION_COOKIE)
         if not token:
             return JSONResponse({"detail": "请先登录"}, status_code=401)
-        db = Database(settings.output_dir)
-        try:
-            session = db.get_session(hash_session_token(token))
-        finally:
-            db.close()
+
+        def load_session() -> dict[str, Any] | None:
+            db = Database(settings.output_dir)
+            try:
+                return db.get_session(hash_session_token(token))
+            finally:
+                db.close()
+
+        session = await run_in_threadpool(load_session)
         if not session:
             return JSONResponse({"detail": "登录已失效，请重新登录"}, status_code=401)
         if request.method not in SAFE_METHODS:
@@ -181,6 +213,11 @@ def reconcile_jobs_on_startup() -> None:
     with Database(settings.output_dir) as db:
         db.reconcile_stale_jobs(settings.job_stale_minutes)
         db.prune_maintenance(settings.audit_retention_days)
+        db.prune_backups(
+            settings.backup_retention_days,
+            settings.backup_retention_count,
+            apply=True,
+        )
 
 
 def get_db() -> Generator[Database, None, None]:
@@ -211,9 +248,10 @@ EXPORT_FIELDS = {
     "主页URL": "profile_url",
     "账号ID": "account_id",
     "代表作": "top_title",
-    "数据来源": "source",
+    "命中关键词": "matched_keywords",
+    "来源标签": "source",
     "平台": "platform_label",
-    "经手人": "owner_username",
+    "负责人": "owner_username",
     "合作主平台": "cooperation_platform",
     "原始标题": "raw_title",
     "样本笔记": "sample_notes",
@@ -226,6 +264,18 @@ def _safe_cell(value: Any) -> Any:
     if isinstance(value, str) and value.lstrip(" \t\r\n")[:1] in ("=", "+", "-", "@"):
         return "'" + value
     return value
+
+
+_SECRET_QUERY_RE = re.compile(
+    r"([?&](?:token|api_?key|apikey|access_token|auth)=)[^&\s\"']+", re.IGNORECASE
+)
+
+
+def _public_error(exc: Any) -> str:
+    text = str(exc or "")
+    text = _SECRET_QUERY_RE.sub(r"\1***", text)
+    text = re.sub(r"(https?://[^\s?#\"']+)\?[^\s\"']*", r"\1", text)
+    return text[:300]
 
 
 def _export_value(item: dict[str, Any], header: str) -> Any:
@@ -241,13 +291,15 @@ def _iter_export_items(
     round_id: int | None,
     filters: dict[str, Any],
     page_size: int = 500,
+    sort: str = "fans",
+    order: str = "desc",
 ) -> Generator[dict[str, Any], None, None]:
     page = 1
     while True:
         result = db.query_creators(
             round_id,
-            sort="fans",
-            order="desc",
+            sort=sort,
+            order=order,
             page=page,
             page_size=page_size,
             **filters,
@@ -269,7 +321,18 @@ def _json_list(value: Any) -> list[Any]:
     return loaded if isinstance(loaded, list) else []
 
 
-PROVIDER_LABELS = {"auto": "自动", "dataflow": "DataFlow", "rnote": "Rnote"}
+PROVIDER_LABELS = {
+    "auto": "自动",
+    "cheapest": "自动（最便宜）",
+    "default": "自动",
+    "dataflow": "DataFlow",
+    "rnote": "Rnote",
+    "everyinfra": "EveryInfra",
+    "tikhub": "TikHub",
+    "justoneapi": "JustOneAPI",
+    "socialdatax": "SocialDataX",
+    "redfox": "RedFoxHub",
+}
 
 
 def _round_dict(row: dict[str, Any]) -> dict[str, Any]:
@@ -281,6 +344,9 @@ def _round_dict(row: dict[str, Any]) -> dict[str, Any]:
     payload["platform_label"] = PLATFORM_LABELS.get(platform, platform)
     payload["provider"] = provider
     payload["provider_label"] = PROVIDER_LABELS.get(provider, provider)
+    payload["archived"] = bool(row.get("archived_at"))
+    if payload["archived"]:
+        payload["status_label"] = "已归档"
     return payload
 
 
@@ -288,6 +354,7 @@ def _job_dict(job: dict[str, Any] | None) -> dict[str, Any] | None:
     if not job:
         return None
     payload = dict(job)
+    payload.pop("pid", None)
     payload["status_label"] = JOB_STATUS_LABELS.get(str(job.get("status")), str(job.get("status")))
     return payload
 
@@ -310,6 +377,7 @@ def _creator_dict(row: dict[str, Any]) -> dict[str, Any]:
     manual_tags = split_tags(row.get("tags_manual"))
     tags = list(dict.fromkeys([*auto_tags, *manual_tags]))
     source_keywords = [str(item) for item in _json_list(row.get("source_keywords"))]
+    source_labels = [str(item) for item in _json_list(row.get("source_labels"))]
     fans = row.get("fans")
     user_id = row["user_id"]
     account_id = row.get("account_id")
@@ -348,7 +416,9 @@ def _creator_dict(row: dict[str, Any]) -> dict[str, Any]:
         "top_url": row.get("top_url") or "",
         "top_liked": row.get("top_liked"),
         "source_keywords": source_keywords,
-        "source": "、".join(source_keywords),
+        "source_labels": source_labels,
+        "matched_keywords": "、".join(source_keywords),
+        "source": "、".join(source_labels),
         "remark": row.get("remark") or "",
         "owner_user_id": row.get("owner_user_id"),
         "owner_username": row.get("owner_username") or "",
@@ -363,6 +433,43 @@ def _creator_dict(row: dict[str, Any]) -> dict[str, Any]:
         "ip_location": row.get("ip_location") or "",
         "verify_info": row.get("verify_info") or "",
         "fetched_at": row.get("fetched_at") or "",
+    }
+
+
+def _queue_item(row: dict[str, Any]) -> dict[str, Any]:
+    status = normalize_status(row.get("status"))
+    return {
+        "key": f"{row['platform']}|{row['user_id']}",
+        "round_id": int(row["round_id"]),
+        "round_name": row.get("round_name") or "",
+        "platform": row["platform"],
+        "platform_label": PLATFORM_LABELS.get(row["platform"], row["platform"]),
+        "user_id": row["user_id"],
+        "nickname": row.get("nickname") or "(未补全)",
+        "avatar": row.get("avatar") or "",
+        "fans": row.get("fans"),
+        "fans_wan": format_fans_wan(row.get("fans")) if row.get("fans") is not None else "—",
+        "interaction": row.get("interaction"),
+        "tier": row.get("derived_tier") or "—",
+        "sample_notes": int(row.get("sample_notes") or 0),
+        "sample_interactions": int(row.get("sample_interactions") or 0),
+        "status": status,
+        "status_label": STATUS_LABELS.get(status, status),
+        "owner_user_id": row.get("owner_user_id"),
+        "owner_username": row.get("owner_username") or "",
+        "match_direction": row.get("match_direction") or "",
+        "source_keywords": [str(item) for item in _json_list(row.get("source_keywords"))],
+        "updated_at": row.get("updated_at") or "",
+    }
+
+
+def _efficiency_item(row: dict[str, Any]) -> dict[str, Any]:
+    platform = str(row.get("platform") or "xhs")
+    status = str(row.get("status") or "")
+    return {
+        **row,
+        "platform_label": PLATFORM_LABELS.get(platform, platform),
+        "status_label": ROUND_STATUS_LABELS.get(status, status),
     }
 
 
@@ -391,6 +498,12 @@ def _lead_dict(row: dict[str, Any]) -> dict[str, Any]:
         "converted_platform": row.get("converted_platform") or "",
         "converted_user_id": row.get("converted_user_id") or "",
         "converted_at": row.get("converted_at"),
+        "matched_platform": row.get("matched_platform") or "",
+        "matched_user_id": row.get("matched_user_id") or "",
+        "matched_round_id": row.get("matched_round_id"),
+        "matched_round_name": row.get("matched_round_name") or "",
+        "matched_at": row.get("matched_at"),
+        "match_confidence": row.get("match_confidence") or "",
     }
 
 
@@ -402,6 +515,24 @@ def _lead_detail(db: Database, lead_id: int) -> dict[str, Any]:
     payload["raw_json"] = _safe_json_object(lead.get("raw_json"))
     payload["rounds"] = db.lead_rounds(lead_id)
     payload["attempts"] = db.lead_attempts(lead_id)
+    matched_platform = str(lead.get("matched_platform") or "")
+    matched_user_id = str(lead.get("matched_user_id") or "")
+    if matched_platform and matched_user_id:
+        creator = db.get_creator(matched_platform, matched_user_id)
+        payload["matched_creator"] = (
+            {
+                "platform": matched_platform,
+                "user_id": matched_user_id,
+                "nickname": (creator or {}).get("nickname") or "",
+                "avatar": (creator or {}).get("avatar") or "",
+                "fans": (creator or {}).get("fans"),
+                "profile_url": (creator or {}).get("profile_url") or "",
+            }
+            if creator
+            else None
+        )
+    else:
+        payload["matched_creator"] = None
     return payload
 
 
@@ -509,6 +640,8 @@ class UpdateCreatorRequest(BaseModel):
     match_direction: str | None = Field(None, max_length=100)
     tags_manual: str | None = Field(None, max_length=500)
     remark: str | None = Field(None, max_length=2000)
+    expected_updated_at: str | None = Field(None, max_length=40)
+    expected_status: str | None = Field(None, max_length=40)
 
 
 class BatchItem(BaseModel):
@@ -518,6 +651,8 @@ class BatchItem(BaseModel):
 
 class BatchUpdateRequest(UpdateCreatorRequest):
     items: list[BatchItem] = Field(max_length=500)
+    set_owner: bool = False
+    owner_user_id: int | None = None
 
 
 class BatchClaimRequest(BaseModel):
@@ -537,6 +672,7 @@ class LeadCreateRequest(BaseModel):
 
 
 class LeadUpdateRequest(BaseModel):
+    platform: str | None = Field(None, min_length=1, max_length=20)
     nickname: str | None = Field(None, max_length=200)
     account_id: str | None = Field(None, max_length=200)
     profile_url: str | None = Field(None, max_length=2000)
@@ -552,6 +688,10 @@ class LeadBulkRequest(BaseModel):
 
 
 class LeadAssignRequest(BaseModel):
+    owner_user_id: int | None = None
+
+
+class CreatorAssignRequest(BaseModel):
     owner_user_id: int | None = None
 
 
@@ -578,6 +718,10 @@ class RunRoundRequest(BaseModel):
     refresh_users: bool = False
     force: bool = False
     provider: str | None = Field(None, min_length=1, max_length=20)
+
+
+class PurgeRoundRequest(BaseModel):
+    confirm_name: str = Field(min_length=1, max_length=100)
 
 
 class KeywordCreateRequest(BaseModel):
@@ -658,7 +802,10 @@ def _client_ip(request: Request) -> str:
 
 
 def _secure_request(request: Request) -> bool:
-    proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+    peer = request.client.host if request.client else ""
+    proto = ""
+    if peer in settings.trusted_proxies:
+        proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
     return settings.cookie_secure or request.url.scheme == "https" or proto == "https"
 
 
@@ -734,11 +881,19 @@ def auth_login(
     username = normalize_username(payload.username)
     ip = _client_ip(request)
     user_agent = request.headers.get("user-agent", "")
-    keys = [f"ip:{ip}", f"user:{username}"]
-    if any(login_limiter.blocked(key) for key in keys):
-        raise HTTPException(429, "登录尝试过多，请稍后再试")
+    keys = [f"ip:{ip}", f"user:{username}:{ip}"]
+    blocked = [key for key in keys if login_limiter.blocked(key)]
+    if blocked:
+        retry = max(login_limiter.retry_after(key) for key in blocked)
+        raise HTTPException(
+            429,
+            "登录尝试过多，请稍后再试",
+            headers={"Retry-After": str(retry or 1)},
+        )
 
     user = db.get_user_by_username(username)
+    if not user:
+        verify_dummy_password(payload.password)
     valid = bool(
         user
         and not user.get("disabled")
@@ -758,7 +913,8 @@ def auth_login(
         )
         raise HTTPException(401, "用户名或密码错误")
 
-    login_limiter.reset(keys[1])
+    for key in keys:
+        login_limiter.reset(key)
     token = new_session_token()
     csrf_token = new_csrf_token()
     db.create_session(
@@ -817,6 +973,8 @@ def auth_change_password(
     user = db.get_user(current_user["id"])
     if not user or not verify_password(payload.current_password, user.get("password_hash")):
         raise HTTPException(400, "当前密码不正确")
+    if payload.new_password == payload.current_password:
+        raise HTTPException(400, "新密码不能与当前密码相同")
     try:
         new_hash = hash_password(validate_password(payload.new_password))
     except ValueError as exc:
@@ -870,7 +1028,7 @@ def create_user(
         username,
         _client_ip(request),
         request.headers.get("user-agent", ""),
-        {"role": role},
+        {"role": role, "can_collect": bool(payload.can_collect)},
     )
     return _public_user(db.get_user(user_id) or {})
 
@@ -889,8 +1047,28 @@ def update_user(
     role = payload.role.strip().lower() if payload.role is not None else None
     if role is not None and role not in ROLES:
         raise HTTPException(400, "无效的角色")
-    if payload.disabled and target["id"] == admin["id"]:
-        raise HTTPException(400, "不能停用自己的账号")
+    if target["id"] == admin["id"]:
+        if payload.disabled:
+            raise HTTPException(400, "不能停用自己的账号")
+        if role is not None and role != target["role"]:
+            raise HTTPException(400, "不能修改自己的角色，请由其他管理员操作")
+    changes: dict[str, dict[str, Any]] = {}
+    if role is not None and role != target["role"]:
+        changes["role"] = {"from": target["role"], "to": role}
+    if payload.disabled is not None and bool(payload.disabled) != bool(target["disabled"]):
+        changes["disabled"] = {
+            "from": bool(target["disabled"]),
+            "to": bool(payload.disabled),
+        }
+    if payload.can_collect is not None and bool(payload.can_collect) != bool(
+        target["can_collect"]
+    ):
+        changes["can_collect"] = {
+            "from": bool(target["can_collect"]),
+            "to": bool(payload.can_collect),
+        }
+    if not changes:
+        return _public_user(target)
     try:
         db.update_user_with_admin_guard(
             target["id"],
@@ -900,7 +1078,7 @@ def update_user(
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    if payload.disabled or (role is not None and role != target.get("role")):
+    if changes.get("disabled", {}).get("to") or "role" in changes:
         db.delete_user_sessions(target["id"])
     db.audit(
         admin["id"],
@@ -908,7 +1086,7 @@ def update_user(
         target["username"],
         _client_ip(request),
         request.headers.get("user-agent", ""),
-        {"role": role, "disabled": payload.disabled},
+        {"changes": changes},
     )
     return _public_user(db.get_user(target["id"]) or target)
 
@@ -924,6 +1102,8 @@ def reset_user_password(
     target = db.get_user(user_id)
     if not target:
         raise HTTPException(404, "用户不存在")
+    if target["id"] == admin["id"]:
+        raise HTTPException(400, "请通过右上角“修改密码”修改自己的密码")
     try:
         password_hash = hash_password(validate_password(payload.new_password))
     except ValueError as exc:
@@ -954,15 +1134,23 @@ def revoke_user_sessions(
     target = db.get_user(user_id)
     if not target:
         raise HTTPException(404, "用户不存在")
-    db.delete_user_sessions(target["id"])
+    kept_current = target["id"] == admin["id"]
+    current_session = getattr(request.state, "session", None)
+    except_token_hash = (
+        current_session.get("token_hash") if kept_current and current_session else None
+    )
+    revoked = db.delete_user_sessions(
+        target["id"], except_token_hash=except_token_hash
+    )
     db.audit(
         admin["id"],
         "user.sessions_revoked",
         target["username"],
         _client_ip(request),
         request.headers.get("user-agent", ""),
+        {"revoked": revoked, "kept_current": kept_current},
     )
-    return {"ok": True}
+    return {"ok": True, "revoked": revoked, "kept_current": kept_current}
 
 
 @app.get("/api/meta")
@@ -1005,6 +1193,8 @@ def _settings_payload(include_paths: bool = False) -> dict[str, Any]:
         "cache_days": settings.cache_days,
         "xhs_cost": xhs_cost,
         "douyin_cost": DOUYIN_COST,
+        "token_cny": settings.token_cny,
+        "usd_cny": settings.usd_cny,
         "credentials_ok": credentials_ok,
         "providers": providers_payload,
         "platforms": platforms_payload,
@@ -1047,7 +1237,8 @@ def _fetch_balance(target: Settings, provider: str = "dataflow") -> dict[str, An
     with DataFlowClient(target) as client:
         payload = DataFlowAPI(client).balance()
     data = unwrap_data(payload)
-    remaining_tokens = as_int(data.get("remaining_calls")) if isinstance(data, dict) else None
+    raw_remaining = data.get("remaining_calls") if isinstance(data, dict) else None
+    remaining_tokens = as_optional_int(raw_remaining)
     return {
         "remaining": remaining_tokens,
         "remaining_native": remaining_tokens,
@@ -1081,7 +1272,13 @@ def update_dataflow_token(
         try:
             balance = _fetch_balance(candidate)
         except Exception as exc:
-            raise HTTPException(400, f"令牌验证失败：{exc}") from exc
+            raise HTTPException(400, f"令牌验证失败：{_public_error(exc)}") from exc
+        if (
+            isinstance(balance, dict)
+            and balance.get("remaining") is None
+            and balance.get("remaining_native") is None
+        ):
+            raise HTTPException(400, "令牌验证失败：余额接口未返回有效余额")
 
     try:
         set_key(str(ENV_PATH), "DATAFLOW_TOKEN", token, quote_mode="always")
@@ -1115,7 +1312,13 @@ def update_rnote_token(
         try:
             balance = _fetch_balance(candidate, "rnote")
         except Exception as exc:
-            raise HTTPException(400, f"令牌验证失败：{exc}") from exc
+            raise HTTPException(400, f"令牌验证失败：{_public_error(exc)}") from exc
+        if (
+            isinstance(balance, dict)
+            and balance.get("remaining") is None
+            and balance.get("remaining_native") is None
+        ):
+            raise HTTPException(400, "令牌验证失败：余额接口未返回有效余额")
 
     try:
         set_key(str(ENV_PATH), "RNOTE_API_KEY", token, quote_mode="always")
@@ -1177,6 +1380,11 @@ def update_provider_token(
             try:
                 if candidate.supports_balance:
                     result = candidate.balance()
+                    if (
+                        result.remaining_tokens is None
+                        and result.remaining_native is None
+                    ):
+                        raise RuntimeError("余额接口未返回有效余额")
                     balance = {
                         "remaining": result.remaining_tokens,
                         "remaining_native": float(result.remaining_native)
@@ -1245,7 +1453,11 @@ def _fetch_extra_balance(provider_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/balance")
-def api_balance(provider: str = "dataflow") -> dict[str, Any]:
+def api_balance(
+    http_request: Request, provider: str = "dataflow"
+) -> dict[str, Any]:
+    actor = require_user(http_request)
+    _enforce_action_limit(f"balance:{actor['id']}")
     provider = provider.strip().lower()
     if provider in {"dataflow", "rnote"}:
         if provider == "rnote":
@@ -1258,20 +1470,27 @@ def api_balance(provider: str = "dataflow") -> dict[str, Any]:
         except Exception as exc:
             return {
                 "remaining": None,
-                "text": f"查询失败：{exc}",
+                "text": f"查询失败：{_public_error(exc)}",
                 "currency": "USD" if provider == "rnote" else "token",
             }
     try:
         return _fetch_extra_balance(provider)
     except Exception as exc:
-        return {"remaining": None, "text": f"查询失败：{exc}", "currency": ""}
+        return {
+            "remaining": None,
+            "text": f"查询失败：{_public_error(exc)}",
+            "currency": "",
+        }
 
 
 @app.get("/api/rounds")
-def list_rounds(db: Database = Depends(get_db)) -> list[dict[str, Any]]:
+def list_rounds(
+    include_archived: bool = False,
+    db: Database = Depends(get_db),
+) -> list[dict[str, Any]]:
     jobs = db.latest_jobs_by_round()
     items: list[dict[str, Any]] = []
-    for row in db.list_rounds():
+    for row in db.list_rounds(include_archived=include_archived):
         payload = _round_dict(row)
         payload["job"] = _job_dict(jobs.get(int(row["id"])))
         items.append(payload)
@@ -1314,6 +1533,14 @@ def create_round(
             platform=platform_code,
             provider=provider_code,
         )
+    except ValueError as exc:
+        text = str(exc)
+        message = (
+            "轮次名称已存在"
+            if "UNIQUE constraint failed: rounds.name" in text
+            else text
+        )
+        raise HTTPException(400, message) from exc
     except Exception as exc:
         text = str(exc)
         message = (
@@ -1331,6 +1558,7 @@ def create_round(
                 settings,
                 round_id,
                 refresh_users=request.refresh_users,
+                created_by=int(collector["id"]),
             )
         except JobBusyError as exc:
             db.delete_round(round_id)
@@ -1354,6 +1582,94 @@ def get_round(round_id: int, db: Database = Depends(get_db)) -> dict[str, Any]:
     return _round_payload(db, round_id)
 
 
+@app.get("/api/rounds/{round_id}/impact")
+def round_impact(
+    round_id: int,
+    admin: dict[str, Any] = Depends(require_admin),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        return db.round_impact(round_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/rounds/{round_id}/archive")
+def archive_round(
+    round_id: int,
+    request: Request,
+    admin: dict[str, Any] = Depends(require_admin),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        db.archive_round(round_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    db.audit(
+        admin["id"],
+        "round.archived",
+        str(round_id),
+        _client_ip(request),
+        request.headers.get("user-agent", ""),
+    )
+    return _round_payload(db, round_id)
+
+
+@app.post("/api/rounds/{round_id}/restore")
+def restore_round(
+    round_id: int,
+    request: Request,
+    admin: dict[str, Any] = Depends(require_admin),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        db.restore_round(round_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    db.audit(
+        admin["id"],
+        "round.restored",
+        str(round_id),
+        _client_ip(request),
+        request.headers.get("user-agent", ""),
+    )
+    return _round_payload(db, round_id)
+
+
+@app.delete("/api/rounds/{round_id}")
+def purge_round(
+    round_id: int,
+    payload: PurgeRoundRequest,
+    request: Request,
+    admin: dict[str, Any] = Depends(require_admin),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    round_row = db.get_round(round_id)
+    if not round_row:
+        raise HTTPException(404, "轮次不存在")
+    if (payload.confirm_name or "").strip() != str(round_row.get("name") or ""):
+        raise HTTPException(400, "轮次名称确认不匹配")
+    impact = db.round_impact(round_id)
+    if not impact["can_purge"]:
+        if impact["jobs_active"]:
+            raise HTTPException(400, "该轮次仍有运行中的任务，请先取消")
+        raise HTTPException(400, "该轮次仍关联线索，不能永久删除；请使用归档")
+    backup = db.backup(f"round-{round_id}-delete")
+    try:
+        result = db.delete_round(round_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    db.audit(
+        admin["id"],
+        "round.purged",
+        str(round_id),
+        _client_ip(request),
+        request.headers.get("user-agent", ""),
+        details={"impact": impact, "backup": str(backup)},
+    )
+    return {**result, "backup": str(backup), "impact": impact}
+
+
 @app.post("/api/rounds/{round_id}/run")
 def run_round(
     round_id: int,
@@ -1365,6 +1681,8 @@ def run_round(
     round_row = db.get_round(round_id)
     if not round_row:
         raise HTTPException(404, "轮次不存在")
+    if round_row.get("archived_at"):
+        raise HTTPException(400, "已归档轮次不能运行采集，请先恢复")
     previous_provider = round_row.get("provider") or "auto"
     platform_code = str(round_row.get("platform") or "xhs")
     provider_code = (request.provider or round_row.get("provider") or "auto").strip().lower()
@@ -1384,6 +1702,7 @@ def run_round(
             round_id,
             refresh_users=request.refresh_users,
             force=request.force,
+            created_by=int(collector["id"]),
         )
     except JobBusyError as exc:
         db.update_round(round_id, provider=previous_provider)
@@ -1417,7 +1736,7 @@ def _validated_owner_filter(value: str | None) -> str | None:
         return None
     if value == "unassigned" or value.isdigit():
         return value
-    raise HTTPException(400, "无效的经手人筛选")
+    raise HTTPException(400, "无效的负责人筛选")
 
 
 def _validated_lead_statuses(value: str | None) -> list[str]:
@@ -1446,6 +1765,7 @@ def _all_creator_filters(
 
 @app.get("/api/creators")
 def list_all_creators(
+    http_request: Request,
     round_id: int | None = None,
     platform: str | None = None,
     search: str | None = None,
@@ -1453,27 +1773,35 @@ def list_all_creators(
     tier: str | None = None,
     direction: str | None = None,
     source: str | None = None,
+    source_mode: str = Query("any", pattern="^(any|all)$"),
+    label: str | None = None,
     owner: str | None = None,
     min_fans: int | None = Query(None, ge=0),
     max_fans: int | None = Query(None, ge=0),
     only_unenriched: bool = False,
+    needs_action: bool = False,
     sort: str = "fans",
     order: str = "desc",
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=10000),
     page_size: int = Query(50, ge=1, le=200),
     db: Database = Depends(get_db),
 ) -> dict[str, Any]:
     if round_id is not None and not db.get_round(round_id):
         raise HTTPException(404, "轮次不存在")
     filters = _all_creator_filters(status, tier, direction, source)
+    actor = require_user(http_request)
     result = db.query_creators(
         round_id,
         platform=platform,
         search=search,
+        source_mode=source_mode,
+        labels=_csv(label),
         owner=_validated_owner_filter(owner),
         min_fans=min_fans,
         max_fans=max_fans,
         only_unenriched=only_unenriched,
+        needs_action=needs_action,
+        action_actor_id=int(actor["id"]),
         sort=sort,
         order=order,
         page=page,
@@ -1482,6 +1810,11 @@ def list_all_creators(
     )
     result["items"] = [_creator_dict(row) for row in result["items"]]
     return result
+
+
+@app.get("/api/creators/owners")
+def creator_owners(db: Database = Depends(get_db)) -> list[dict[str, Any]]:
+    return db.creator_owner_options()
 
 
 @app.get("/api/creators/facets")
@@ -1498,24 +1831,29 @@ def all_creator_facets(
 @app.get("/api/rounds/{round_id}/creators")
 def list_creators(
     round_id: int,
+    http_request: Request,
     platform: str | None = None,
     search: str | None = None,
     status: str | None = None,
     tier: str | None = None,
     direction: str | None = None,
     source: str | None = None,
+    source_mode: str = Query("any", pattern="^(any|all)$"),
+    label: str | None = None,
     owner: str | None = None,
     min_fans: int | None = Query(None, ge=0),
     max_fans: int | None = Query(None, ge=0),
     only_unenriched: bool = False,
+    needs_action: bool = False,
     sort: str = "fans",
     order: str = "desc",
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=10000),
     page_size: int = Query(50, ge=1, le=200),
     db: Database = Depends(get_db),
 ) -> dict[str, Any]:
     if not db.get_round(round_id):
         raise HTTPException(404, "轮次不存在")
+    actor = require_user(http_request)
     result = db.query_creators(
         round_id,
         platform=platform,
@@ -1524,10 +1862,14 @@ def list_creators(
         tiers=_csv(tier),
         directions=_csv(direction),
         sources=_csv(source),
+        source_mode=source_mode,
+        labels=_csv(label),
         owner=_validated_owner_filter(owner),
         min_fans=min_fans,
         max_fans=max_fans,
         only_unenriched=only_unenriched,
+        needs_action=needs_action,
+        action_actor_id=int(actor["id"]),
         sort=sort,
         order=order,
         page=page,
@@ -1546,6 +1888,18 @@ def creator_facets(
     if not db.get_round(round_id):
         raise HTTPException(404, "轮次不存在")
     return db.creator_facets(round_id, platform=platform)
+
+
+def _ensure_creator_exists(
+    db: Database,
+    round_id: int,
+    platform: str,
+    user_id: str,
+) -> dict[str, Any]:
+    owner = db.creator_owner(round_id, platform, user_id)
+    if not owner:
+        raise HTTPException(404, "达人不存在")
+    return owner
 
 
 @app.get("/api/rounds/{round_id}/creators/{platform}/{user_id}")
@@ -1568,16 +1922,40 @@ def update_creator(
     db: Database = Depends(get_db),
 ) -> dict[str, Any]:
     actor = require_user(http_request)
+    owner_before = _ensure_creator_exists(db, round_id, platform, user_id)
     status = _validated_status(request.status)
-    db.update_review(
-        round_id,
-        platform,
-        user_id,
-        status=status,
-        match_direction=request.match_direction,
-        tags_manual=request.tags_manual,
-        remark=request.remark,
-    )
+    if request.expected_status is not None:
+        expected = normalize_status(request.expected_status, default="")
+        if expected not in STATUS_CODES:
+            raise HTTPException(400, "无效的期望状态")
+    try:
+        db.update_review(
+            round_id,
+            platform,
+            user_id,
+            status=status,
+            match_direction=request.match_direction,
+            tags_manual=request.tags_manual,
+            remark=request.remark,
+            expected_updated_at=request.expected_updated_at,
+            expected_status=request.expected_status,
+            claim_user_id=int(actor["id"]),
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    detail = _detail_payload(db, round_id, platform, user_id)
+    if (
+        owner_before.get("owner_user_id") is None
+        and detail.get("owner_user_id") == actor["id"]
+    ):
+        db.audit(
+            actor["id"],
+            "creator.claimed",
+            f"{round_id}:{platform}:{user_id}",
+            _client_ip(http_request),
+            http_request.headers.get("user-agent", ""),
+            details={"auto": True, "source": "review"},
+        )
     db.audit(
         actor["id"],
         "creator.review_updated",
@@ -1591,7 +1969,7 @@ def update_creator(
             "remark": request.remark,
         },
     )
-    return _detail_payload(db, round_id, platform, user_id)
+    return detail
 
 
 @app.post("/api/rounds/{round_id}/creators/batch")
@@ -1604,6 +1982,27 @@ def batch_update(
     if not db.get_round(round_id):
         raise HTTPException(404, "轮次不存在")
     actor = require_user(http_request)
+    if request.set_owner and actor.get("role") != "admin":
+        raise HTTPException(403, "只有管理员可以批量调整跟进人")
+    if request.set_owner and request.owner_user_id is not None:
+        target_user = db.get_user(int(request.owner_user_id))
+        if not target_user or target_user.get("disabled"):
+            raise HTTPException(400, "跟进人不存在或已禁用")
+    auto_claim_targets = 0
+    has_review_changes = any(
+        value is not None
+        for value in (
+            request.status,
+            request.match_direction,
+            request.tags_manual,
+            request.remark,
+        )
+    )
+    if not request.set_owner and has_review_changes:
+        for item in request.items:
+            owner = db.creator_owner(round_id, item.platform, item.user_id)
+            if owner and owner.get("owner_user_id") is None:
+                auto_claim_targets += 1
     status = _validated_status(request.status)
     changed = db.bulk_update_review(
         round_id,
@@ -1612,7 +2011,19 @@ def batch_update(
         match_direction=request.match_direction,
         tags_manual=request.tags_manual,
         remark=request.remark,
+        claim_user_id=int(actor["id"]),
+        set_owner=request.set_owner,
+        owner_user_id=request.owner_user_id,
     )
+    if auto_claim_targets > 0:
+        db.audit(
+            actor["id"],
+            "creator.claimed_bulk",
+            str(round_id),
+            _client_ip(http_request),
+            http_request.headers.get("user-agent", ""),
+            details={"count": auto_claim_targets, "auto": True},
+        )
     db.audit(
         actor["id"],
         "creator.review_bulk_updated",
@@ -1625,6 +2036,8 @@ def batch_update(
             "match_direction": request.match_direction,
             "tags_manual": request.tags_manual,
             "remark": request.remark,
+            "set_owner": request.set_owner,
+            "owner_user_id": request.owner_user_id,
         },
     )
     return {"changed": changed}
@@ -1645,7 +2058,7 @@ def claim_creator(
         raise HTTPException(404, str(exc)) from exc
     if not result["ok"]:
         owner = result.get("owner_username") or "其他成员"
-        raise HTTPException(409, f"该达人已被 {owner} 认领")
+        raise HTTPException(409, f"该达人已由 {owner} 跟进")
     db.audit(
         actor["id"],
         "creator.claimed",
@@ -1673,7 +2086,7 @@ def release_creator(
     if current is None:
         return _detail_payload(db, round_id, platform, user_id)
     if int(current) != int(actor["id"]) and actor.get("role") != "admin":
-        raise HTTPException(403, "只能释放自己认领的达人")
+        raise HTTPException(403, "只能结束自己的跟进")
     result = db.release_creator(
         round_id,
         platform,
@@ -1681,7 +2094,7 @@ def release_creator(
         expected_owner_user_id=int(current),
     )
     if not result["ok"]:
-        raise HTTPException(409, "认领状态已变化，请刷新后重试")
+        raise HTTPException(409, "跟进状态已变化，请刷新后重试")
     previous = result.get("previous")
     if previous:
         db.audit(
@@ -1692,6 +2105,49 @@ def release_creator(
             http_request.headers.get("user-agent", ""),
             details={"owner_user_id": previous.get("owner_user_id")},
         )
+    return _detail_payload(db, round_id, platform, user_id)
+
+
+@app.post("/api/rounds/{round_id}/creators/{platform}/{user_id}/assign")
+def assign_creator(
+    round_id: int,
+    platform: str,
+    user_id: str,
+    request: CreatorAssignRequest,
+    http_request: Request,
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    actor = require_user(http_request)
+    owner = db.creator_owner(round_id, platform, user_id)
+    if not owner:
+        raise HTTPException(404, "达人不存在")
+    current = owner.get("owner_user_id")
+    if actor.get("role") != "admin":
+        if current is None or int(current) != int(actor["id"]):
+            raise HTTPException(403, "只能转交自己跟进的达人")
+    target = request.owner_user_id
+    if target is not None:
+        target_user = db.get_user(int(target))
+        if not target_user or target_user.get("disabled"):
+            raise HTTPException(400, "跟进人不存在或已禁用")
+    try:
+        db.assign_creator(
+            round_id,
+            platform,
+            user_id,
+            owner_user_id=target,
+            expected_owner_user_id=current,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    db.audit(
+        actor["id"],
+        "creator.assigned",
+        f"{round_id}:{platform}:{user_id}",
+        _client_ip(http_request),
+        http_request.headers.get("user-agent", ""),
+        details={"previous_owner_user_id": current, "owner_user_id": target},
+    )
     return _detail_payload(db, round_id, platform, user_id)
 
 
@@ -1738,7 +2194,7 @@ def list_leads(
     owner: str | None = None,
     sort: str = "updated_at",
     order: str = "desc",
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=10000),
     page_size: int = Query(50, ge=1, le=200),
     db: Database = Depends(get_db),
 ) -> dict[str, Any]:
@@ -1787,6 +2243,9 @@ LEAD_EXPORT_COLUMNS = [
     "线索状态",
     "创建时间",
     "更新时间",
+    "关联达人 ID",
+    "匹配轮次",
+    "匹配时间",
     "转换达人 ID",
 ]
 
@@ -1799,6 +2258,8 @@ def _iter_lead_export_rows(
     statuses: list[str],
     source: str | None,
     owner: str | None,
+    sort: str = "updated_at",
+    order: str = "desc",
 ) -> Generator[dict[str, Any], None, None]:
     page = 1
     while True:
@@ -1809,6 +2270,8 @@ def _iter_lead_export_rows(
             statuses=statuses,
             sources=_csv(source),
             owner=owner,
+            sort=sort,
+            order=order,
             page=page,
             page_size=200,
         )
@@ -1833,6 +2296,9 @@ def _lead_export_value(row: dict[str, Any], column: str) -> Any:
         "线索状态": "status_label",
         "创建时间": "created_at",
         "更新时间": "updated_at",
+        "关联达人 ID": "matched_user_id",
+        "匹配轮次": "matched_round_name",
+        "匹配时间": "matched_at",
         "转换达人 ID": "converted_user_id",
     }
     value = row.get(mapping.get(column, column))
@@ -1850,6 +2316,8 @@ def export_leads(
     status: str | None = None,
     source: str | None = None,
     owner: str | None = None,
+    sort: str = "updated_at",
+    order: str = "desc",
     db: Database = Depends(get_db),
 ) -> Response:
     if round_id is not None and not db.get_round(round_id):
@@ -1867,7 +2335,7 @@ def export_leads(
             yield buffer.getvalue().encode("utf-8")
             with Database(settings.output_dir) as stream_db:
                 for row in _iter_lead_export_rows(
-                    stream_db, round_id, platform, search, statuses, source, owner_filter
+                    stream_db, round_id, platform, search, statuses, source, owner_filter, sort, order
                 ):
                     buffer.seek(0)
                     buffer.truncate(0)
@@ -1891,7 +2359,7 @@ def export_leads(
         sheet.freeze_panes = "A2"
         sheet.append(LEAD_EXPORT_COLUMNS)
         for row in _iter_lead_export_rows(
-            db, round_id, platform, search, statuses, source, owner_filter
+            db, round_id, platform, search, statuses, source, owner_filter, sort, order
         ):
             sheet.append([_lead_export_value(row, column) for column in LEAD_EXPORT_COLUMNS])
         workbook.save(temp_path)
@@ -1918,7 +2386,7 @@ def create_lead(
     _validate_owner(db, payload.owner_user_id)
     _check_owner_change(actor, payload.owner_user_id)
     owner_id = payload.owner_user_id if payload.owner_user_id is not None else actor["id"]
-    lead_id = db.create_lead(
+    lead_id, created, revived = db.create_lead_dedup(
         platform=payload.platform.strip().lower(),
         nickname=payload.nickname.strip(),
         account_id=payload.account_id.strip(),
@@ -1930,8 +2398,35 @@ def create_lead(
         raw_json=_checked_raw_json(payload.raw_json),
         created_by=actor["id"],
     )
-    db.audit(actor["id"], "lead.created", str(lead_id), _client_ip(http_request), http_request.headers.get("user-agent", ""))
-    return _lead_detail(db, lead_id)
+    match_error = ""
+    if created or revived:
+        if getattr(settings, "lead_match_enabled", True):
+            try:
+                match_lead_against_creators(db, lead_id, actor_id=actor["id"])
+            except Exception as exc:
+                match_error = str(exc)
+                print(f"[lead-match] 线索 {lead_id} 匹配失败: {exc}")
+        db.audit(
+            actor["id"],
+            "lead.revived" if revived else "lead.created",
+            str(lead_id),
+            _client_ip(http_request),
+            http_request.headers.get("user-agent", ""),
+        )
+    else:
+        db.audit(
+            actor["id"],
+            "lead.duplicate_reused",
+            str(lead_id),
+            _client_ip(http_request),
+            http_request.headers.get("user-agent", ""),
+        )
+    result = _lead_detail(db, lead_id)
+    result["created"] = created
+    result["revived"] = revived
+    if match_error:
+        result["match_error"] = match_error
+    return result
 
 
 @app.post("/api/leads/bulk")
@@ -1941,15 +2436,19 @@ def create_leads_bulk(
     db: Database = Depends(get_db),
     actor: dict[str, Any] = Depends(require_collector),
 ) -> dict[str, Any]:
+    _enforce_action_limit(f"leads-bulk:{actor['id']}")
     created: list[int] = []
+    revived: list[int] = []
+    existing: list[int] = []
     errors: list[dict[str, Any]] = []
+    match_errors = 0
     for index, item in enumerate(payload.items, 1):
         try:
             if item.source_round_id is not None and not db.get_round(item.source_round_id):
                 raise ValueError("来源轮次不存在")
             _validate_owner(db, item.owner_user_id)
             _check_owner_change(actor, item.owner_user_id)
-            lead_id = db.create_lead(
+            lead_id, is_new, is_revived = db.create_lead_dedup(
                 platform=item.platform.strip().lower(),
                 nickname=item.nickname.strip(),
                 account_id=item.account_id.strip(),
@@ -1961,9 +2460,21 @@ def create_leads_bulk(
                 raw_json=_checked_raw_json(item.raw_json),
                 created_by=actor["id"],
             )
-            created.append(lead_id)
+            if is_new:
+                created.append(lead_id)
+            elif is_revived:
+                revived.append(lead_id)
+            else:
+                existing.append(lead_id)
+            if is_new or is_revived:
+                if getattr(settings, "lead_match_enabled", True):
+                    try:
+                        match_lead_against_creators(db, lead_id, actor_id=actor["id"])
+                    except Exception as exc:
+                        match_errors += 1
+                        print(f"[lead-match] 线索 {lead_id} 匹配失败: {exc}")
         except Exception as exc:
-            errors.append({"index": index, "error": str(exc)})
+            errors.append({"index": index, "error": _public_error(exc)})
     if created:
         db.audit(
             actor["id"],
@@ -1972,7 +2483,29 @@ def create_leads_bulk(
             _client_ip(http_request),
             http_request.headers.get("user-agent", ""),
         )
-    return {"created": len(created), "ids": created, "errors": errors}
+    if revived:
+        db.audit(
+            actor["id"],
+            "lead.bulk_revived",
+            f"{len(revived)} leads",
+            _client_ip(http_request),
+            http_request.headers.get("user-agent", ""),
+        )
+    return {
+        "created": len(created),
+        "revived": len(revived),
+        "existing": len(existing),
+        "ids": created,
+        "revived_ids": revived,
+        "existing_ids": existing,
+        "match_errors": match_errors,
+        "errors": errors,
+    }
+
+
+@app.get("/api/leads/identity-health")
+def lead_identity_health(db: Database = Depends(get_db)) -> dict[str, Any]:
+    return db.lead_identity_health()
 
 
 @app.get("/api/leads/{lead_id}")
@@ -2006,12 +2539,26 @@ def update_lead(
         if status == "converted":
             raise HTTPException(400, "请使用线索转换接口")
         changes["status"] = status
+    if "platform" in changes:
+        platform_value = str(changes["platform"] or "").strip().lower()
+        if not platform_value:
+            raise HTTPException(400, "平台不能为空")
+        changes["platform"] = platform_value
     if "source" in changes:
         changes["source"] = normalize_lead_source(changes["source"])
     try:
         db.update_lead(lead_id, **changes)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    match_error = ""
+    if {"account_id", "profile_url", "platform"} & set(changes) and getattr(
+        settings, "lead_match_enabled", True
+    ):
+        try:
+            match_lead_against_creators(db, lead_id, actor_id=actor["id"])
+        except Exception as exc:
+            match_error = str(exc)
+            print(f"[lead-match] 线索 {lead_id} 匹配失败: {exc}")
     db.audit(
         actor["id"],
         "lead.updated",
@@ -2020,7 +2567,10 @@ def update_lead(
         http_request.headers.get("user-agent", ""),
         details={"changes": changes},
     )
-    return _lead_detail(db, lead_id)
+    result = _lead_detail(db, lead_id)
+    if match_error:
+        result["match_error"] = match_error
+    return result
 
 
 @app.post("/api/leads/{lead_id}/assign")
@@ -2052,6 +2602,34 @@ def assign_lead(
     return _lead_detail(db, lead_id)
 
 
+@app.post("/api/leads/{lead_id}/match")
+def match_lead_endpoint(
+    lead_id: int,
+    http_request: Request,
+    db: Database = Depends(get_db),
+    actor: dict[str, Any] = Depends(require_collector),
+) -> dict[str, Any]:
+    lead = db.get_lead(lead_id)
+    if not lead:
+        raise HTTPException(404, "线索不存在")
+    _ensure_lead_owner(lead, actor, "匹配")
+    _enforce_action_limit(f"lead-match:{actor['id']}")
+    if lead.get("status") == "converted":
+        raise HTTPException(400, "已转达人的线索无需重新匹配")
+    stats = match_lead_against_creators(db, lead_id, actor_id=actor["id"])
+    db.audit(
+        actor["id"],
+        "lead.match_retried",
+        str(lead_id),
+        _client_ip(http_request),
+        http_request.headers.get("user-agent", ""),
+        details=stats,
+    )
+    result = _lead_detail(db, lead_id)
+    result["match"] = stats
+    return result
+
+
 @app.post("/api/leads/{lead_id}/convert")
 def convert_lead_endpoint(
     lead_id: int,
@@ -2064,6 +2642,7 @@ def convert_lead_endpoint(
     if not lead:
         raise HTTPException(404, "线索不存在")
     _ensure_lead_owner(lead, actor, "转换")
+    _enforce_action_limit(f"lead-convert:{actor['id']}")
     try:
         result = convert_lead(
             db,
@@ -2076,9 +2655,9 @@ def convert_lead_endpoint(
             actor_id=actor["id"],
         )
     except (ValueError, RuntimeError, PlatformConfigError) as exc:
-        raise HTTPException(400, str(exc)) from exc
+        raise HTTPException(400, _public_error(exc)) from exc
     except Exception as exc:
-        raise HTTPException(400, f"转换失败：{exc}") from exc
+        raise HTTPException(400, f"转换失败：{_public_error(exc)}") from exc
     db.audit(
         actor["id"],
         "lead.converted",
@@ -2093,7 +2672,19 @@ def convert_lead_endpoint(
 @app.get("/api/jobs/active")
 def active_job(db: Database = Depends(get_db)) -> dict[str, Any] | None:
     db.reconcile_stale_jobs(settings.job_stale_minutes)
-    return _job_dict(db.latest_active_job())
+    payload = _job_dict(db.latest_active_job())
+    if payload is not None:
+        payload["active_count"] = db.count_active_jobs()
+    return payload
+
+
+@app.get("/api/jobs/latest")
+def latest_job_overall(db: Database = Depends(get_db)) -> dict[str, Any] | None:
+    db.reconcile_stale_jobs(settings.job_stale_minutes)
+    payload = _job_dict(db.latest_job_overall())
+    if payload is not None:
+        payload["active_count"] = db.count_active_jobs()
+    return payload
 
 
 @app.post("/api/jobs/{job_id}/cancel")
@@ -2108,8 +2699,12 @@ def cancel_job(
         raise HTTPException(404, "任务不存在")
     if job.get("status") not in ("pending", "running"):
         raise HTTPException(409, "任务已结束")
-    updated = db.cancel_job(job_id)
-    terminate_job_process(job.get("pid"))
+    if actor.get("role") != "admin":
+        starter = job.get("created_by")
+        if starter is None or int(starter) != int(actor["id"]):
+            raise HTTPException(403, "只能取消自己发起的任务")
+    updated = db.cancel_job(job_id, cancelled_by=int(actor["id"]))
+    terminate_job_process(job.get("pid"), round_id=job.get("round_id"), job_id=job_id)
     db.audit(
         actor["id"],
         "job.cancelled",
@@ -2122,31 +2717,43 @@ def cancel_job(
 
 
 @app.get("/api/rounds/{round_id}/calls")
-def recent_calls(round_id: int, db: Database = Depends(get_db)) -> list[dict[str, Any]]:
+def recent_calls(
+    round_id: int,
+    http_request: Request,
+    db: Database = Depends(get_db),
+) -> list[dict[str, Any]]:
     if not db.get_round(round_id):
         raise HTTPException(404, "轮次不存在")
+    actor = require_user(http_request)
     job = db.latest_job(round_id)
-    return db.recent_api_calls(
+    rows = db.recent_api_calls(
         round_id,
         limit=30,
         job_id=int(job["id"]) if job else None,
     )
+    if actor.get("role") != "admin":
+        for row in rows:
+            row.pop("raw_file", None)
+    return rows
 
 
 @app.get("/api/rounds/{round_id}/log")
 def job_log(
     round_id: int,
+    http_request: Request,
     lines: int = Query(200, ge=1, le=2000),
     db: Database = Depends(get_db),
 ) -> dict[str, Any]:
     if not db.get_round(round_id):
         raise HTTPException(404, "轮次不存在")
+    actor = require_user(http_request)
+    show_path = actor.get("role") == "admin"
     job = db.latest_job(round_id)
     if not job:
         return {"path": "", "content": ""}
     path = settings.output_dir / "logs" / f"round_{round_id}_{job['id']}.log"
     if not path.exists():
-        return {"path": str(path), "content": ""}
+        return {"path": str(path) if show_path else "", "content": ""}
     size = path.stat().st_size
     read_size = min(size, 512_000)
     with path.open("rb") as handle:
@@ -2155,7 +2762,10 @@ def job_log(
     if read_size < size:
         text = text.split("\n", 1)[-1]
     content = text.splitlines()
-    return {"path": str(path), "content": "\n".join(content[-lines:])}
+    return {
+        "path": str(path) if show_path else "",
+        "content": "\n".join(content[-lines:]),
+    }
 
 
 def _xlsx_response(items: Iterable[dict[str, Any]], filename: str) -> FileResponse:
@@ -2188,6 +2798,7 @@ def _xlsx_response(items: Iterable[dict[str, Any]], filename: str) -> FileRespon
 @app.get("/api/rounds/{round_id}/export")
 def export_round(
     round_id: int,
+    http_request: Request,
     export_format: str = Query("xlsx", alias="format", pattern="^(csv|xlsx)$"),
     scope: str = Query("filtered", pattern="^(filtered|all)$"),
     platform: str | None = None,
@@ -2196,10 +2807,15 @@ def export_round(
     tier: str | None = None,
     direction: str | None = None,
     source: str | None = None,
+    source_mode: str = Query("any", pattern="^(any|all)$"),
+    label: str | None = None,
     owner: str | None = None,
     min_fans: int | None = Query(None, ge=0),
     max_fans: int | None = Query(None, ge=0),
     only_unenriched: bool = False,
+    needs_action: bool = False,
+    sort: str = "fans",
+    order: str = "desc",
     db: Database = Depends(get_db),
 ) -> Response:
     if not db.get_round(round_id):
@@ -2211,18 +2827,25 @@ def export_round(
         tier = None
         direction = None
         source = None
+        source_mode = "any"
+        label = None
         owner = None
         min_fans = None
         max_fans = None
         only_unenriched = False
+        needs_action = False
     filters = {
         "platform": platform,
         "search": search,
         **_all_creator_filters(status, tier, direction, source),
+        "source_mode": source_mode,
+        "labels": _csv(label),
         "owner": _validated_owner_filter(owner),
         "min_fans": min_fans,
         "max_fans": max_fans,
         "only_unenriched": only_unenriched,
+        "needs_action": needs_action,
+        "action_actor_id": int(require_user(http_request)["id"]),
     }
     suffix = re.sub(r"[^A-Za-z0-9_-]+", "_", platform or "all")[:40]
     if export_format == "csv":
@@ -2237,7 +2860,7 @@ def export_round(
             row_buffer = io.StringIO()
             row_writer = csv.writer(row_buffer, lineterminator="\r\n")
             with Database(settings.output_dir) as stream_db:
-                for item in _iter_export_items(stream_db, round_id, filters):
+                for item in _iter_export_items(stream_db, round_id, filters, sort=sort, order=order):
                     row_buffer.seek(0)
                     row_buffer.truncate(0)
                     row_writer.writerow(
@@ -2252,11 +2875,12 @@ def export_round(
         )
 
     filename = f"codata_round_{round_id}_{suffix}_{scope}.xlsx"
-    return _xlsx_response(_iter_export_items(db, round_id, filters), filename)
+    return _xlsx_response(_iter_export_items(db, round_id, filters, sort=sort, order=order), filename)
 
 
 @app.get("/api/creators/export")
 def export_all_creators(
+    http_request: Request,
     export_format: str = Query("xlsx", alias="format", pattern="^(csv|xlsx)$"),
     scope: str = Query("filtered", pattern="^(filtered|all)$"),
     platform: str | None = None,
@@ -2265,10 +2889,15 @@ def export_all_creators(
     tier: str | None = None,
     direction: str | None = None,
     source: str | None = None,
+    source_mode: str = Query("any", pattern="^(any|all)$"),
+    label: str | None = None,
     owner: str | None = None,
     min_fans: int | None = Query(None, ge=0),
     max_fans: int | None = Query(None, ge=0),
     only_unenriched: bool = False,
+    needs_action: bool = False,
+    sort: str = "fans",
+    order: str = "desc",
     db: Database = Depends(get_db),
 ) -> Response:
     if scope == "all":
@@ -2278,18 +2907,25 @@ def export_all_creators(
         tier = None
         direction = None
         source = None
+        source_mode = "any"
+        label = None
         owner = None
         min_fans = None
         max_fans = None
         only_unenriched = False
+        needs_action = False
     filters = {
         "platform": platform,
         "search": search,
         **_all_creator_filters(status, tier, direction, source),
+        "source_mode": source_mode,
+        "labels": _csv(label),
         "owner": _validated_owner_filter(owner),
         "min_fans": min_fans,
         "max_fans": max_fans,
         "only_unenriched": only_unenriched,
+        "needs_action": needs_action,
+        "action_actor_id": int(require_user(http_request)["id"]),
     }
     suffix = re.sub(r"[^A-Za-z0-9_-]+", "_", platform or "all")[:40]
     if export_format == "csv":
@@ -2304,7 +2940,7 @@ def export_all_creators(
             row_buffer = io.StringIO()
             row_writer = csv.writer(row_buffer, lineterminator="\r\n")
             with Database(settings.output_dir) as stream_db:
-                for item in _iter_export_items(stream_db, None, filters):
+                for item in _iter_export_items(stream_db, None, filters, sort=sort, order=order):
                     row_buffer.seek(0)
                     row_buffer.truncate(0)
                     row_writer.writerow(
@@ -2319,7 +2955,7 @@ def export_all_creators(
         )
 
     filename = f"codata_all_{suffix}_{scope}.xlsx"
-    return _xlsx_response(_iter_export_items(db, None, filters), filename)
+    return _xlsx_response(_iter_export_items(db, None, filters, sort=sort, order=order), filename)
 
 
 @app.get("/api/keywords")
@@ -2333,7 +2969,7 @@ def create_keyword(
     http_request: Request,
     db: Database = Depends(get_db),
 ) -> dict[str, Any]:
-    actor = require_user(http_request)
+    actor = require_collector(http_request)
     keyword_id = db.ensure_keyword(request.word, request.category)
     if not request.enabled:
         db.update_keyword(keyword_id, enabled=False)
@@ -2357,7 +2993,7 @@ def update_keyword(
 ) -> dict[str, Any]:
     if not db.get_keyword(keyword_id):
         raise HTTPException(404, "关键词不存在")
-    actor = require_user(http_request)
+    actor = require_collector(http_request)
     db.update_keyword(keyword_id, category=request.category, enabled=request.enabled)
     db.audit(
         actor["id"],
@@ -2378,7 +3014,7 @@ def delete_keyword(
 ) -> dict[str, Any]:
     if not db.get_keyword(keyword_id):
         raise HTTPException(404, "关键词不存在")
-    actor = require_user(http_request)
+    actor = require_collector(http_request)
     try:
         db.delete_keyword(keyword_id)
     except ValueError as exc:
@@ -2393,33 +3029,77 @@ def delete_keyword(
     return {"ok": True}
 
 
+@app.get("/api/counts")
+def counts_endpoint(db: Database = Depends(get_db)) -> dict[str, int]:
+    return db.counts()
+
+
+@app.get("/api/dashboard/queue")
+def dashboard_queue(
+    http_request: Request,
+    round_id: int | None = None,
+    scope: str = "all",
+    sort: str = "potential",
+    include_others: bool = False,
+    limit: int = Query(6, ge=1, le=20),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    if scope not in {"all", "pending", "unclaimed"}:
+        raise HTTPException(400, "scope 参数无效")
+    if sort not in {"potential", "ratio", "updated"}:
+        raise HTTPException(400, "sort 参数无效")
+    actor = require_user(http_request)
+    result = db.action_queue(
+        actor_id=int(actor["id"]),
+        is_admin=actor.get("role") == "admin",
+        round_id=round_id,
+        scope=scope,
+        sort=sort,
+        limit=limit,
+        include_others=include_others,
+    )
+    return {
+        "counts": result["counts"],
+        "items": [_queue_item(row) for row in result["items"]],
+    }
+
+
+@app.get("/api/dashboard/activity")
+def dashboard_activity(
+    days: int = Query(365, ge=30, le=730),
+    tz_offset: int = Query(480, ge=-720, le=840),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    return db.activity_calendar(days, tz_offset)
+
+
+@app.get("/api/dashboard/efficiency")
+def dashboard_efficiency(
+    limit: int = Query(6, ge=1, le=20),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    result = db.round_efficiency(limit)
+    return {
+        "items": [_efficiency_item(row) for row in result["items"]],
+        "totals": result["totals"],
+    }
+
+
 @app.get("/api/dashboard")
 def dashboard(
     round_id: int | None = None,
     db: Database = Depends(get_db),
 ) -> dict[str, Any]:
-    counts = db.counts()
-    rounds = [_round_dict(row) for row in db.list_rounds(limit=8)]
-    payload: dict[str, Any] = {"counts": counts, "recent_rounds": rounds}
+    payload: dict[str, Any] = {"counts": db.counts()}
     if round_id is None:
-        top_rows = []
-        seen: set[tuple[str, str]] = set()
-        for row in db.query_creators(None, sort="interaction", page_size=100)["items"]:
-            key = (str(row["platform"]), str(row["user_id"]))
-            if key in seen:
-                continue
-            seen.add(key)
-            top_rows.append(row)
-            if len(top_rows) >= 5:
-                break
-        metrics = db.all_round_metrics()
+        breakdown = db.dashboard_breakdown(None)
+        metrics = breakdown["metrics"]
         metrics["cost"] = db.sum_round_cost(None)
         payload.update(
             {
                 "round": None,
-                "tier_counts": db.all_tier_counts(),
-                "status_counts": db.all_status_counts(),
-                "top_creators": [_creator_dict(row) for row in top_rows],
+                "tier_counts": breakdown["tier_counts"],
+                "status_counts": breakdown["status_counts"],
                 "metrics": metrics,
                 "lead_metrics": db.lead_metrics(),
             }
@@ -2427,16 +3107,15 @@ def dashboard(
         return payload
     if not db.get_round(round_id):
         raise HTTPException(404, "轮次不存在")
-    top_rows = db.query_creators(round_id, sort="interaction", page_size=5)["items"]
     round_payload = _round_payload(db, round_id)
-    metrics = db.round_metrics(round_id)
+    breakdown = db.dashboard_breakdown(round_id)
+    metrics = breakdown["metrics"]
     metrics["cost"] = int(round_payload.get("summary", {}).get("cost", 0))
     payload.update(
         {
             "round": round_payload,
-            "tier_counts": db.tier_counts(round_id),
-            "status_counts": db.status_counts(round_id),
-            "top_creators": [_creator_dict(row) for row in top_rows],
+            "tier_counts": breakdown["tier_counts"],
+            "status_counts": breakdown["status_counts"],
             "metrics": metrics,
             "lead_metrics": db.lead_metrics(round_id),
         }

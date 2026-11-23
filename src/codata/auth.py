@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 SESSION_COOKIE = "codata_session"
 CSRF_HEADER = "x-csrf-token"
 ROLES = {"admin", "member"}
-MIN_PASSWORD_LENGTH = 10
+MIN_PASSWORD_LENGTH = 6
 MAX_PASSWORD_LENGTH = 200
 USERNAME_RE = re.compile(r"^[\w.@-]{2,32}$", re.UNICODE)
 
@@ -89,6 +89,13 @@ def verify_password(password: str, stored: str | None) -> bool:
         return False
 
 
+_DUMMY_PASSWORD_HASH = hash_password("codata-timing-dummy-password")
+
+
+def verify_dummy_password(password: str) -> None:
+    verify_password(password, _DUMMY_PASSWORD_HASH)
+
+
 def new_session_token() -> str:
     return secrets.token_urlsafe(32)
 
@@ -144,6 +151,14 @@ class LoginRateLimiter:
         with self._lock:
             self._prune_all(now)
             return len(self._prune(key, now)) >= self.max_attempts
+
+    def retry_after(self, key: str) -> int:
+        now = time.monotonic()
+        with self._lock:
+            attempts = self._prune(key, now)
+            if len(attempts) < self.max_attempts:
+                return 0
+            return max(1, int(self.window_seconds - (now - attempts[0])))
 
     def fail(self, key: str) -> None:
         now = time.monotonic()

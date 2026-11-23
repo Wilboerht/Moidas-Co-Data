@@ -17,6 +17,8 @@ codata = "codata.cli:main"
 codata-panel = "codata.api_server:main"
 codata-web = "codata.api_server:main"
 codata-admin = "codata.admin_cli:main"
+codata-backfill = "codata.backfill:main"
+codata-migrate-leads = "codata.migrate_leads:main"
 codata-cleanup-executor = "codata.cleanup_legacy_executor:main"
 
 [build-system]

@@ -3,7 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any
 
-from .client import JsonProviderClient, ProviderError
+from .client import JsonProviderClient
 from .config import Settings
 from .normalize_platform import (
     normalize_search_item_platform,
@@ -52,6 +52,13 @@ def _items(payload: Any) -> list[dict[str, Any]]:
         if isinstance(value, list):
             return [item for item in value if isinstance(item, dict)]
     return []
+
+
+def _usd_to_tokens(settings: Any, usd: Decimal) -> int | None:
+    token_cny = Decimal(str(getattr(settings, "token_cny", 0) or 0))
+    if token_cny <= 0:
+        return None
+    return int(usd * Decimal(str(settings.usd_cny)) / token_cny)
 
 
 def _has_more(payload: Any) -> bool | None:
@@ -126,6 +133,8 @@ class EveryInfraProvider(JsonProvider):
         token = state.get("page_token")
         if token:
             params["page_token"] = token
+        if page > 1 and not token:
+            return SearchResponse(payload={}, items=[], state={}, has_more=False)
         action = "reels_search" if self.platform == "instagram" else "search"
         payload = self._call(action, params, self.search_cost_tokens)
         next_token = _find(payload, ("next_page_token",))
@@ -161,8 +170,13 @@ class EveryInfraProvider(JsonProvider):
         if balance is None:
             return BalanceResponse(None, "USD", None, "EveryInfra 余额接口未返回余额")
         usd = Decimal(str(balance))
-        tokens = int(usd * Decimal(str(self.settings.usd_cny)) / Decimal(str(self.settings.token_cny)))
-        return BalanceResponse(usd, "USD", tokens, f"剩余 ${usd.quantize(Decimal('0.0001'))}（约 {tokens} token）")
+        tokens = _usd_to_tokens(self.settings, usd)
+        text = (
+            f"剩余 ${usd.quantize(Decimal('0.0001'))}（约 {tokens} token）"
+            if tokens is not None
+            else f"剩余 ${usd.quantize(Decimal('0.0001'))}"
+        )
+        return BalanceResponse(usd, "USD", tokens, text)
 
 
 class TikHubProvider(JsonProvider):
@@ -205,14 +219,18 @@ class TikHubProvider(JsonProvider):
         payload = self.client.request(
             "POST", self.search_path, json_body=body, cost=self.search_cost_tokens
         )
+        cursor = _find(payload, ("cursor",))
+        state: dict[str, str] = {}
+        if cursor is not None:
+            state["cursor"] = str(cursor)
+        for key in ("search_id", "backtrace"):
+            value = _find(payload, (key,))
+            if value:
+                state[key] = str(value)
         return SearchResponse(
             payload=payload,
             items=_items(payload),
-            state={
-                "cursor": str(_find(payload, ("cursor",)) or 0),
-                "search_id": str(_find(payload, ("search_id",)) or ""),
-                "backtrace": str(_find(payload, ("backtrace",)) or ""),
-            },
+            state=state,
             has_more=_has_more(payload),
         )
 
@@ -233,8 +251,13 @@ class TikHubProvider(JsonProvider):
         if raw_balance is None:
             return BalanceResponse(None, "USD", None, "TikHub 余额接口未返回余额")
         usd = Decimal(str(raw_balance)) + Decimal(str(free_credit or 0))
-        tokens = int(usd * Decimal(str(self.settings.usd_cny)) / Decimal(str(self.settings.token_cny)))
-        return BalanceResponse(usd, "USD", tokens, f"剩余 ${usd.quantize(Decimal('0.0001'))}（约 {tokens} token）")
+        tokens = _usd_to_tokens(self.settings, usd)
+        text = (
+            f"剩余 ${usd.quantize(Decimal('0.0001'))}（约 {tokens} token）"
+            if tokens is not None
+            else f"剩余 ${usd.quantize(Decimal('0.0001'))}"
+        )
+        return BalanceResponse(usd, "USD", tokens, text)
 
 
 class JustOneAPIProvider(JsonProvider):
@@ -296,7 +319,8 @@ class SocialDataXProvider(JsonProvider):
         if balance is None:
             return BalanceResponse(None, "points", None, "SocialDataX 余额接口未返回余额")
         points = Decimal(str(balance))
-        tokens = int(points * Decimal("10"))
+        rate = self.provider.balance_token_rate or Decimal("10")
+        tokens = int(points * rate)
         return BalanceResponse(points, "points", tokens, f"剩余 {points} 积分（约 {tokens} token）")
 
 
@@ -312,12 +336,12 @@ class RedFoxProvider(JsonProvider):
         payload = self.client.request(
             "POST", self.search_path, json_body=body, cost=self.search_cost_tokens
         )
-        has_more = _find(payload, ("hasMore", "has_more"))
+        has_more = _has_more(payload)
         return SearchResponse(
             payload=payload,
             items=_items(payload),
-            state={"offset": str(offset + 20)} if has_more not in (False, 0, "0") else {},
-            has_more=has_more not in (False, 0, "0"),
+            state={"offset": str(offset + 20)} if has_more else {},
+            has_more=has_more,
         )
 
     def user(self, user_id: str, profile_url: str = "") -> Any:
@@ -341,7 +365,8 @@ class RedFoxProvider(JsonProvider):
         if points is None:
             return BalanceResponse(None, "points", None, "RedFoxHub 余额接口未返回积分")
         amount = Decimal(str(points))
-        tokens = int(amount * Decimal("100"))
+        rate = self.provider.balance_token_rate or Decimal("100")
+        tokens = int(amount * rate)
         return BalanceResponse(amount, "points", tokens, f"剩余 {amount.quantize(Decimal('0.01'))} 积分（约 {tokens} token）")
 
 

@@ -7,9 +7,18 @@ from .api import XHS_COST
 from .client import ProviderError
 from .config import Settings
 from .db import Database
+from .matching import match_round_leads
 from .normalize import utc_now
 from .platforms import Registry, load_registry
 from .providers import Provider, SearchResponse, build_provider, resolve_provider
+
+
+class JobCancelled(RuntimeError):
+    """Raised when another request cancels the active job."""
+
+
+def _fatal_provider_error(exc: ProviderError) -> bool:
+    return getattr(exc, "status", None) in {401, 402, 403} or getattr(exc, "code", None) == 1001
 
 
 class Pipeline:
@@ -84,43 +93,62 @@ class Pipeline:
         round_row = self.db.get_round(round_id)
         if not round_row:
             raise ValueError(f"轮次不存在: {round_id}")
-        job_id = job_id or self.db.claim_job(
-            round_id,
-            getattr(self.settings, "max_active_jobs", None),
-            getattr(self.settings, "job_stale_minutes", 30),
-        )
-        if not self.db.get_job(job_id):
+        if round_row.get("archived_at"):
+            raise ValueError("已归档轮次不能运行采集，请先恢复")
+        if job_id is None:
             job_id = self.db.claim_job(
                 round_id,
                 getattr(self.settings, "max_active_jobs", None),
                 getattr(self.settings, "job_stale_minutes", 30),
             )
+        current_job = self.db.get_job(job_id)
+        if not current_job:
+            raise ValueError(f"任务记录不存在: {job_id}")
+        if int(current_job.get("round_id") or 0) != int(round_id):
+            raise ValueError(f"任务 #{job_id} 不属于轮次 #{round_id}")
+        if current_job.get("status") not in ("pending", "running"):
+            raise JobCancelled("任务已结束，不能重复执行")
         self._active_job_id = job_id
+        self._job_cost = self.db.sum_job_cost(job_id)
+        self._round_cost = self.db.sum_round_cost(round_id)
 
-        self.db.update_round(round_id, status="running", started_at=utc_now(), error=None)
-        self.db.update_job(job_id, status="running", stage="准备", started_at=utc_now(), error=None)
+        self.db.update_round(
+            round_id,
+            status="running",
+            started_at=utc_now(),
+            error=None,
+            cost_tokens=self._round_cost,
+        )
+        self.db.update_job(
+            job_id,
+            status="running",
+            stage="准备",
+            started_at=utc_now(),
+            error=None,
+            cost=self._job_cost,
+        )
 
         try:
             summary = self._run(round_id, round_row, job_id, refresh_users=refresh_users, force=force)
         except Exception as exc:
-            message = str(exc)
+            current = self.db.get_job(job_id)
+            cancelled = isinstance(exc, JobCancelled) or (
+                current is not None and current.get("status") == "cancelled"
+            )
+            message = "任务已取消" if cancelled else str(exc)
             round_cost = self.db.sum_round_cost(round_id)
             job_cost = self.db.sum_job_cost(job_id)
-            self.db.update_round(
-                round_id,
-                status="failed",
-                finished_at=utc_now(),
-                error=message,
-                cost_tokens=round_cost,
-            )
-            self.db.update_job(
-                job_id,
-                status="failed",
-                stage="失败",
-                error=message,
-                cost=job_cost,
-                finished_at=utc_now(),
-            )
+            if current is None or current.get("status") in ("pending", "running"):
+                self.db.finish_job(
+                    job_id,
+                    round_id,
+                    status="cancelled" if cancelled else "failed",
+                    stage="已取消" if cancelled else "失败",
+                    error=message,
+                    cost=job_cost,
+                    round_cost=round_cost,
+                    finished_at=utc_now(),
+                )
             raise
         finally:
             self.close()
@@ -128,8 +156,12 @@ class Pipeline:
 
     def _check_active(self, job_id: int) -> None:
         job = self.db.get_job(job_id)
-        if not job or job.get("status") not in ("pending", "running"):
-            raise RuntimeError("任务已取消或已停止")
+        if not job:
+            raise JobCancelled("任务记录不存在")
+        if job.get("status") == "cancelled":
+            raise JobCancelled("任务已取消")
+        if job.get("status") not in ("pending", "running"):
+            raise RuntimeError("任务已停止")
         self.db.update_job(job_id, heartbeat_at=utc_now())
 
     def _provider_candidates(self, platform: str, requested: str) -> list[Provider]:
@@ -170,6 +202,12 @@ class Pipeline:
         max_creators = int(max_creators) if max_creators else None
 
         candidates = self._provider_candidates(platform, requested)
+        if requested in {"auto", "cheapest", "default"} and len(candidates) > 1:
+            candidates.sort(
+                key=lambda candidate: self.estimate_for(
+                    candidate, len(keywords), pages, max_creators
+                )["tokens"]
+            )
         provider: Provider | None = None
         estimate: dict[str, Any] = {}
         last_error: Exception | None = None
@@ -189,6 +227,12 @@ class Pipeline:
             break
         if provider is None:
             raise last_error or ProviderError(None, "没有可用的采集服务商")
+        for candidate in candidates:
+            if candidate is not provider:
+                try:
+                    candidate.close()
+                except Exception:
+                    pass
 
         search_total = sum(int(row.get("pages") or pages) for row in keywords)
         self.db.update_job(
@@ -199,24 +243,33 @@ class Pipeline:
         )
 
         done = 0
+        failures = 0
         for row in keywords:
             word = row["word"]
             keyword_pages = int(row.get("pages") or pages)
             search_state: dict[str, str] = {}
             for page in range(1, keyword_pages + 1):
                 self._check_active(job_id)
-                response = self._call(
-                    round_id,
-                    platform,
-                    "search",
-                    lambda word=word, page=page, state=search_state: provider.search(word, page, state),
-                    {"keyword": word, "page": page},
-                    cost=provider.search_cost_tokens,
-                    label=f"round{round_id}_{provider.provider_id}_search_{word}_{page}",
-                    path=provider.search_path,
-                    provider=provider.provider_id,
-                    cost_native=provider.search_price,
-                )
+                try:
+                    response = self._call(
+                        round_id,
+                        platform,
+                        "search",
+                        lambda word=word, page=page, state=search_state: provider.search(word, page, state),
+                        {"keyword": word, "page": page},
+                        cost=provider.search_cost_tokens,
+                        label=f"round{round_id}_{provider.provider_id}_search_{word}_{page}",
+                        path=provider.search_path,
+                        provider=provider.provider_id,
+                        cost_native=provider.search_price,
+                        provider_obj=provider,
+                    )
+                except ProviderError as exc:
+                    failures += 1
+                    print(f"[search] {word} 第 {page} 页失败: {exc}")
+                    if _fatal_provider_error(exc) or failures >= 5:
+                        raise
+                    break
                 if not isinstance(response, SearchResponse):
                     raise ProviderError(None, "搜索适配器返回了无效响应")
                 items = response.items
@@ -247,6 +300,9 @@ class Pipeline:
                 if response.has_more is False or not items:
                     break
 
+        if done == 0 and keywords:
+            raise RuntimeError("所有搜索页均失败，未采集到任何数据")
+
         stats = self.db.round_author_stats(round_id)
         to_fetch: list[dict[str, Any]] = []
         for entry in stats:
@@ -272,47 +328,76 @@ class Pipeline:
             platform_code = entry["platform"]
             user_id = entry["user_id"]
             profile_url = entry.get("profile_url") or ""
-            payload = self._call(
-                round_id,
-                platform_code,
-                "user",
-                lambda user_id=user_id, profile_url=profile_url: provider.user(user_id, profile_url),
-                {"userId": user_id},
-                cost=provider.user_cost_tokens,
-                label=f"round{round_id}_{provider.provider_id}_user_{user_id}",
-                path=provider.user_path,
-                provider=provider.provider_id,
-                cost_native=provider.user_price,
-            )
-            creator = provider.normalize_user(payload, user_id)
-            if not creator.get("user_id"):
-                creator["user_id"] = user_id
-            self.db.upsert_creator(creator)
-            enriched += 1
+            try:
+                payload = self._call(
+                    round_id,
+                    platform_code,
+                    "user",
+                    lambda user_id=user_id, profile_url=profile_url: provider.user(user_id, profile_url),
+                    {"userId": user_id},
+                    cost=provider.user_cost_tokens,
+                    label=f"round{round_id}_{provider.provider_id}_user_{user_id}",
+                    path=provider.user_path,
+                    provider=provider.provider_id,
+                    cost_native=provider.user_price,
+                    provider_obj=provider,
+                )
+                creator = provider.normalize_user(payload, user_id)
+                if not creator.get("user_id"):
+                    creator["user_id"] = user_id
+                self.db.upsert_creator(creator)
+                enriched += 1
+                print(f"[user] {creator.get('nickname') or user_id}: 粉丝 {creator.get('fans')}")
+            except ProviderError as exc:
+                failures += 1
+                print(f"[user] {user_id} 失败: {exc}")
+                if _fatal_provider_error(exc) or failures >= 5:
+                    raise
+            except ValueError as exc:
+                failures += 1
+                print(f"[user] {user_id} 资料格式异常: {exc}")
+                if failures >= 5:
+                    raise
             done += 1
             self.db.update_job(job_id, progress_done=done)
-            print(f"[user] {creator.get('nickname') or user_id}: 粉丝 {creator.get('fans', 0)}")
 
         rows = self.db.refresh_creator_rounds(round_id)
         if max_creators is not None:
             self.db.prune_round_creators(round_id, max_creators)
+            self.db.cleanup_orphans()
             rows = self.db.round_metrics(round_id)["creators"]
+        lead_matches = {"matched": 0, "updated": 0, "ambiguous": 0}
+        if getattr(self.settings, "lead_match_enabled", True):
+            try:
+                lead_matches = match_round_leads(self.db, round_id)
+            except Exception as exc:
+                print(f"[lead-match] 轮次 {round_id} 匹配线索失败: {exc}")
+                try:
+                    self.db.audit(
+                        None,
+                        "lead.match_failed",
+                        f"round:{round_id}",
+                        details={"error": str(exc)},
+                    )
+                except Exception:
+                    pass
         round_cost = self.db.sum_round_cost(round_id)
         job_cost = self.db.sum_job_cost(job_id)
-        self.db.update_round(
+        stage = "完成" if not failures else f"完成（失败 {failures} 次）"
+        if not self.db.finish_job(
+            job_id,
             round_id,
             status="done",
-            finished_at=utc_now(),
-            cost_tokens=round_cost,
-            provider=provider.provider_id if requested not in {"auto", "cheapest", "default"} else requested,
-        )
-        self.db.update_job(
-            job_id,
-            status="done",
-            stage="完成",
+            stage=stage,
             progress_done=total_progress,
             cost=job_cost,
+            round_cost=round_cost,
             finished_at=utc_now(),
+        ):
+            raise JobCancelled("任务已取消")
+        self.db.update_round(
+            round_id,
+            provider=provider.provider_id if requested not in {"auto", "cheapest", "default"} else requested,
         )
 
         summary = {
@@ -323,13 +408,20 @@ class Pipeline:
             "authors": len(stats),
             "creators": rows,
             "enriched": enriched,
+            "failed_calls": failures,
+            "failed_cost_estimate": self.db.sum_failed_estimate(job_id),
             "cost_tokens": round_cost,
             "job_cost_tokens": job_cost,
+            "leads_matched": int(lead_matches.get("matched") or 0),
+            "leads_updated": int(lead_matches.get("updated") or 0),
+            "leads_ambiguous": int(lead_matches.get("ambiguous") or 0),
+            "leads_suggested": int(lead_matches.get("suggested") or 0),
             "estimate": estimate,
         }
         print(
             f"[done] 轮次 {round_id} ({provider.label}): 关键词 {len(keywords)} 个, "
-            f"作者 {len(stats)} 个, 补全 {enriched} 个, 花费 {job_cost} token"
+            f"作者 {len(stats)} 个, 补全 {enriched} 个, 线索匹配 {summary['leads_matched']} 个, "
+            f"花费 {job_cost} token"
         )
         return summary
 
@@ -354,12 +446,13 @@ class Pipeline:
             if force:
                 return
             raise RuntimeError(
-                f"{provider.label} 余额接口未返回剩余额度，已停止采集；确认后可用 --force 重试。"
+                f"{provider.label} 余额接口未返回剩余额度，已停止采集；"
+                "确认后可在任务详情勾选“跳过余额检查”重试。"
             )
         if balance.remaining_tokens < needed_tokens and not force:
             raise RuntimeError(
                 f"{provider.label} 余额不足：{balance.text}，预计需要 {needed_tokens} token。"
-                "请充值或确认余额后再试，或使用 --force 跳过检查。"
+                "请充值或确认余额后再试，或在任务详情勾选“跳过余额检查”。"
             )
 
     def _call(
@@ -374,12 +467,16 @@ class Pipeline:
         path: str,
         provider: str = "dataflow",
         cost_native: Any = None,
+        provider_obj: Any = None,
     ) -> Any:
         start = time.monotonic()
         try:
             result = fn()
         except ProviderError as exc:
             duration = int((time.monotonic() - start) * 1000)
+            client = getattr(provider_obj, "client", None)
+            attempts = getattr(client, "last_attempts", 0)
+            charged_cost = int(getattr(client, "last_cost", 0) or 0)
             raw_file = None
             if exc.payload is not None:
                 raw_file = self.db.save_raw(label + "_error", exc.payload)
@@ -395,16 +492,25 @@ class Pipeline:
                 path=path,
                 job_id=getattr(self, "_active_job_id", None),
                 provider=provider,
-                cost_native=0,
-                cost_currency="token",
+                cost_native=float(cost_native.amount) if cost_native is not None else 0,
+                cost_currency=cost_native.unit if cost_native is not None else "token",
+                estimated_cost=charged_cost or cost * max(1, int(attempts or 1)),
+                attempt=max(1, int(attempts or 1)),
+                status="error",
             )
             raise
         duration = int((time.monotonic() - start) * 1000)
         payload = result.payload if isinstance(result, SearchResponse) else result
         raw_file = self.db.save_raw(label, payload)
         code = payload.get("code") if isinstance(payload, dict) else None
+        if code is None:
+            code = 200
         native_amount = float(cost_native.amount) if cost_native is not None else float(cost)
         native_currency = cost_native.unit if cost_native is not None else "token"
+        job_id = getattr(self, "_active_job_id", None)
+        client = getattr(provider_obj, "client", None)
+        attempts = getattr(client, "last_attempts", 0)
+        actual_cost = int(getattr(client, "last_cost", 0) or 0) or cost * max(1, int(attempts or 1))
         self.db.log_api_call(
             round_id,
             platform,
@@ -412,12 +518,22 @@ class Pipeline:
             params,
             raw_file,
             code,
-            cost,
+            actual_cost,
             duration,
             path=path,
-            job_id=getattr(self, "_active_job_id", None),
+            job_id=job_id,
             provider=provider,
             cost_native=native_amount,
             cost_currency=native_currency,
+            estimated_cost=actual_cost,
+            attempt=max(1, int(attempts or 1)),
+            status="ok",
         )
+        if job_id:
+            self._job_cost = getattr(self, "_job_cost", self.db.sum_job_cost(job_id)) + actual_cost
+            self._round_cost = (
+                getattr(self, "_round_cost", self.db.sum_round_cost(round_id)) + actual_cost
+            )
+            self.db.update_job(job_id, cost=self._job_cost)
+            self.db.update_round(round_id, cost_tokens=self._round_cost)
         return result

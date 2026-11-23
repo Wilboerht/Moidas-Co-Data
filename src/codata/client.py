@@ -69,10 +69,35 @@ def _same_host_request(
     current_path = path
     current_params = params
     allowed = tuple(host.lower() for host in allowed_hosts if host)
+    base = httpx.URL(str(client.base_url))
+    base_host = (base.host or "").lower()
+    base_port = base.port or 443
+    loopback = {"127.0.0.1", "localhost", "::1"}
     for _ in range(max_redirects + 1):
+        initial = base.join(str(current_path))
+        host = (initial.host or "").lower()
+        port = initial.port or 443
+        if initial.scheme != "https" and host not in loopback:
+            raise ProviderError(
+                None,
+                "服务商请求必须使用 HTTPS，已拒绝",
+                provider=provider_id,
+            )
+        if host != base_host or port != base_port:
+            raise ProviderError(
+                None,
+                f"服务商请求目标与配置域名不一致，已拒绝: {host}",
+                provider=provider_id,
+            )
+        if allowed and host not in allowed:
+            raise ProviderError(
+                None,
+                f"服务商域名不在允许列表，已拒绝: {host}",
+                provider=provider_id,
+            )
         response = client.request(
             method.upper(),
-            current_path,
+            str(initial),
             params=_clean_params(current_params),
             json=json_body,
         )
@@ -87,17 +112,19 @@ def _same_host_request(
                 status=response.status_code,
             )
         target = httpx.URL(str(response.url)).join(location)
-        if target.scheme != "https" and target.host not in {"127.0.0.1", "localhost", "::1"}:
+        target_host = (target.host or "").lower()
+        target_port = target.port or 443
+        if target.scheme != "https" and target_host not in loopback:
             raise ProviderError(
                 response.status_code,
-                f"服务商重定向到非 HTTPS 地址，已拒绝: {target}",
+                "服务商重定向到非 HTTPS 地址，已拒绝",
                 provider=provider_id,
                 status=response.status_code,
             )
-        if allowed and (target.host or "").lower() not in allowed:
+        if target_host != base_host or target_port != base_port:
             raise ProviderError(
                 response.status_code,
-                f"服务商重定向到非允许域名，已拒绝: {target}",
+                f"服务商重定向到非允许域名，已拒绝: {target_host}",
                 provider=provider_id,
                 status=response.status_code,
             )
@@ -119,13 +146,25 @@ def _clean_params(params: dict[str, Any] | None) -> dict[str, Any] | None:
     return cleaned or None
 
 
+def _failed_flag(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, (int, float)):
+        return not value
+    if isinstance(value, str):
+        return value.strip().lower() in {"", "false", "0", "no", "off"}
+    return not bool(value)
+
+
 def _parse_json(response: httpx.Response) -> Any:
     try:
         return response.json()
     except json.JSONDecodeError as exc:
         raise ProviderError(
             response.status_code,
-            f"响应不是合法 JSON: {response.text[:200]}",
+            "响应不是合法 JSON",
             status=response.status_code,
         ) from exc
 
@@ -161,8 +200,11 @@ class DataFlowClient:
             headers={header: f"{prefix}{api_key}", "Accept": "application/json"},
             timeout=httpx.Timeout(getattr(provider, "timeout", settings.timeout)),
             follow_redirects=False,
+            trust_env=settings.provider_trust_env,
         )
         self.cost = 0
+        self.last_attempts = 0
+        self.last_cost = 0
 
     def close(self) -> None:
         self._client.close()
@@ -177,7 +219,9 @@ class DataFlowClient:
         delay = getattr(self.provider, "delay", self.settings.delay)
         retries = max(1, int(getattr(self.provider, "retries", self.settings.retries)))
         last_error: Exception | None = None
+        self.last_cost = 0
         for attempt in range(1, retries + 1):
+            self.last_attempts = attempt
             if delay:
                 time.sleep(delay)
             response: httpx.Response | None = None
@@ -191,6 +235,8 @@ class DataFlowClient:
                     getattr(self.provider, "allowed_hosts", None) or self.settings.dataflow_allowed_hosts,
                     "dataflow",
                 )
+                self.last_cost += cost
+                self.cost += cost
                 if response.status_code in FATAL_STATUS:
                     raise ProviderError(
                         response.status_code,
@@ -229,8 +275,15 @@ class DataFlowClient:
                 raise
 
             code = payload.get("code") if isinstance(payload, dict) else None
-            if code in (0, None):
-                self.cost += cost
+            success_codes = tuple(getattr(self.provider, "success_codes", ()) or ())
+            if code is None:
+                success = True
+            else:
+                try:
+                    success = int(code) in (success_codes or (0,))
+                except (TypeError, ValueError):
+                    success = False
+            if success:
                 return payload
 
             message = payload.get("msg") or payload.get("message") or "未知错误"
@@ -262,8 +315,11 @@ class RnoteClient:
             headers={"X-API-Key": api_key, "Accept": "application/json"},
             timeout=httpx.Timeout(getattr(provider, "timeout", settings.timeout)),
             follow_redirects=False,
+            trust_env=settings.provider_trust_env,
         )
         self.cost = 0
+        self.last_attempts = 0
+        self.last_cost = 0
 
     def close(self) -> None:
         self._client.close()
@@ -278,7 +334,9 @@ class RnoteClient:
         delay = getattr(self.provider, "delay", self.settings.delay)
         retries = max(1, int(getattr(self.provider, "retries", self.settings.retries)))
         last_error: Exception | None = None
+        self.last_cost = 0
         for attempt in range(1, retries + 1):
+            self.last_attempts = attempt
             if delay:
                 time.sleep(delay)
             response: httpx.Response | None = None
@@ -292,6 +350,8 @@ class RnoteClient:
                     getattr(self.provider, "allowed_hosts", None) or self.settings.rnote_allowed_hosts,
                     "rnote",
                 )
+                self.last_cost += cost
+                self.cost += cost
                 if response.status_code in FATAL_STATUS:
                     raise RnoteError(
                         response.status_code,
@@ -325,7 +385,9 @@ class RnoteClient:
                     continue
                 raise
 
-            if isinstance(payload, dict) and payload.get("success") is False:
+            if isinstance(payload, dict) and "success" in payload and _failed_flag(
+                payload.get("success")
+            ):
                 message = str(payload.get("error") or payload.get("detail") or "未知错误")
                 retryable = response.status_code in RETRYABLE_STATUS or bool(payload.get("retry_after"))
                 error = RnoteError(response.status_code, message, payload, status=response.status_code)
@@ -342,7 +404,6 @@ class RnoteClient:
                     continue
                 raise error
 
-            self.cost += cost
             return payload
 
         raise RnoteError(None, f"重试后仍失败: {last_error}")
@@ -363,8 +424,11 @@ class JsonProviderClient:
             headers=headers,
             timeout=httpx.Timeout(provider.timeout),
             follow_redirects=False,
+            trust_env=self.settings.provider_trust_env,
         )
         self.cost = 0
+        self.last_attempts = 0
+        self.last_cost = 0
 
     def close(self) -> None:
         self._client.close()
@@ -378,7 +442,7 @@ class JsonProviderClient:
     def _success(self, payload: Any) -> bool:
         if not isinstance(payload, dict):
             return True
-        if payload.get("success") is False:
+        if "success" in payload and _failed_flag(payload.get("success")):
             return False
         if payload.get("error") and "success" not in payload:
             return False
@@ -409,7 +473,9 @@ class JsonProviderClient:
         if self.provider.auth_query and self.provider.api_key:
             request_params[self.provider.auth_query] = self.provider.api_key
         last_error: Exception | None = None
+        self.last_cost = 0
         for attempt in range(1, retries + 1):
+            self.last_attempts = attempt
             if delay:
                 time.sleep(delay)
             response: httpx.Response | None = None
@@ -423,6 +489,8 @@ class JsonProviderClient:
                     self.provider.allowed_hosts,
                     self.provider.id,
                 )
+                self.last_cost += cost
+                self.cost += cost
                 if response.status_code in FATAL_STATUS:
                     raise ProviderError(
                         response.status_code,
@@ -474,7 +542,6 @@ class JsonProviderClient:
                     provider=self.provider.id,
                     status=response.status_code,
                 )
-            self.cost += cost
             return payload
         raise ProviderError(None, f"重试后仍失败: {last_error}", provider=self.provider.id)
 

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -55,6 +57,68 @@ class LeadTests(unittest.TestCase):
         rows = self.db.creator_table(self.round_id)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["user_id"], "u1")
+        self.assertEqual(rows[0]["owner_user_id"], 1)
+        self.assertEqual(json.loads(rows[0]["source_keywords"]), [])
+        self.assertEqual(json.loads(rows[0]["source_labels"]), ["线索转换"])
+
+    def test_conversion_splits_source_keywords_and_labels(self) -> None:
+        lead_id = self.db.create_lead(
+            platform="xhs",
+            nickname="来源线索",
+            account_id="u1",
+            source_round_id=self.round_id,
+        )
+        self.db._conn.execute(
+            "UPDATE lead_rounds SET source_keywords = ? WHERE lead_id = ? AND round_id = ?",
+            (json.dumps(["测试", "小红书"], ensure_ascii=False), lead_id, self.round_id),
+        )
+        self.db._conn.commit()
+        convert_lead(self.db, self.settings, lead_id, fetch=False)
+        rows = self.db.creator_table(self.round_id)
+        self.assertEqual(json.loads(rows[0]["source_keywords"]), ["测试"])
+        self.assertEqual(json.loads(rows[0]["source_labels"]), ["小红书"])
+
+    def test_conversion_rolls_back_all_writes_on_failure(self) -> None:
+        lead_id = self.db.create_lead(
+            platform="xhs",
+            nickname="回滚线索",
+            account_id="u1",
+            source_round_id=self.round_id,
+        )
+        with patch.object(
+            self.db, "add_creator_round", side_effect=RuntimeError("boom")
+        ):
+            with self.assertRaises(RuntimeError):
+                convert_lead(self.db, self.settings, lead_id, fetch=False)
+        lead = self.db.get_lead(lead_id)
+        self.assertEqual(lead["status"], "unverified")
+        self.assertIsNone(lead["conversion_lock"])
+        self.assertEqual(self.db.creator_table(self.round_id), [])
+        attempts = self.db.lead_attempts(lead_id)
+        self.assertTrue(any(item["status"] == "error" for item in attempts))
+
+    def test_conversion_clears_stale_match_fields(self) -> None:
+        lead_id = self.db.create_lead(
+            platform="xhs",
+            nickname="已匹配线索",
+            account_id="u1",
+            source_round_id=self.round_id,
+        )
+        self.db._conn.execute(
+            """
+            UPDATE leads SET matched_platform = 'xhs', matched_user_id = 'old',
+                matched_round_id = ?, matched_at = '2024-01-01', match_confidence = 'legacy'
+            WHERE id = ?
+            """,
+            (self.round_id, lead_id),
+        )
+        self.db._conn.commit()
+        result = convert_lead(self.db, self.settings, lead_id, fetch=False)
+        lead = result["lead"]
+        self.assertEqual(lead["status"], "converted")
+        self.assertIsNone(lead["matched_user_id"])
+        self.assertIsNone(lead["matched_round_id"])
+        self.assertEqual(lead["account_id"], "u1")
 
     def test_lead_update_and_facets(self) -> None:
         lead_id = self.db.create_lead(platform="weibo", nickname="微博线索")

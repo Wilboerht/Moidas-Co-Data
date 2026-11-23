@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import Any, Iterable
+from urllib.parse import quote
 
-from .statuses import STATUS_OPTIONS
 from .storage import unwrap_data, unwrap_item
 
 UNCLASSIFIED = "未分类"
@@ -15,51 +16,105 @@ _HASHTAG_RE = re.compile(r"#([^#\s@，。！？、；：,.!?;:]+)")
 def utc_now() -> str:
     from datetime import datetime, timezone
 
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def as_optional_int(value: Any) -> int | None:
+    """Parse a metric while preserving "missing" as None instead of 0."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        parsed = int(value)
+        return parsed if parsed >= 0 else None
+    text = str(value).strip().replace(",", "")
+    if text.endswith("+"):
+        text = text[:-1].strip()
+    if not text:
+        return None
+    multiplier = 1
+    suffix = text[-1]
+    if suffix in {"万", "w", "W"}:
+        multiplier = 10_000
+        text = text[:-1]
+    elif suffix == "亿":
+        multiplier = 100_000_000
+        text = text[:-1]
+    elif suffix in {"千", "k", "K"}:
+        multiplier = 1_000
+        text = text[:-1]
+    elif suffix in {"m", "M"}:
+        multiplier = 1_000_000
+        text = text[:-1]
+    try:
+        numeric = float(text)
+    except ValueError:
+        match = re.search(r"-?\d+(?:\.\d+)?", text)
+        if not match:
+            return None
+        numeric = float(match.group())
+    if not math.isfinite(numeric):
+        return None
+    parsed = int(round(numeric * multiplier))
+    return parsed if parsed >= 0 else None
 
 
 def as_int(value: Any, default: int = 0) -> int:
-    if value is None or value == "" or isinstance(value, bool):
-        return default
-    if isinstance(value, (int, float)):
-        return int(value)
-    text = str(value).strip().replace(",", "")
-    multiplier = 1
-    if text.endswith(("万", "w", "W")):
-        multiplier = 10_000
-        text = text[:-1]
-    elif text.endswith("亿"):
-        multiplier = 100_000_000
-        text = text[:-1]
-    try:
-        return int(float(text) * multiplier)
-    except ValueError:
-        match = re.search(r"\d+(?:\.\d+)?", text)
-        if not match:
-            return default
-        return int(float(match.group()) * multiplier)
+    parsed = as_optional_int(value)
+    return default if parsed is None else parsed
+
+
+def _interaction(liked: int | None, collected: int | None) -> int | None:
+    if liked is None and collected is None:
+        return None
+    return (liked or 0) + (collected or 0)
 
 
 def first_str(*values: Any) -> str:
     for value in values:
         if isinstance(value, str) and value.strip():
             return value.strip()
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if isinstance(value, float) and not math.isfinite(value):
+            continue
+        if isinstance(value, float) and value.is_integer():
+            return str(int(value))
+        return str(value)
     return ""
 
 
 def first_dict(*values: Any) -> dict[str, Any]:
     for value in values:
-        if isinstance(value, dict):
+        if isinstance(value, dict) and value:
             return value
     return {}
 
 
+def first_not_none(*values: Any) -> Any:
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return None
+
+
 def note_url(note_id: str) -> str:
-    return f"https://www.xiaohongshu.com/explore/{note_id}" if note_id else ""
+    return (
+        f"https://www.xiaohongshu.com/explore/{quote(str(note_id), safe='')}"
+        if note_id
+        else ""
+    )
 
 
 def profile_url(user_id: str) -> str:
-    return f"https://www.xiaohongshu.com/user/profile/{user_id}" if user_id else ""
+    return (
+        f"https://www.xiaohongshu.com/user/profile/{quote(str(user_id), safe='')}"
+        if user_id
+        else ""
+    )
 
 
 def extract_hashtags(*texts: Any, limit: int = 8) -> list[str]:
@@ -190,12 +245,16 @@ def normalize_user_info(payload: Any, user_id: str = "") -> dict[str, Any]:
         user_id,
     )
     stats = first_dict(data.get("note_num_stat"), data.get("noteNumStat"))
-    liked = as_int(data.get("liked") or stats.get("liked"))
-    collected = as_int(data.get("collected") or stats.get("collected"))
-    interaction = liked + collected
+    liked = as_optional_int(first_not_none(data.get("liked"), stats.get("liked")))
+    collected = as_optional_int(
+        first_not_none(data.get("collected"), stats.get("collected"))
+    )
+    interaction = _interaction(liked, collected)
     for item in data.get("interactions") or []:
         if isinstance(item, dict) and item.get("type") == "interaction":
-            interaction = as_int(item.get("count"), interaction)
+            parsed = as_optional_int(item.get("count"))
+            if parsed is not None:
+                interaction = parsed
             break
 
     tags = []
@@ -217,11 +276,19 @@ def normalize_user_info(payload: Any, user_id: str = "") -> dict[str, Any]:
         "red_id": first_str(data.get("red_id"), data.get("redId")),
         "nickname": first_str(data.get("nickname"), data.get("nick_name"), data.get("nickName")),
         "avatar": first_str(data.get("images"), data.get("image"), data.get("imageb"), data.get("avatar")),
-        "fans": as_int(data.get("fans") or data.get("fans_count") or data.get("fansCount")),
-        "follows": as_int(data.get("follows") or data.get("follow_count")),
+        "fans": as_optional_int(
+            first_not_none(data.get("fans"), data.get("fans_count"), data.get("fansCount"))
+        ),
+        "follows": as_optional_int(
+            first_not_none(data.get("follows"), data.get("follow_count"))
+        ),
         "liked": liked,
         "collected": collected,
-        "posted": as_int(stats.get("posted") or data.get("ndiscovery") or data.get("note_count")),
+        "posted": as_optional_int(
+            first_not_none(
+                stats.get("posted"), data.get("ndiscovery"), data.get("note_count")
+            )
+        ),
         "interaction": interaction,
         "desc": first_str(data.get("desc"), data.get("description")),
         "tags_json": json.dumps(tags, ensure_ascii=False),
@@ -263,30 +330,36 @@ def normalize_rnote_user(payload: Any, user_id: str = "") -> dict[str, Any]:
         data.get("userid"),
         data.get("userId"),
     )
-    liked = as_int(
-        data.get("liked")
-        or data.get("liked_count")
-        or result.get("liked")
-        or stats.get("liked")
+    liked = as_optional_int(
+        first_not_none(
+            data.get("liked"),
+            data.get("liked_count"),
+            result.get("liked"),
+            stats.get("liked"),
+        )
     )
-    collected = as_int(
-        data.get("collected")
-        or data.get("collected_count")
-        or result.get("collected")
-        or stats.get("collected")
+    collected = as_optional_int(
+        first_not_none(
+            data.get("collected"),
+            data.get("collected_count"),
+            result.get("collected"),
+            stats.get("collected"),
+        )
     )
-    interaction = liked + collected
+    interaction = _interaction(liked, collected)
     for value in (data.get("interaction"), result.get("interaction")):
         if value not in (None, ""):
-            interaction = as_int(value)
+            parsed = as_optional_int(value)
+            if parsed is not None:
+                interaction = parsed
             break
-    fans = (
-        data.get("fans")
-        or data.get("fans_count")
-        or data.get("fansCount")
-        or result.get("fans")
-        or result.get("fans_count")
-        or result.get("fansCount")
+    fans = first_not_none(
+        data.get("fans"),
+        data.get("fans_count"),
+        data.get("fansCount"),
+        result.get("fans"),
+        result.get("fans_count"),
+        result.get("fansCount"),
     )
     avatar_values = (
         result.get("image"),
@@ -314,21 +387,25 @@ def normalize_rnote_user(payload: Any, user_id: str = "") -> dict[str, Any]:
             data.get("nick_name"),
         ),
         "avatar": avatar,
-        "fans": as_int(fans),
-        "follows": as_int(
-            data.get("follows")
-            or data.get("follow_count")
-            or result.get("follows")
-            or result.get("follow_count")
+        "fans": as_optional_int(fans),
+        "follows": as_optional_int(
+            first_not_none(
+                data.get("follows"),
+                data.get("follow_count"),
+                result.get("follows"),
+                result.get("follow_count"),
+            )
         ),
         "liked": liked,
         "collected": collected,
-        "posted": as_int(
-            stats.get("posted")
-            or data.get("posted")
-            or data.get("note_count")
-            or result.get("posted")
-            or result.get("note_count")
+        "posted": as_optional_int(
+            first_not_none(
+                stats.get("posted"),
+                data.get("posted"),
+                data.get("note_count"),
+                result.get("posted"),
+                result.get("note_count"),
+            )
         ),
         "interaction": interaction,
         "desc": first_str(

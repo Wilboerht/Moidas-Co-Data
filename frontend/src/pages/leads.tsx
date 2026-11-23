@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
-import { ChevronLeft, ChevronRight, Download, LoaderCircle, Plus, RotateCcw, RotateCw, Search } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { ChevronLeft, ChevronRight, Download, Link2, LoaderCircle, Plus, RotateCcw, RotateCw, Search } from "lucide-react";
 import { useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api } from "@/shared/api";
+import { api, downloadFile } from "@/shared/api";
+import { canonicalSearch } from "@/shared/query-string";
 import { fmtDateTime, fmtNumber } from "@/shared/format";
 import { useAuth } from "@/shared/auth-context";
 import { useRound } from "@/shared/round-context";
@@ -76,6 +77,7 @@ export function LeadsPage() {
   const [platform, setPlatform] = useState(params.get("platform") ?? "");
   const [statusFilter, setStatusFilter] = useState<string[]>(() => {
     const value = params.get("status");
+    if (value === "none") return [];
     return value ? value.split(",").filter(Boolean) : [...DEFAULT_STATUS_FILTER];
   });
   const [sourceFilter, setSourceFilter] = useState<string[]>(() => {
@@ -101,24 +103,57 @@ export function LeadsPage() {
   const leadStatuses = meta?.lead_statuses ?? [];
   const leadSources = meta?.lead_sources ?? [];
   const platforms = meta?.platforms ?? [];
+  const lastUrlRef = useRef(canonicalSearch(params));
+  const syncingFromUrlRef = useRef(false);
 
   useEffect(() => {
+    const serialized = canonicalSearch(params);
+    if (serialized === lastUrlRef.current) return;
+    lastUrlRef.current = serialized;
+    syncingFromUrlRef.current = true;
+    const nextRound = Number(params.get("round"));
+    setRoundFilter(Number.isFinite(nextRound) && nextRound > 0 ? nextRound : null);
+    setPlatform(params.get("platform") ?? "");
+    const status = params.get("status");
+    setStatusFilter(status === "none" ? [] : status ? status.split(",").filter(Boolean) : [...DEFAULT_STATUS_FILTER]);
+    setSourceFilter(params.get("source")?.split(",").filter(Boolean) ?? []);
+    setOwner(params.get("owner") ?? "");
+    const nextPage = Number(params.get("page") ?? 1);
+    setPage(Number.isFinite(nextPage) && nextPage > 0 ? Math.floor(nextPage) : 1);
+    const nextPageSize = Number(params.get("page_size") ?? 50);
+    setPageSize(Number.isFinite(nextPageSize) ? Math.min(200, Math.max(25, Math.floor(nextPageSize))) : 50);
+    setSearch(params.get("search") ?? "");
+    const nextLead = Number(params.get("lead"));
+    setSelectedLeadId(Number.isFinite(nextLead) && nextLead > 0 ? nextLead : null);
+  }, [params]);
+
+  const currentParams = new URLSearchParams();
+  if (roundFilter !== null) currentParams.set("round", String(roundFilter));
+  if (platform) currentParams.set("platform", platform);
+  if (debouncedSearch) currentParams.set("search", debouncedSearch);
+  currentParams.set("status", statusFilter.length ? statusFilter.join(",") : "none");
+  if (sourceFilter.length) currentParams.set("source", sourceFilter.join(","));
+  if (owner) currentParams.set("owner", owner);
+  if (page > 1) currentParams.set("page", String(page));
+  if (pageSize !== 50) currentParams.set("page_size", String(pageSize));
+  if (selectedLeadId !== null) currentParams.set("lead", String(selectedLeadId));
+
+  useEffect(() => {
+    if (syncingFromUrlRef.current) return;
+    if (canonicalSearch(currentParams) === lastUrlRef.current) return;
     setPage(1);
   }, [roundFilter, platform, debouncedSearch, statusFilter, sourceFilter, owner]);
 
   useEffect(() => {
-    const next = new URLSearchParams();
-    if (roundFilter !== null) next.set("round", String(roundFilter));
-    if (platform) next.set("platform", platform);
-    if (debouncedSearch) next.set("search", debouncedSearch);
-    if (statusFilter.length) next.set("status", statusFilter.join(","));
-    if (sourceFilter.length) next.set("source", sourceFilter.join(","));
-    if (owner) next.set("owner", owner);
-    if (page > 1) next.set("page", String(page));
-    if (pageSize !== 50) next.set("page_size", String(pageSize));
-    if (selectedLeadId !== null) next.set("lead", String(selectedLeadId));
-    setParams(next, { replace: true });
-  }, [roundFilter, platform, debouncedSearch, statusFilter, sourceFilter, owner, page, pageSize, selectedLeadId, setParams]);
+    if (syncingFromUrlRef.current) {
+      if (debouncedSearch === (params.get("search") ?? "")) syncingFromUrlRef.current = false;
+      return;
+    }
+    const serialized = canonicalSearch(currentParams);
+    if (serialized === canonicalSearch(params)) return;
+    lastUrlRef.current = serialized;
+    setParams(currentParams, { replace: true });
+  }, [roundFilter, platform, debouncedSearch, statusFilter, sourceFilter, owner, page, pageSize, selectedLeadId, params, setParams]);
 
   const query: LeadQuery = useMemo(
     () => ({
@@ -127,6 +162,7 @@ export function LeadsPage() {
       search: debouncedSearch,
       statuses: statusFilter,
       sources: sourceFilter,
+      source_mode: "any",
       owner,
       page,
       page_size: pageSize,
@@ -140,22 +176,62 @@ export function LeadsPage() {
     queryKey: ["leads", query],
     queryFn: () => api.getLeads(query),
   });
+  const healthQuery = useQuery({
+    queryKey: ["lead-identity-health"],
+    queryFn: api.getLeadIdentityHealth,
+    refetchInterval: 60_000,
+  });
   const ownersQuery = useQuery({
     queryKey: ["lead-owners"],
     queryFn: api.getLeadOwners,
   });
+  const leadFacetsQuery = useQuery({
+    queryKey: ["lead-facets", roundFilter],
+    queryFn: () => api.getLeadFacets(roundFilter),
+  });
 
+  const platformOptions = leadFacetsQuery.data?.platforms.length
+    ? leadFacetsQuery.data.platforms.map((item) => ({
+        code: item.value,
+        label: `${platforms.find((platform) => platform.code === item.value)?.label ?? item.value} (${item.count})`,
+      }))
+    : platforms;
   const owners: LeadOwner[] = ownersQuery.data ?? [];
   const assignableOwners = user?.role === "admin" ? owners : owners.filter((item) => item.id === user?.id);
   const total = leadsQuery.data?.total ?? 0;
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   useEffect(() => {
-    if (page > totalPages) setPage(totalPages);
-  }, [page, totalPages]);
+    if (leadsQuery.data && page > totalPages) setPage(totalPages);
+  }, [page, totalPages, leadsQuery.data]);
   const empty = !leadsQuery.isLoading && !leadsQuery.error && (leadsQuery.data?.items ?? []).length === 0;
+  const health = healthQuery.data;
+  const duplicateGroups =
+    (health?.duplicate_account_groups ?? 0) + (health?.duplicate_profile_groups ?? 0);
+  const indexMissing = health ? !health.account_index || !health.profile_index : false;
+  const showIdentityWarning = Boolean(health && (duplicateGroups > 0 || indexMissing));
 
   const refresh = async () => {
-    await queryClient.invalidateQueries({ queryKey: ["leads"] });
+    for (const key of [
+      ["leads"],
+      ["lead"],
+      ["lead-identity-health"],
+      ["lead-facets"],
+      ["bootstrap"],
+      ["dashboard"],
+      ["creators"],
+      ["facets"],
+      ["action-queue"],
+    ]) {
+      await queryClient.invalidateQueries({ queryKey: key });
+    }
+  };
+
+  const runExport = (format: "csv" | "xlsx") => {
+    void downloadFile(leadExportUrl(query, format), `codata_leads.${format}`).catch(
+      (err) => {
+        toast.error(err instanceof Error ? err.message : "导出失败");
+      },
+    );
   };
 
   const statusOptions = leadStatuses.map((item) => ({ value: item.code, label: item.label }));
@@ -201,14 +277,25 @@ export function LeadsPage() {
               <RotateCw className={leadsQuery.isFetching ? "animate-spin" : undefined} />
               刷新
             </Button>
-            <Button asChild variant="outline">
-              <a href={leadExportUrl(query, "csv")}>
-                <Download /> 导出 CSV
-              </a>
+            <Button variant="outline" onClick={() => runExport("csv")}>
+              <Download /> 导出筛选 CSV
+            </Button>
+            <Button variant="outline" onClick={() => runExport("xlsx")}>
+              <Download /> 导出筛选 Excel
             </Button>
           </>
         }
       />
+
+      {showIdentityWarning ? (
+        <div className="border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+          {duplicateGroups > 0
+            ? `检测到 ${duplicateGroups} 组账号或主页重复的线索，唯一索引未完全启用。`
+            : "线索唯一索引未启用。"}
+          请运行 <code className="rounded bg-amber-100 px-1 py-0.5 font-mono text-xs">uv run codata-admin leads-dedupe --apply</code>
+          后重启面板。
+        </div>
+      ) : null}
 
       <Section
         title="筛选"
@@ -243,7 +330,7 @@ export function LeadsPage() {
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">全部平台</SelectItem>
-                {platforms.map((item) => (
+                {platformOptions.map((item) => (
                   <SelectItem key={item.code} value={item.code}>{item.label}</SelectItem>
                 ))}
               </SelectContent>
@@ -353,13 +440,31 @@ export function LeadsPage() {
               {(leadsQuery.data?.items ?? []).map((lead) => (
                 <TableRow
                   key={lead.id}
-                  className="cursor-pointer hover:bg-muted/50"
+                  tabIndex={0}
+                  className="cursor-pointer hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   onClick={() => setSelectedLeadId(lead.id)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      setSelectedLeadId(lead.id);
+                    }
+                  }}
                 >
                   <TableCell className="font-medium">
                     <div className="max-w-[240px] truncate">{lead.nickname || lead.raw_title || `线索 #${lead.id}`}</div>
                     {lead.raw_title && lead.nickname ? (
                       <div className="max-w-[240px] truncate text-xs text-muted-foreground">{lead.raw_title}</div>
+                    ) : null}
+                    {lead.matched_user_id && lead.status !== "converted" ? (
+                      <div
+                        className="mt-1 inline-flex max-w-[240px] items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-[11px] font-normal text-muted-foreground"
+                        title={`已关联达人 ${lead.matched_user_id}${lead.matched_round_name ? ` · ${lead.matched_round_name}` : ""}`}
+                      >
+                        <Link2 className="size-3 shrink-0" aria-hidden="true" />
+                        <span className="truncate">
+                          已关联达人{lead.matched_round_name ? ` · ${lead.matched_round_name}` : ""}
+                        </span>
+                      </div>
                     ) : null}
                   </TableCell>
                   <TableCell className="text-muted-foreground">{lead.platform_label || lead.platform}</TableCell>
@@ -396,6 +501,7 @@ export function LeadsPage() {
         rounds={rounds}
         sources={leadSources}
         onCreated={refresh}
+        defaultPlatform={platform || "xhs"}
       />
 
       <CreateLeadDialog
@@ -405,6 +511,7 @@ export function LeadsPage() {
         rounds={rounds}
         owners={assignableOwners}
         sources={leadSources}
+        defaultPlatform={platform || "xhs"}
         onCreated={async (leadId) => {
           setCreateOpen(false);
           setSelectedLeadId(leadId);
@@ -423,6 +530,7 @@ function CreateLeadDialog({
   owners,
   sources,
   onCreated,
+  defaultPlatform = "xhs",
 }: {
   open: boolean;
   onClose: () => void;
@@ -431,8 +539,9 @@ function CreateLeadDialog({
   owners: LeadOwner[];
   sources: { code: string; label: string }[];
   onCreated: (leadId: number) => void;
+  defaultPlatform?: string;
 }) {
-  const [platform, setPlatform] = useState("xhs");
+  const [platform, setPlatform] = useState(defaultPlatform);
   const [nickname, setNickname] = useState("");
   const [accountId, setAccountId] = useState("");
   const [profileUrl, setProfileUrl] = useState("");
@@ -444,7 +553,7 @@ function CreateLeadDialog({
 
   useEffect(() => {
     if (!open) return;
-    setPlatform("xhs");
+    setPlatform(defaultPlatform);
     setNickname("");
     setAccountId("");
     setProfileUrl("");
@@ -453,7 +562,7 @@ function CreateLeadDialog({
     setRoundId("none");
     setOwnerId("none");
     setCloseConfirmOpen(false);
-  }, [open]);
+  }, [open, defaultPlatform]);
 
   const canSubmit = Boolean(nickname.trim() || accountId.trim() || profileUrl.trim());
   const dirty = Boolean(
@@ -480,7 +589,19 @@ function CreateLeadDialog({
         owner_user_id: ownerId === "none" ? null : Number(ownerId),
       }),
     onSuccess: (lead) => {
-      toast.success("线索已创建");
+      if (lead.match_error) {
+        toast.warning(`线索已保存，但自动匹配失败：${lead.match_error}`);
+      } else if (lead.revived) {
+        toast.success(
+          lead.matched_user_id ? "旧线索已恢复，并关联到达人库" : "旧线索已恢复为待核实",
+        );
+      } else if (lead.created === false) {
+        toast.info("线索已存在，已打开原线索");
+      } else if (lead.matched_user_id) {
+        toast.success("线索已创建，并关联到达人库");
+      } else {
+        toast.success("线索已创建");
+      }
       onCreated(lead.id);
     },
     onError: (error) => toast.error(error instanceof Error ? error.message : "创建线索失败"),
@@ -646,6 +767,8 @@ function leadExportUrl(query: LeadQuery, format: "csv" | "xlsx") {
   if (query.statuses.length) params.set("status", query.statuses.join(","));
   if (query.sources.length) params.set("source", query.sources.join(","));
   if (query.owner) params.set("owner", query.owner);
-  return `/api/leads/export?${params.toString()}`;
+  params.set("sort", query.sort);
+  params.set("order", query.order);
+  return `/api/leads/export?${canonicalSearch(params)}`;
 }
 

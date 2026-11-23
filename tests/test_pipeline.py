@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from codata.config import Settings
 from codata.db import Database
-from codata.pipeline import Pipeline
+from codata.pipeline import JobCancelled, Pipeline
 from helpers import search_item, search_payload, user_payload
 
 
@@ -88,6 +88,19 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(job["status"], "done")
         self.assertEqual(job["cost"], 90)
 
+    def test_run_round_matches_existing_leads(self) -> None:
+        lead_id = self.db.create_lead(
+            platform="xhs", nickname="线索昵称", account_id="u1"
+        )
+        round_id = self._round(1)
+        summary = Pipeline(self.settings, self.db, api=FakeAPI()).run_round(round_id)
+        lead = self.db.get_lead(lead_id)
+        self.assertEqual(lead["status"], "unverified")
+        self.assertEqual(lead["matched_user_id"], "u1")
+        self.assertEqual(lead["matched_round_id"], round_id)
+        self.assertEqual(lead["nickname"], "咖啡师")
+        self.assertEqual(summary["leads_matched"], 1)
+
     def test_run_round_uses_cache(self) -> None:
         first = FakeAPI()
         Pipeline(self.settings, self.db, api=first).run_round(self._round(1))
@@ -107,6 +120,40 @@ class PipelineTests(unittest.TestCase):
         Pipeline(self.settings, self.db, api=api).run_round(round_id, refresh_users=True)
         self.assertEqual(sorted(api.user_calls), ["u1", "u2"])
         self.assertEqual(self.db.get_round(round_id)["cost_tokens"], 135)
+
+    def test_run_round_rejects_job_from_another_round(self) -> None:
+        first_round = self._round(None)
+        second_round = self._round(None)
+        job_id = self.db.claim_job(first_round)
+        with self.assertRaises(ValueError):
+            Pipeline(self.settings, self.db, api=FakeAPI()).run_round(
+                second_round, job_id=job_id
+            )
+
+    def test_run_round_rejects_finished_job(self) -> None:
+        round_id = self._round(None)
+        job_id = self.db.claim_job(round_id)
+        self.db.finish_job(
+            job_id, round_id, status="done", stage="完成", progress_done=1
+        )
+        with self.assertRaises(JobCancelled):
+            Pipeline(self.settings, self.db, api=FakeAPI()).run_round(
+                round_id, job_id=job_id
+            )
+
+    def test_pruned_enriched_creator_is_not_fetched_again(self) -> None:
+        first = FakeAPI()
+        round_id = self._round(2)
+        Pipeline(self.settings, self.db, api=first).run_round(round_id)
+        self.assertEqual(sorted(first.user_calls), ["u1", "u2"])
+        self.db.update_round(round_id, max_creators=1)
+
+        second = FakeAPI()
+        Pipeline(self.settings, self.db, api=second).run_round(round_id)
+        self.assertEqual(second.user_calls, [])
+        rows = self.db.creator_table(round_id)
+        self.assertEqual([row["user_id"] for row in rows], ["u1"])
+        self.assertIsNotNone(self.db.get_creator("xhs", "u2"))
 
 
 if __name__ == "__main__":

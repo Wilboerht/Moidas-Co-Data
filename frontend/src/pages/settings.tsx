@@ -1,12 +1,13 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Copy, Eye, EyeOff, KeyRound, LoaderCircle, RefreshCw } from "lucide-react";
+import { ChevronRight, Copy, Eye, EyeOff, KeyRound, LoaderCircle, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 import logo from "@/assets/logo.svg";
 import { api } from "@/shared/api";
 import { useAuth } from "@/shared/auth-context";
-import { fmtNumber } from "@/shared/format";
+import { CHANGELOG } from "@/shared/changelog";
+import { fmtNumber, safeHttpUrl } from "@/shared/format";
 import { useRound } from "@/shared/round-context";
 import { APP_VERSION, BUILD_TIME } from "@/shared/version";
 import type { Balance, PlatformProviderPrice, ProviderSettings } from "@/shared/types";
@@ -21,6 +22,7 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
+  DialogTrigger,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -47,6 +49,20 @@ const UPDATED_AT = new Date(BUILD_TIME).toLocaleString("zh-CN", {
   hour12: false,
 });
 
+const DATA_POLICY = [
+  { label: "数据存储", value: "SQLite 数据库保存在本机 data 目录，启用 WAL 与安全写入。" },
+  {
+    label: "自动备份",
+    value:
+      "数据库结构升级前自动备份；默认保留 90 天、最多 10 份，可用 CODATA_BACKUP_RETENTION_DAYS / CODATA_BACKUP_RETENTION_COUNT 调整（0 关闭）。",
+  },
+  { label: "原始响应", value: "服务商原始响应保存在 data/raw，便于复核与重新解析。" },
+  { label: "运行日志", value: "采集与运行日志保存在 data/logs。" },
+  { label: "访问凭据", value: "访问令牌仅写入 .env，界面只显示配置状态。" },
+  { label: "网络边界", value: "面板默认只监听本机；公网访问需 Nginx/HTTPS 与账号登录。" },
+  { label: "采集边界", value: "仅采集公开数据，并遵守各服务商的使用条款。" },
+];
+
 function formatCny(value: string) {
   const amount = Number(value);
   if (!Number.isFinite(amount)) return value;
@@ -56,7 +72,7 @@ function formatCny(value: string) {
 export function SettingsPage() {
   const { user } = useAuth();
   const isAdmin = user?.role === "admin";
-  const { counts } = useRound();
+  const { counts, settings: bootstrapSettings } = useRound();
   const [searchParams, setSearchParams] = useSearchParams();
   const requestedTab = searchParams.get("tab");
   const availableTabs: readonly SettingsTab[] = isAdmin
@@ -89,7 +105,11 @@ export function SettingsPage() {
   const [providerTokenTarget, setProviderTokenTarget] = useState<ProviderSettings | null>(null);
   const [providerTokenInput, setProviderTokenInput] = useState("");
   const [showProviderToken, setShowProviderToken] = useState(false);
-  const settingsQuery = useQuery({ queryKey: ["settings"], queryFn: api.getSettings });
+  const settingsQuery = useQuery({
+    queryKey: ["settings"],
+    queryFn: api.getSettings,
+    initialData: bootstrapSettings ?? undefined,
+  });
   const tokenMutation = useMutation({
     mutationFn: (token: string) => api.updateDataflowToken(token),
     onSuccess: async (nextSettings) => {
@@ -294,7 +314,7 @@ export function SettingsPage() {
       <Tabs value={tab} onValueChange={setTab} className="flex flex-1 flex-col">
         <TabsList>
           <TabsTrigger value="connection">连接与用量</TabsTrigger>
-          <TabsTrigger value="storage">数据与缓存</TabsTrigger>
+          {isAdmin ? <TabsTrigger value="storage">数据与缓存</TabsTrigger> : null}
           <TabsTrigger value="about">关于</TabsTrigger>
         </TabsList>
 
@@ -335,7 +355,7 @@ export function SettingsPage() {
                         </div>
                         {provider.host ? (
                           <a
-                            href={provider.host}
+                            href={safeHttpUrl(provider.host) || undefined}
                             target="_blank"
                             rel="noreferrer"
                             title={provider.host}
@@ -496,6 +516,12 @@ export function SettingsPage() {
               <span className="text-muted-foreground">达人缓存（全局）</span>
               <span>{settings.cache_days} 天</span>
             </div>
+            <div className="flex items-center justify-between border-t px-4 py-3 text-sm">
+              <span className="text-muted-foreground">计价换算</span>
+              <span className="tabular-nums">
+                1 token = ¥{settings.token_cny} · 1 USD = ¥{settings.usd_cny}
+              </span>
+            </div>
             <p className="border-t px-4 py-3 text-xs text-muted-foreground">
               DataFlow、Rnote、EveryInfra、TikHub、SocialDataX、RedFoxHub 可查询余额；JustOneAPI 暂未找到公开余额接口。价格按当前配置和汇率折算，实际扣费以服务商账单为准。
             </p>
@@ -526,7 +552,7 @@ export function SettingsPage() {
         </TabsContent> : null}
 
         <TabsContent value="about" className="flex flex-1 flex-col pt-6">
-          <div className="flex flex-1 flex-col">
+          <div className="flex flex-1 flex-col gap-4">
             <div className="relative">
               <Section className="ring-0" title="Moidas Co-data" description="多平台信息数据处理工作台">
                 <div className="max-w-5xl space-y-3 text-sm text-muted-foreground">
@@ -561,6 +587,8 @@ export function SettingsPage() {
                   src={logo}
                   alt=""
                   aria-hidden="true"
+                  width={481}
+                  height={424}
                   className="pointer-events-none absolute inset-y-0 right-0 hidden h-full w-auto opacity-10 select-none md:block"
                 />
               </Section>
@@ -569,16 +597,55 @@ export function SettingsPage() {
                 className="pointer-events-none absolute inset-0 rounded-xl border border-foreground/10 [mask-image:linear-gradient(to_right,black_50%,transparent)]"
               />
             </div>
-            <div className="mt-2 flex flex-wrap items-center justify-end gap-x-2 gap-y-1 text-xs text-muted-foreground">
+            <div className="flex flex-wrap items-center justify-end gap-x-2 gap-y-1 text-xs text-muted-foreground">
               <span className="font-mono">v{APP_VERSION}</span>
               <span aria-hidden="true">·</span>
               <span>更新于 {UPDATED_AT}</span>
               <span aria-hidden="true">·</span>
               <span>by Information Technology Department</span>
             </div>
-            <p className="mt-auto border-t pt-4 text-center text-xs text-muted-foreground">
-              © {new Date().getFullYear()} Moidas. All rights reserved.
-            </p>
+            <div className="grid items-start gap-4 lg:grid-cols-2">
+              <AboutInfoCard title="更新日志" description="记录产品能力的迭代">
+                <ol className="space-y-4">
+                  {CHANGELOG.map((release) => (
+                    <li key={release.version} className="border-b pb-4 last:border-0 last:pb-0">
+                      <div className="flex items-center gap-2">
+                        <span className="font-mono text-xs font-medium">v{release.version}</span>
+                        {release.version === APP_VERSION ? (
+                          <Badge
+                            variant="outline"
+                            className="border-emerald-200 bg-emerald-50 text-[10px] font-normal text-emerald-700"
+                          >
+                            当前
+                          </Badge>
+                        ) : null}
+                      </div>
+                      <ul className="mt-2 space-y-1.5">
+                        {release.highlights.map((item) => (
+                          <li key={item} className="flex gap-2 text-sm text-muted-foreground">
+                            <span
+                              aria-hidden="true"
+                              className="mt-[7px] size-1 shrink-0 rounded-full bg-foreground/25"
+                            />
+                            <span>{item}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </li>
+                  ))}
+                </ol>
+              </AboutInfoCard>
+              <AboutInfoCard title="数据与安全" description="数据仅保存在本机，令牌不会在界面回显">
+                <dl className="space-y-3">
+                  {DATA_POLICY.map((item) => (
+                    <div key={item.label} className="grid grid-cols-[76px_1fr] gap-3">
+                      <dt className="text-xs leading-5 text-muted-foreground">{item.label}</dt>
+                      <dd className="text-sm leading-5">{item.value}</dd>
+                    </div>
+                  ))}
+                </dl>
+              </AboutInfoCard>
+            </div>
           </div>
         </TabsContent>
       </Tabs>
@@ -843,6 +910,45 @@ export function SettingsPage() {
         </DialogContent>
       </Dialog>
     </Page>
+  );
+}
+
+function AboutInfoCard({
+  title,
+  description,
+  children,
+}: {
+  title: string;
+  description: string;
+  children: ReactNode;
+}) {
+  return (
+    <Dialog>
+      <Card className="gap-0 overflow-hidden py-0">
+        <DialogTrigger asChild>
+          <button
+            type="button"
+            className="flex w-full cursor-pointer items-start justify-between gap-4 px-4 py-4 text-left outline-none transition-colors hover:bg-muted/40 focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:ring-inset"
+          >
+            <div className="space-y-1">
+              <h2 className="font-heading text-base leading-snug font-medium">{title}</h2>
+              <p className="text-sm text-muted-foreground">{description}</p>
+            </div>
+            <ChevronRight
+              aria-hidden="true"
+              className="mt-0.5 size-4 shrink-0 text-muted-foreground"
+            />
+          </button>
+        </DialogTrigger>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader className="pr-8">
+            <DialogTitle>{title}</DialogTitle>
+            <DialogDescription>{description}</DialogDescription>
+          </DialogHeader>
+          <div className="max-h-[60vh] overflow-y-auto">{children}</div>
+        </DialogContent>
+      </Card>
+    </Dialog>
   );
 }
 

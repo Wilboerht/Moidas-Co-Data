@@ -143,7 +143,7 @@ export function KeywordsPage() {
                 name="keyword-word"
                 autoComplete="off"
                 spellCheck={false}
-                maxLength={40}
+                maxLength={50}
                 value={word}
                 aria-invalid={duplicateKeyword ? true : undefined}
                 aria-describedby="keyword-help"

@@ -2,6 +2,7 @@ import { useState, type FormEvent } from "react";
 import { KeyRound, Loader2, LogOut } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "@/shared/auth-context";
+import { MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH } from "@/shared/constants";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -17,6 +18,10 @@ export function ChangePasswordRequiredPage() {
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
+    if (newPassword.length < MIN_PASSWORD_LENGTH) {
+      setError(`密码至少需要 ${MIN_PASSWORD_LENGTH} 个字符`);
+      return;
+    }
     if (newPassword !== confirmPassword) {
       setError("两次输入的新密码不一致");
       return;
@@ -66,10 +71,14 @@ export function ChangePasswordRequiredPage() {
                   type="password"
                   autoComplete="new-password"
                   value={newPassword}
+                  minLength={MIN_PASSWORD_LENGTH}
+                  maxLength={MAX_PASSWORD_LENGTH}
                   onChange={(event) => setNewPassword(event.target.value)}
                   disabled={submitting}
                 />
-                <p className="text-xs text-muted-foreground">至少 10 个字符。</p>
+                <p className="text-xs text-muted-foreground">
+                  至少 {MIN_PASSWORD_LENGTH} 个字符，最多 {MAX_PASSWORD_LENGTH} 个字符。
+                </p>
               </div>
               <div className="space-y-2">
                 <Label htmlFor="required-confirm">确认新密码</Label>
@@ -78,6 +87,8 @@ export function ChangePasswordRequiredPage() {
                   type="password"
                   autoComplete="new-password"
                   value={confirmPassword}
+                  minLength={MIN_PASSWORD_LENGTH}
+                  maxLength={MAX_PASSWORD_LENGTH}
                   onChange={(event) => setConfirmPassword(event.target.value)}
                   disabled={submitting}
                 />
@@ -86,7 +97,12 @@ export function ChangePasswordRequiredPage() {
               <Button
                 type="submit"
                 className="w-full"
-                disabled={submitting || !currentPassword || !newPassword || !confirmPassword}
+                disabled={
+                  submitting ||
+                  !currentPassword ||
+                  newPassword.length < MIN_PASSWORD_LENGTH ||
+                  newPassword !== confirmPassword
+                }
               >
                 {submitting ? <Loader2 className="animate-spin" /> : <KeyRound />}
                 更新密码

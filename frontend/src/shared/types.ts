@@ -9,10 +9,14 @@ export interface Job {
   cost: number;
   error: string | null;
   pid: number | null;
+  created_by?: number | null;
+  cancelled_by?: number | null;
+  cancelled_at?: string | null;
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
   heartbeat_at?: string | null;
+  active_count?: number;
 }
 
 export interface Round {
@@ -32,10 +36,32 @@ export interface Round {
   cost_tokens: number;
   error: string | null;
   created_at: string;
+  archived_at?: string | null;
+  archived?: boolean;
   keywords: string;
   keyword_details?: { word: string; category: string | null; pages: number }[];
   summary?: { creators: number; leads: number; notes: number; note_hits: number; cost: number };
   job?: Job | null;
+}
+
+export interface RoundImpact {
+  round_id: number;
+  name: string;
+  archived_at?: string | null;
+  creators: number;
+  creators_reviewed: number;
+  creators_claimed: number;
+  notes: number;
+  note_hits: number;
+  leads: number;
+  leads_converted: number;
+  jobs: number;
+  jobs_active: number;
+  api_calls: number;
+  cost_tokens: number;
+  raw_files: number;
+  log_files: number;
+  can_purge: boolean;
 }
 
 export interface Creator {
@@ -69,6 +95,8 @@ export interface Creator {
   top_url: string;
   top_liked: number | null;
   source_keywords: string[];
+  source_labels: string[];
+  matched_keywords: string;
   source: string;
   remark: string;
   owner_user_id: number | null;
@@ -84,6 +112,7 @@ export interface Creator {
   ip_location: string;
   verify_info: string;
   fetched_at: string;
+  updated_at: string;
 }
 
 export interface Note {
@@ -129,6 +158,12 @@ export interface Lead {
   converted_platform: string;
   converted_user_id: string;
   converted_at: string | null;
+  matched_platform: string;
+  matched_user_id: string;
+  matched_round_id: number | null;
+  matched_round_name: string;
+  matched_at: string | null;
+  match_confidence: string;
 }
 
 export interface LeadRound {
@@ -136,6 +171,7 @@ export interface LeadRound {
   round_id: number;
   round_name: string;
   source_keywords: string;
+  source_labels: string;
   raw_title: string;
   data_round: string;
   top_note_id: string;
@@ -161,14 +197,49 @@ export interface LeadAttempt {
   cost: number;
   cost_native: number;
   cost_currency: string;
+  round_id: number | null;
   created_by: number | null;
   created_at: string;
+}
+
+export interface LeadMatchedCreator {
+  platform: string;
+  user_id: string;
+  nickname: string;
+  avatar: string;
+  fans: number | null;
+  profile_url: string;
 }
 
 export interface LeadDetail extends Lead {
   raw_json: Record<string, unknown>;
   rounds: LeadRound[];
   attempts: LeadAttempt[];
+  matched_creator?: LeadMatchedCreator | null;
+}
+
+export interface LeadCreateResponse extends LeadDetail {
+  created: boolean;
+  revived: boolean;
+  match_error?: string;
+}
+
+export interface LeadIdentityHealth {
+  account_index: boolean;
+  profile_index: boolean;
+  duplicate_account_groups: number;
+  duplicate_profile_groups: number;
+}
+
+export interface LeadMatchResult {
+  scanned: number;
+  matched: number;
+  updated: number;
+  ambiguous: number;
+  skipped: number;
+  attempts: number;
+  lead_ids: number[];
+  examples: { lead_id: number; user_id: string; confidence: string }[];
 }
 
 export interface LeadOwner {
@@ -260,6 +331,8 @@ export interface Settings {
   cache_days: number;
   xhs_cost: number;
   douyin_cost: number;
+  token_cny: number;
+  usd_cny: number;
   credentials_ok: boolean;
   providers: ProviderSettings[];
   platforms: PlatformSettings[];
@@ -320,14 +393,67 @@ export interface LeadMetrics {
 
 export interface DashboardData {
   counts: Counts;
-  recent_rounds: Round[];
   round?: Round;
+  recent_rounds?: Round[];
+  top_creators?: Creator[];
   tier_counts?: Record<string, number>;
   status_counts?: Record<string, number>;
-  top_creators?: Creator[];
   metrics?: DashboardMetrics;
   lead_metrics?: LeadMetrics;
 }
+
+export interface ActivityCalendarDay {
+  date: string;
+  collected: number;
+  processed: number;
+}
+
+export interface ActivityCalendarResponse {
+  days: number;
+  start: string;
+  end: string;
+  items: ActivityCalendarDay[];
+  totals: {
+    collected: number;
+    processed: number;
+  };
+}
+
+export interface ActionQueueItem {
+  key: string;
+  round_id: number;
+  round_name: string;
+  platform: string;
+  platform_label: string;
+  user_id: string;
+  nickname: string;
+  avatar: string;
+  fans: number | null;
+  fans_wan: string;
+  interaction: number | null;
+  tier: string;
+  sample_notes: number;
+  sample_interactions: number;
+  status: string;
+  status_label: string;
+  owner_user_id: number | null;
+  owner_username: string;
+  match_direction: string;
+  source_keywords: string[];
+  updated_at: string;
+}
+
+export interface ActionQueueCounts {
+  all: number;
+  pending: number;
+  unclaimed: number;
+}
+
+export interface ActionQueueResponse {
+  counts: ActionQueueCounts;
+  items: ActionQueueItem[];
+}
+
 
 export interface ApiCall {
   id: number;
@@ -363,6 +489,8 @@ export interface BatchUpdatePayload {
   match_direction?: string | null;
   tags_manual?: string | null;
   remark?: string | null;
+  set_owner?: boolean;
+  owner_user_id?: number | null;
 }
 
 export interface StatusDef {
@@ -415,6 +543,7 @@ export interface Facets {
   tiers: FacetItem[];
   directions: FacetItem[];
   sources: FacetItem[];
+  labels: FacetItem[];
 }
 
 export interface CreatorQuery {
@@ -426,10 +555,13 @@ export interface CreatorQuery {
   tiers: string[];
   directions: string[];
   sources: string[];
+  source_mode: "any" | "all";
+  labels: string[];
   owner: string;
   min_fans: string;
   max_fans: string;
   only_unenriched: boolean;
+  needs_action: boolean;
   sort: string;
   order: "asc" | "desc";
 }

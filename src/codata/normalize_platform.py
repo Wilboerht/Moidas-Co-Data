@@ -2,52 +2,70 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any
+from urllib.parse import quote
 
-from .normalize import as_int, first_dict, first_str, note_hashtags, utc_now
+from .normalize import as_int, as_optional_int, first_dict, first_str, note_hashtags, utc_now
 from .storage import unwrap_data
 
 
 def note_url(platform: str, note_id: str) -> str:
     if not note_id:
         return ""
+    value = quote(str(note_id), safe="")
     if platform == "douyin":
-        return f"https://www.douyin.com/video/{note_id}"
+        return f"https://www.douyin.com/video/{value}"
     if platform == "bilibili":
-        return f"https://www.bilibili.com/video/{note_id}"
+        return f"https://www.bilibili.com/video/{value}"
     if platform == "instagram":
-        return f"https://www.instagram.com/p/{note_id}/"
+        return f"https://www.instagram.com/p/{value}/"
     if platform == "zhihu":
         return ""
-    return f"https://www.xiaohongshu.com/explore/{note_id}"
+    return f"https://www.xiaohongshu.com/explore/{value}"
 
 
 def profile_url(platform: str, user_id: str) -> str:
     if not user_id:
         return ""
+    value = quote(str(user_id), safe="")
     if platform == "douyin":
-        return f"https://www.douyin.com/user/{user_id}"
+        return f"https://www.douyin.com/user/{value}"
     if platform == "bilibili":
-        return f"https://space.bilibili.com/{user_id}"
+        return f"https://space.bilibili.com/{value}"
     if platform == "instagram":
-        return f"https://www.instagram.com/{user_id}/"
+        return f"https://www.instagram.com/{value}/"
     if platform == "zhihu":
-        return f"https://www.zhihu.com/people/{user_id}"
-    return f"https://www.xiaohongshu.com/user/profile/{user_id}"
+        return f"https://www.zhihu.com/people/{value}"
+    return f"https://www.xiaohongshu.com/user/profile/{value}"
+
+
+def _epoch_seconds(stamp: int) -> int:
+    value = stamp
+    if value > 10**17:
+        value //= 10**9
+    elif value > 10**14:
+        value //= 10**6
+    elif value > 10**11:
+        value //= 10**3
+    return value
 
 
 def as_timestamp(value: Any) -> int | None:
     if value in (None, ""):
         return None
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        stamp = int(value)
-        return stamp // 1000 if stamp > 10_000_000_000 else stamp
+        return _epoch_seconds(int(value))
     text = str(value).strip()
     if not text:
         return None
+    if text.isdigit() and len(text) == 8 and text[:2] in {"19", "20"}:
+        try:
+            parsed = datetime.strptime(text, "%Y%m%d").replace(tzinfo=timezone.utc)
+            return int(parsed.timestamp())
+        except ValueError:
+            return None
     try:
-        stamp = int(float(text))
-        return stamp // 1000 if stamp > 10_000_000_000 else stamp
+        return _epoch_seconds(int(float(text)))
     except ValueError:
         pass
     normalized = text.replace("Z", "+00:00").replace("/", "-")
@@ -55,6 +73,7 @@ def as_timestamp(value: Any) -> int | None:
         lambda item: datetime.fromisoformat(item),
         lambda item: datetime.strptime(item, "%Y-%m-%d %H:%M:%S"),
         lambda item: datetime.strptime(item, "%Y-%m-%d"),
+        lambda item: datetime.strptime(item, "%Y%m%d"),
     ):
         try:
             parsed = parser(normalized)
@@ -63,6 +82,13 @@ def as_timestamp(value: Any) -> int | None:
             return int(parsed.timestamp())
         except ValueError:
             continue
+    return None
+
+
+def _first_present(mapping: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in mapping and mapping[key] is not None and mapping[key] != "":
+            return mapping[key]
     return None
 
 
@@ -397,50 +423,75 @@ def normalize_xhs_user(payload: Any, user_id: str = "") -> dict[str, Any]:
             merged.get("name"),
         ),
         "avatar": avatar,
-        "fans": as_int(
-            merged.get("fans")
-            or merged.get("fans_count")
-            or merged.get("fansCount")
-            or merged.get("follower_count")
-            or merged.get("accountFans")
+        "fans": as_optional_int(
+            _first_present(
+                merged, "fans", "fans_count", "fansCount", "follower_count", "accountFans"
+            )
         ),
-        "follows": as_int(
-            merged.get("follows")
-            or merged.get("follow_count")
-            or merged.get("following_count")
-            or merged.get("accountFollows")
+        "follows": as_optional_int(
+            _first_present(
+                merged, "follows", "follow_count", "following_count", "accountFollows"
+            )
         ),
-        "liked": as_int(
-            merged.get("liked")
-            or merged.get("liked_count")
-            or merged.get("like_count")
-            or merged.get("accountLikes")
+        "liked": as_optional_int(
+            _first_present(merged, "liked", "liked_count", "like_count", "accountLikes")
         ),
-        "collected": as_int(
-            merged.get("collected")
-            or merged.get("collected_count")
-            or merged.get("collect_count")
-            or merged.get("accountCollectes")
+        "collected": as_optional_int(
+            _first_present(
+                merged, "collected", "collected_count", "collect_count", "accountCollectes"
+            )
         ),
-        "posted": as_int(
-            merged.get("posted")
-            or merged.get("note_count")
-            or merged.get("post_count")
-            or merged.get("accountTotalWorks")
-            or merged.get("video_count")
+        "posted": as_optional_int(
+            _first_present(
+                merged,
+                "posted",
+                "note_count",
+                "post_count",
+                "accountTotalWorks",
+                "video_count",
+            )
         ),
-        "interaction": as_int(
-            merged.get("interaction")
-            or merged.get("liked")
-            or merged.get("liked_count")
-            or merged.get("like_count")
-            or merged.get("accountLikes")
-        )
-        + as_int(
-            merged.get("collected")
-            or merged.get("collected_count")
-            or merged.get("collect_count")
-            or merged.get("accountCollectes")
+        "interaction": (
+            (
+                as_optional_int(
+                    _first_present(
+                        merged,
+                        "interaction",
+                        "liked",
+                        "liked_count",
+                        "like_count",
+                        "accountLikes",
+                    )
+                )
+                or 0
+            )
+            + (
+                as_optional_int(
+                    _first_present(
+                        merged,
+                        "collected",
+                        "collected_count",
+                        "collect_count",
+                        "accountCollectes",
+                    )
+                )
+                or 0
+            )
+            if any(
+                as_optional_int(merged.get(key)) is not None
+                for key in (
+                    "interaction",
+                    "liked",
+                    "liked_count",
+                    "like_count",
+                    "accountLikes",
+                    "collected",
+                    "collected_count",
+                    "collect_count",
+                    "accountCollectes",
+                )
+            )
+            else None
         ),
         "desc": first_str(
             merged.get("desc"),
@@ -493,17 +544,18 @@ def normalize_douyin_user(payload: Any, user_id: str = "") -> dict[str, Any]:
         merged.get("unique_id"),
         merged.get("uniqueId"),
     )
-    liked = as_int(
-        merged.get("liked")
-        or merged.get("total_favorited")
-        or merged.get("totalFavorited")
-        or merged.get("like_count")
-        or merged.get("liked_count")
+    liked = as_optional_int(
+        _first_present(
+            merged,
+            "liked",
+            "total_favorited",
+            "totalFavorited",
+            "like_count",
+            "liked_count",
+        )
     )
-    collected = as_int(
-        merged.get("collected")
-        or merged.get("collect_count")
-        or merged.get("collected_count")
+    collected = as_optional_int(
+        _first_present(merged, "collected", "collect_count", "collected_count")
     )
     return {
         "platform": "douyin",
@@ -522,27 +574,24 @@ def normalize_douyin_user(payload: Any, user_id: str = "") -> dict[str, Any]:
             merged.get("name"),
         ),
         "avatar": _douyin_avatar(merged, data),
-        "fans": as_int(
-            merged.get("follower_count")
-            or merged.get("followerCount")
-            or merged.get("fans")
-            or merged.get("accountFans")
+        "fans": as_optional_int(
+            _first_present(
+                merged, "follower_count", "followerCount", "fans", "accountFans"
+            )
         ),
-        "follows": as_int(
-            merged.get("following_count")
-            or merged.get("followingCount")
-            or merged.get("follows")
-            or merged.get("accountFollows")
+        "follows": as_optional_int(
+            _first_present(
+                merged, "following_count", "followingCount", "follows", "accountFollows"
+            )
         ),
         "liked": liked,
         "collected": collected,
-        "posted": as_int(
-            merged.get("aweme_count")
-            or merged.get("awemeCount")
-            or merged.get("video_count")
-            or merged.get("accountTotalWorks")
+        "posted": as_optional_int(
+            _first_present(
+                merged, "aweme_count", "awemeCount", "video_count", "accountTotalWorks"
+            )
         ),
-        "interaction": liked + collected,
+        "interaction": None if liked is None and collected is None else (liked or 0) + (collected or 0),
         "desc": first_str(
             merged.get("signature"),
             merged.get("desc"),
@@ -572,21 +621,32 @@ def normalize_bilibili_user(payload: Any, user_id: str = "") -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("B站用户信息响应格式异常")
     user = _nested_user(payload)
-    merged = {**data, **user}
+    stat = data.get("stat") if isinstance(data.get("stat"), dict) else {}
+    merged = {**stat, **data, **user}
     resolved = first_str(user_id, merged.get("mid"), merged.get("user_id"), merged.get("id"))
-    liked = as_int(merged.get("like_count") or merged.get("liked") or merged.get("total_favorited"))
+    liked = as_optional_int(
+        _first_present(merged, "like_count", "liked", "total_favorited")
+    )
+    collected = None
+    interaction = liked
     return {
         "platform": "bilibili",
         "user_id": resolved,
         "red_id": "",
         "nickname": first_str(merged.get("name"), merged.get("nickname"), merged.get("uname")),
         "avatar": _avatar(merged, merged),
-        "fans": as_int(merged.get("follower_count") or merged.get("fans")),
-        "follows": as_int(merged.get("following_count") or merged.get("follows")),
+        "fans": as_optional_int(
+            _first_present(merged, "follower", "follower_count", "fans")
+        ),
+        "follows": as_optional_int(
+            _first_present(merged, "following", "following_count", "follows")
+        ),
         "liked": liked,
-        "collected": 0,
-        "posted": as_int(merged.get("video_count") or merged.get("posted")),
-        "interaction": liked,
+        "collected": collected,
+        "posted": as_optional_int(
+            _first_present(merged, "video", "video_count", "posted")
+        ),
+        "interaction": interaction,
         "desc": first_str(merged.get("bio"), merged.get("sign"), merged.get("description")),
         "tags_json": json.dumps([], ensure_ascii=False),
         "ip_location": "",
@@ -609,9 +669,11 @@ def normalize_zhihu_user(payload: Any, user_id: str = "") -> dict[str, Any]:
         merged.get("user_id"),
         merged.get("id"),
     )
-    answered = as_int(merged.get("answer_count"))
-    articles = as_int(merged.get("article_count"))
-    liked = as_int(merged.get("received_upvote_count") or merged.get("like_count"))
+    answered = as_optional_int(merged.get("answer_count"))
+    articles = as_optional_int(merged.get("article_count"))
+    liked = as_optional_int(
+        _first_present(merged, "received_upvote_count", "like_count")
+    )
     return {
         "platform": "zhihu",
         "user_id": resolved,
@@ -622,11 +684,17 @@ def normalize_zhihu_user(payload: Any, user_id: str = "") -> dict[str, Any]:
             merged.get("name"),
         ),
         "avatar": _avatar(merged, merged),
-        "fans": as_int(merged.get("author_follower_count") or merged.get("follower_count")),
-        "follows": as_int(merged.get("following_count")),
+        "fans": as_optional_int(
+            _first_present(merged, "author_follower_count", "follower_count")
+        ),
+        "follows": as_optional_int(
+            _first_present(merged, "following_count", "following")
+        ),
         "liked": liked,
-        "collected": 0,
-        "posted": answered + articles,
+        "collected": None,
+        "posted": None
+        if answered is None and articles is None
+        else (answered or 0) + (articles or 0),
         "interaction": liked,
         "desc": first_str(merged.get("author_bio"), merged.get("bio"), merged.get("description")),
         "tags_json": json.dumps([], ensure_ascii=False),
@@ -651,12 +719,18 @@ def normalize_instagram_user(payload: Any, user_id: str = "") -> dict[str, Any]:
         "red_id": "",
         "nickname": first_str(merged.get("display_name"), merged.get("name"), username),
         "avatar": _avatar(merged, merged),
-        "fans": as_int(merged.get("follower_count") or merged.get("followers")),
-        "follows": as_int(merged.get("following_count") or merged.get("follows")),
-        "liked": 0,
-        "collected": 0,
-        "posted": as_int(merged.get("post_count") or merged.get("media_count")),
-        "interaction": 0,
+        "fans": as_optional_int(
+            _first_present(merged, "follower_count", "followers")
+        ),
+        "follows": as_optional_int(
+            _first_present(merged, "following_count", "follows")
+        ),
+        "liked": None,
+        "collected": None,
+        "posted": as_optional_int(
+            _first_present(merged, "post_count", "media_count")
+        ),
+        "interaction": None,
         "desc": first_str(merged.get("bio"), merged.get("biography"), merged.get("description")),
         "tags_json": json.dumps([], ensure_ascii=False),
         "ip_location": "",
@@ -676,4 +750,6 @@ def normalize_user_platform(platform: str, payload: Any, user_id: str = "") -> d
         return normalize_zhihu_user(payload, user_id)
     if platform == "instagram":
         return normalize_instagram_user(payload, user_id)
-    return normalize_xhs_user(payload, user_id)
+    if platform == "xhs":
+        return normalize_xhs_user(payload, user_id)
+    raise ValueError(f"不支持的平台: {platform}")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ from codata import api_server
 from codata.auth import hash_password
 from codata.config import Settings
 from codata.db import Database
+from codata.normalize import utc_now
 
 
 class AuthApiTests(unittest.TestCase):
@@ -91,6 +93,41 @@ class AuthApiTests(unittest.TestCase):
             200,
         )
 
+    def test_weak_password_is_rejected(self) -> None:
+        login = self.login("admin-test", "admin-password-123")
+        headers = {"X-CSRF-Token": login["csrf_token"]}
+        response = self.client.post(
+            "/api/users",
+            json={"username": "weak-user", "password": "12345", "role": "member"},
+            headers=headers,
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+
+    def test_six_character_password_is_allowed(self) -> None:
+        login = self.login("admin-test", "admin-password-123")
+        headers = {"X-CSRF-Token": login["csrf_token"]}
+        response = self.client.post(
+            "/api/users",
+            json={"username": "short-pass", "password": "123456", "role": "member"},
+            headers=headers,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["must_change_password"])
+
+    def test_password_change_rejects_current_password(self) -> None:
+        login = self.login("member-test", "member-password-123")
+        headers = {"X-CSRF-Token": login["csrf_token"]}
+        response = self.client.post(
+            "/api/auth/change-password",
+            json={
+                "current_password": "member-password-123",
+                "new_password": "member-password-123",
+            },
+            headers=headers,
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn("不能与当前密码相同", response.json()["detail"])
+        self.login("member-test", "member-password-123")
 
     def test_password_change_keeps_current_session_and_updates_password(self) -> None:
         login = self.login("member-test", "member-password-123")
@@ -172,6 +209,144 @@ class AuthApiTests(unittest.TestCase):
             headers=limited_headers,
         )
         self.assertEqual(allowed.status_code, 200, allowed.text)
+
+    def test_self_service_restrictions(self) -> None:
+        login = self.login("admin-test", "admin-password-123")
+        headers = {"X-CSRF-Token": login["csrf_token"]}
+        users = self.client.get("/api/users").json()
+        admin_id = next(user["id"] for user in users if user["username"] == "admin-test")
+        reset = self.client.post(
+            f"/api/users/{admin_id}/reset-password",
+            json={"new_password": "123456"},
+            headers=headers,
+        )
+        self.assertEqual(reset.status_code, 400, reset.text)
+        created = self.client.post(
+            "/api/users",
+            json={
+                "username": "admin-two",
+                "password": "admin-two-password",
+                "role": "admin",
+            },
+            headers=headers,
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        demote = self.client.patch(
+            f"/api/users/{admin_id}", json={"role": "member"}, headers=headers
+        )
+        self.assertEqual(demote.status_code, 400, demote.text)
+        self.assertIn("不能修改自己的角色", demote.json()["detail"])
+
+    def test_revoke_own_sessions_keeps_current(self) -> None:
+        login = self.login("admin-test", "admin-password-123")
+        headers = {"X-CSRF-Token": login["csrf_token"]}
+        users = self.client.get("/api/users").json()
+        admin_id = next(user["id"] for user in users if user["username"] == "admin-test")
+        other = TestClient(api_server.app, base_url="http://127.0.0.1")
+        other.post(
+            "/api/auth/login",
+            json={"username": "admin-test", "password": "admin-password-123"},
+        )
+        response = self.client.post(
+            f"/api/users/{admin_id}/revoke-sessions", headers=headers
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertTrue(payload["kept_current"])
+        self.assertGreaterEqual(payload["revoked"], 1)
+        self.assertEqual(self.client.get("/api/rounds").status_code, 200)
+        self.assertEqual(other.get("/api/rounds").status_code, 401)
+
+    def test_can_collect_change_applies_without_relogin_and_is_audited(self) -> None:
+        admin = self.login("admin-test", "admin-password-123")
+        admin_headers = {"X-CSRF-Token": admin["csrf_token"]}
+        users = self.client.get("/api/users").json()
+        member_id = next(user["id"] for user in users if user["username"] == "member-test")
+        member_client = TestClient(api_server.app, base_url="http://127.0.0.1")
+        member = member_client.post(
+            "/api/auth/login",
+            json={"username": "member-test", "password": "member-password-123"},
+        ).json()
+        member_headers = {"X-CSRF-Token": member["csrf_token"]}
+        denied = member_client.post(
+            "/api/rounds",
+            json={"keywords": ["测试"], "pages": 1, "max_creators": 1, "start": False},
+            headers=member_headers,
+        )
+        self.assertEqual(denied.status_code, 403, denied.text)
+        updated = self.client.patch(
+            f"/api/users/{member_id}", json={"can_collect": True}, headers=admin_headers
+        )
+        self.assertEqual(updated.status_code, 200, updated.text)
+        allowed = member_client.post(
+            "/api/rounds",
+            json={"keywords": ["测试"], "pages": 1, "max_creators": 1, "start": False},
+            headers=member_headers,
+        )
+        self.assertEqual(allowed.status_code, 200, allowed.text)
+        with Database(self.settings.output_dir) as db:
+            row = db._conn.execute(
+                "SELECT details FROM audit_log WHERE action = 'user.updated' "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        details = json.loads(row["details"])
+        self.assertEqual(
+            details["changes"]["can_collect"], {"from": False, "to": True}
+        )
+
+    def test_reset_password_revokes_sessions_and_forces_change(self) -> None:
+        admin = self.login("admin-test", "admin-password-123")
+        admin_headers = {"X-CSRF-Token": admin["csrf_token"]}
+        users = self.client.get("/api/users").json()
+        member_id = next(user["id"] for user in users if user["username"] == "member-test")
+        member_client = TestClient(api_server.app, base_url="http://127.0.0.1")
+        member_client.post(
+            "/api/auth/login",
+            json={"username": "member-test", "password": "member-password-123"},
+        )
+        reset = self.client.post(
+            f"/api/users/{member_id}/reset-password",
+            json={"new_password": "new-pass"},
+            headers=admin_headers,
+        )
+        self.assertEqual(reset.status_code, 200, reset.text)
+        self.assertEqual(member_client.get("/api/rounds").status_code, 401)
+        relogin = member_client.post(
+            "/api/auth/login",
+            json={"username": "member-test", "password": "new-pass"},
+        ).json()
+        self.assertTrue(relogin["user"]["must_change_password"])
+        headers = {"X-CSRF-Token": relogin["csrf_token"]}
+        self.assertEqual(member_client.get("/api/rounds").status_code, 403)
+        self.assertEqual(
+            member_client.post(
+                "/api/auth/change-password",
+                json={"current_password": "new-pass", "new_password": "new-pass-2"},
+                headers=headers,
+            ).status_code,
+            200,
+        )
+
+    def test_prune_maintenance_caps_sessions(self) -> None:
+        now = utc_now()
+        with Database(self.settings.output_dir) as db:
+            user = db.get_user_by_username("member-test")
+            for index in range(25):
+                db._conn.execute(
+                    """
+                    INSERT INTO sessions
+                    (token_hash, user_id, csrf_token, created_at, expires_at, last_seen)
+                    VALUES (?, ?, 'csrf', ?, '2999-01-01T00:00:00+00:00', ?)
+                    """,
+                    (f"cap-token-{index}", user["id"], now, now),
+                )
+            db._conn.commit()
+            result = db.prune_maintenance()
+            remaining = db._conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE user_id = ?", (user["id"],)
+            ).fetchone()[0]
+        self.assertEqual(remaining, 20)
+        self.assertEqual(result["sessions_overflow"], 5)
 
     def test_last_admin_cannot_be_disabled_or_demoted(self) -> None:
         login = self.login("admin-test", "admin-password-123")

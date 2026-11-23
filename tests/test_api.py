@@ -138,6 +138,9 @@ class ApiTests(unittest.TestCase):
             "top_title",
             "top_url",
             "top_liked",
+            "source_keywords",
+            "source_labels",
+            "matched_keywords",
             "source",
             "platform_label",
             "owner_user_id",
@@ -151,6 +154,31 @@ class ApiTests(unittest.TestCase):
             "sample_comments",
         ):
             self.assertIn(field, creator)
+
+        any_keyword = self.client.get(
+            f"/api/rounds/{self.round_id}/creators",
+            params={"source": "咖啡,手冲"},
+        ).json()
+        self.assertEqual(any_keyword["total"], 1)
+        all_keywords = self.client.get(
+            f"/api/rounds/{self.round_id}/creators",
+            params={"source": "咖啡,手冲", "source_mode": "all"},
+        ).json()
+        self.assertEqual(all_keywords["total"], 0)
+        any_export = self.client.get(
+            f"/api/rounds/{self.round_id}/export",
+            params={"format": "csv", "source": "咖啡,手冲"},
+        )
+        self.assertEqual(
+            len([line for line in any_export.text.splitlines() if line.strip()]), 2
+        )
+        all_export = self.client.get(
+            f"/api/rounds/{self.round_id}/export",
+            params={"format": "csv", "source": "咖啡,手冲", "source_mode": "all"},
+        )
+        self.assertEqual(
+            len([line for line in all_export.text.splitlines() if line.strip()]), 1
+        )
 
         detail = self.client.get(
             f"/api/rounds/{self.round_id}/creators/xhs/u1"
@@ -175,6 +203,42 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(batch.status_code, 200)
         self.assertEqual(batch.json()["changed"], 1)
 
+    def test_source_label_filter_and_search(self) -> None:
+        with Database(self.settings.output_dir) as db:
+            with db._conn:
+                db._conn.execute(
+                    "UPDATE creator_rounds SET source_labels = ? "
+                    "WHERE round_id = ? AND platform = 'xhs' AND user_id = 'u1'",
+                    (json.dumps(["投放A", "来源"], ensure_ascii=False), self.round_id),
+                )
+            db.rebuild_search_index()
+
+        facets = self.client.get(
+            f"/api/rounds/{self.round_id}/facets"
+        ).json()
+        self.assertIn(
+            "投放A", {item["value"] for item in facets["labels"]}
+        )
+        filtered = self.client.get(
+            f"/api/rounds/{self.round_id}/creators",
+            params={"label": "投放A"},
+        ).json()
+        self.assertEqual(filtered["total"], 1)
+        all_filtered = self.client.get(
+            "/api/creators", params={"label": "投放A"}
+        ).json()
+        self.assertEqual(all_filtered["total"], 1)
+        searched = self.client.get(
+            f"/api/rounds/{self.round_id}/creators",
+            params={"search": "投放A"},
+        ).json()
+        self.assertEqual(searched["total"], 1)
+        short_search = self.client.get(
+            f"/api/rounds/{self.round_id}/creators",
+            params={"search": "来源"},
+        ).json()
+        self.assertEqual(short_search["total"], 1)
+
     def test_creator_claim_and_release(self) -> None:
         url = f"/api/rounds/{self.round_id}/creators/xhs/u1"
         claimed = self.client.post(f"{url}/claim")
@@ -196,7 +260,7 @@ class ApiTests(unittest.TestCase):
             f"/api/rounds/{self.round_id}/export?format=csv&owner={self.user_id}"
         )
         text = claimed_export.content.decode("utf-8-sig")
-        self.assertIn("经手人", text)
+        self.assertIn("负责人", text)
         self.assertEqual(len([line for line in text.splitlines() if line.strip()]), 2)
         unassigned_export = self.client.get(
             f"/api/rounds/{self.round_id}/export?format=csv&owner=unassigned"
@@ -320,6 +384,102 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(converted.json()["lead"]["status"], "converted")
         self.assertEqual(converted.json()["creator"]["user_id"], "u1")
 
+    def test_lead_dedup_and_auto_match(self) -> None:
+        first = self.client.post(
+            "/api/leads",
+            json={
+                "platform": "xhs",
+                "nickname": "线索昵称",
+                "account_id": "u1",
+                "source": "manual",
+            },
+        )
+        self.assertEqual(first.status_code, 200, first.text)
+        payload = first.json()
+        self.assertTrue(payload["created"])
+        self.assertEqual(payload["status"], "unverified")
+        self.assertEqual(payload["matched_user_id"], "u1")
+        self.assertEqual(payload["matched_round_id"], self.round_id)
+        self.assertEqual(payload["nickname"], "咖啡师")
+        lead_id = payload["id"]
+
+        second = self.client.post(
+            "/api/leads",
+            json={
+                "platform": "xhs",
+                "nickname": "另一个昵称",
+                "account_id": "u1",
+                "source": "manual",
+            },
+        )
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertFalse(second.json()["created"])
+        self.assertEqual(second.json()["id"], lead_id)
+
+        bulk = self.client.post(
+            "/api/leads/bulk",
+            json={
+                "items": [
+                    {
+                        "platform": "xhs",
+                        "nickname": "重复线索",
+                        "account_id": "u1",
+                        "source": "manual",
+                    },
+                    {
+                        "platform": "xhs",
+                        "nickname": "新线索",
+                        "account_id": "missing-user",
+                        "source": "manual",
+                    },
+                ]
+            },
+        )
+        self.assertEqual(bulk.status_code, 200, bulk.text)
+        self.assertEqual(bulk.json()["created"], 1)
+        self.assertEqual(bulk.json()["existing"], 1)
+        self.assertEqual(bulk.json()["existing_ids"], [lead_id])
+
+        rematch = self.client.post(f"/api/leads/{lead_id}/match")
+        self.assertEqual(rematch.status_code, 200, rematch.text)
+        self.assertEqual(rematch.json()["match"]["matched"], 1)
+
+        health = self.client.get("/api/leads/identity-health")
+        self.assertEqual(health.status_code, 200, health.text)
+        self.assertTrue(health.json()["account_index"])
+        self.assertEqual(health.json()["duplicate_account_groups"], 0)
+
+        first_revive = self.client.post(
+            "/api/leads",
+            json={
+                "platform": "xhs",
+                "nickname": "待恢复线索",
+                "account_id": "revive-user",
+                "source": "manual",
+            },
+        )
+        self.assertTrue(first_revive.json()["created"])
+        revive_id = first_revive.json()["id"]
+        discarded = self.client.patch(
+            f"/api/leads/{revive_id}", json={"status": "discarded"}
+        )
+        self.assertEqual(discarded.status_code, 200, discarded.text)
+        revived = self.client.post(
+            "/api/leads",
+            json={
+                "platform": "xhs",
+                "nickname": "恢复后的线索",
+                "account_id": "revive-user",
+                "source": "customer",
+            },
+        )
+        self.assertEqual(revived.status_code, 200, revived.text)
+        self.assertFalse(revived.json()["created"])
+        self.assertTrue(revived.json()["revived"])
+        self.assertEqual(revived.json()["id"], revive_id)
+        self.assertEqual(revived.json()["status"], "unverified")
+        self.assertEqual(revived.json()["nickname"], "恢复后的线索")
+
     def test_active_job_endpoint(self) -> None:
         with Database(self.settings.output_dir) as db:
             job_id = db.claim_job(self.round_id)
@@ -327,10 +487,17 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["id"], job_id)
         self.assertEqual(response.json()["round_id"], self.round_id)
+        self.assertEqual(response.json()["active_count"], 1)
+        latest = self.client.get("/api/jobs/latest")
+        self.assertEqual(latest.status_code, 200)
+        self.assertEqual(latest.json()["id"], job_id)
         cancelled = self.client.post(f"/api/jobs/{job_id}/cancel")
         self.assertEqual(cancelled.status_code, 200, cancelled.text)
-        self.assertEqual(cancelled.json()["status"], "failed")
+        self.assertEqual(cancelled.json()["status"], "cancelled")
         self.assertIsNone(self.client.get("/api/jobs/active").json())
+        latest = self.client.get("/api/jobs/latest").json()
+        self.assertEqual(latest["status"], "cancelled")
+        self.assertEqual(latest["active_count"], 0)
 
     def test_pagination_facets_and_meta(self) -> None:
         page = self.client.get(
@@ -347,6 +514,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(facets["platforms"][0]["value"], "xhs")
         self.assertIn("statuses", facets)
         self.assertIn("tiers", facets)
+        self.assertIn("labels", facets)
 
         meta = self.client.get("/api/meta").json()
         codes = {item["code"] for item in meta["statuses"]}
@@ -387,7 +555,30 @@ class ApiTests(unittest.TestCase):
         all_dashboard = self.client.get("/api/dashboard").json()
         self.assertIsNone(all_dashboard["round"])
         self.assertEqual(all_dashboard["metrics"]["creators"], 1)
-        self.assertEqual(len(all_dashboard["top_creators"]), 1)
+
+        queue = self.client.get(
+            f"/api/dashboard/queue?round_id={self.round_id}&scope=all"
+        ).json()
+        self.assertEqual(queue["counts"]["all"], 1)
+        self.assertEqual(queue["counts"]["pending"], 1)
+        self.assertEqual(queue["counts"]["unclaimed"], 1)
+        self.assertEqual(len(queue["items"]), 1)
+        self.assertEqual(queue["items"][0]["nickname"], "咖啡师")
+
+        efficiency = self.client.get("/api/dashboard/efficiency?limit=6").json()
+        self.assertEqual(len(efficiency["items"]), 1)
+        self.assertEqual(efficiency["items"][0]["round_id"], self.round_id)
+        self.assertEqual(efficiency["items"][0]["creators"], 1)
+        self.assertEqual(efficiency["items"][0]["adopted"], 0)
+        self.assertEqual(efficiency["totals"]["creators"], 1)
+
+        activity = self.client.get(
+            "/api/dashboard/activity?days=30&tz_offset=480"
+        ).json()
+        self.assertEqual(activity["days"], 30)
+        self.assertEqual(len(activity["items"]), 30)
+        self.assertGreaterEqual(activity["totals"]["collected"], 1)
+        self.assertGreaterEqual(activity["totals"]["processed"], 0)
 
         csv_response = self.client.get(f"/api/rounds/{self.round_id}/export?format=csv")
         self.assertEqual(csv_response.status_code, 200)
@@ -399,6 +590,213 @@ class ApiTests(unittest.TestCase):
         xlsx_response = self.client.get(f"/api/rounds/{self.round_id}/export?format=xlsx")
         self.assertEqual(xlsx_response.status_code, 200)
         self.assertGreater(len(xlsx_response.content), 100)
+
+    def test_review_visibility_and_queue_filters(self) -> None:
+        with Database(self.settings.output_dir) as db:
+            db.create_user("test-member", hash_password("test-password-123"), role="member")
+
+        def login_as(username: str) -> int:
+            self.client.cookies.clear()
+            response = self.client.post(
+                "/api/auth/login",
+                json={"username": username, "password": "test-password-123"},
+            )
+            self.assertEqual(response.status_code, 200)
+            self.client.headers.update({"X-CSRF-Token": response.json()["csrf_token"]})
+            return int(response.json()["user"]["id"])
+
+        creator_url = f"/api/rounds/{self.round_id}/creators/xhs/u1"
+
+        member_id = login_as("test-member")
+        self.assertEqual(self.client.post(f"{creator_url}/claim").status_code, 200)
+
+        login_as("test-admin")
+        admin_actionable = self.client.get(
+            f"/api/rounds/{self.round_id}/creators?platform=xhs&needs_action=true"
+        ).json()
+        self.assertEqual(admin_actionable["total"], 0)
+        login_as("test-member")
+        member_actionable = self.client.get(
+            f"/api/rounds/{self.round_id}/creators?platform=xhs&needs_action=true"
+        ).json()
+        self.assertEqual(member_actionable["total"], 1)
+        login_as("test-admin")
+        personal_queue = self.client.get(
+            f"/api/dashboard/queue?round_id={self.round_id}&scope=all"
+        ).json()
+        self.assertEqual(personal_queue["counts"]["all"], 0)
+        team_queue = self.client.get(
+            f"/api/dashboard/queue?round_id={self.round_id}&scope=all&include_others=true"
+        ).json()
+        self.assertEqual(team_queue["counts"]["all"], 1)
+        ratio_queue = self.client.get(
+            f"/api/dashboard/queue?round_id={self.round_id}&scope=all&include_others=true&sort=ratio"
+        ).json()
+        self.assertEqual(ratio_queue["counts"]["all"], 1)
+        self.assertEqual(self.client.post(f"{creator_url}/release").status_code, 200)
+        self.assertEqual(self.client.post(f"{creator_url}/claim").status_code, 200)
+
+        login_as("test-member")
+        shared_review = self.client.patch(f"{creator_url}", json={"status": "shortlisted"})
+        self.assertEqual(shared_review.status_code, 200)
+        self.assertEqual(shared_review.json()["owner_user_id"], self.user_id)
+
+        login_as("test-admin")
+        self.assertEqual(self.client.post(f"{creator_url}/release").status_code, 200)
+
+        login_as("test-member")
+        unclaimed_review = self.client.patch(f"{creator_url}", json={"status": "shortlisted"})
+        self.assertEqual(unclaimed_review.status_code, 200)
+        self.assertEqual(unclaimed_review.json()["owner_user_id"], member_id)
+        actionable = self.client.get(
+            f"/api/rounds/{self.round_id}/creators?platform=xhs&needs_action=true&sort=sample_average"
+        ).json()
+        self.assertEqual(actionable["total"], 0)
+
+        login_as("test-admin")
+        self.assertEqual(self.client.post(f"{creator_url}/release").status_code, 200)
+        current = self.client.get(
+            f"/api/dashboard/queue?round_id={self.round_id}&scope=all&include_others=true"
+        ).json()["items"][0]["updated_at"]
+        first = self.client.patch(
+            f"{creator_url}",
+            json={
+                "status": "adopted",
+                "expected_updated_at": current,
+                "expected_status": "shortlisted",
+            },
+        )
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json()["owner_user_id"], self.user_id)
+        stale = self.client.patch(
+            f"{creator_url}",
+            json={
+                "status": "rejected",
+                "expected_updated_at": current,
+                "expected_status": "shortlisted",
+            },
+        )
+        self.assertEqual(stale.status_code, 409)
+
+    def test_creator_owner_transfer_permissions(self) -> None:
+        with Database(self.settings.output_dir) as db:
+            member_a = db.create_user("member-a", hash_password("test-password-123"), role="member")
+            member_b = db.create_user("member-b", hash_password("test-password-123"), role="member")
+
+        def login_as(username: str) -> int:
+            self.client.cookies.clear()
+            response = self.client.post(
+                "/api/auth/login",
+                json={"username": username, "password": "test-password-123"},
+            )
+            self.assertEqual(response.status_code, 200)
+            self.client.headers.update({"X-CSRF-Token": response.json()["csrf_token"]})
+            return int(response.json()["user"]["id"])
+
+        creator_url = f"/api/rounds/{self.round_id}/creators/xhs/u1"
+
+        login_as("member-a")
+        unclaimed_transfer = self.client.post(
+            f"{creator_url}/assign", json={"owner_user_id": member_b}
+        )
+        self.assertEqual(unclaimed_transfer.status_code, 403)
+
+        auto_claimed = self.client.patch(f"{creator_url}", json={"status": "shortlisted"})
+        self.assertEqual(auto_claimed.status_code, 200)
+        self.assertEqual(auto_claimed.json()["owner_user_id"], member_a)
+
+        transferred = self.client.post(
+            f"{creator_url}/assign", json={"owner_user_id": member_b}
+        )
+        self.assertEqual(transferred.status_code, 200)
+        self.assertEqual(transferred.json()["owner_user_id"], member_b)
+
+        forbidden = self.client.post(
+            f"{creator_url}/assign", json={"owner_user_id": member_a}
+        )
+        self.assertEqual(forbidden.status_code, 403)
+
+        login_as("test-admin")
+        reassigned = self.client.post(
+            f"{creator_url}/assign", json={"owner_user_id": member_a}
+        )
+        self.assertEqual(reassigned.status_code, 200)
+        self.assertEqual(reassigned.json()["owner_user_id"], member_a)
+        released = self.client.post(f"{creator_url}/assign", json={"owner_user_id": None})
+        self.assertEqual(released.status_code, 200)
+        self.assertIsNone(released.json()["owner_user_id"])
+
+        owners = self.client.get("/api/creators/owners").json()
+        usernames = {owner["username"] for owner in owners}
+        self.assertIn("member-a", usernames)
+        self.assertIn("member-b", usernames)
+        self.assertIn("test-admin", usernames)
+
+        batch_items = [{"platform": "xhs", "user_id": "u1"}]
+        login_as("member-a")
+        forbidden_batch = self.client.post(
+            f"/api/rounds/{self.round_id}/creators/batch",
+            json={
+                "items": batch_items,
+                "set_owner": True,
+                "owner_user_id": member_b,
+            },
+        )
+        self.assertEqual(forbidden_batch.status_code, 403)
+
+        login_as("test-admin")
+        batch_assigned = self.client.post(
+            f"/api/rounds/{self.round_id}/creators/batch",
+            json={
+                "items": batch_items,
+                "set_owner": True,
+                "owner_user_id": member_b,
+            },
+        )
+        self.assertEqual(batch_assigned.status_code, 200)
+        self.assertEqual(batch_assigned.json()["changed"], 1)
+        detail = self.client.get(creator_url).json()
+        self.assertEqual(detail["owner_user_id"], member_b)
+
+        batch_released = self.client.post(
+            f"/api/rounds/{self.round_id}/creators/batch",
+            json={
+                "items": batch_items,
+                "set_owner": True,
+                "owner_user_id": None,
+            },
+        )
+        self.assertEqual(batch_released.status_code, 200)
+        self.assertIsNone(self.client.get(creator_url).json()["owner_user_id"])
+
+    def test_follow_up_persists_across_new_rounds_and_profile_updates(self) -> None:
+        creator_url = f"/api/rounds/{self.round_id}/creators/xhs/u1"
+        claimed = self.client.patch(f"{creator_url}", json={"status": "shortlisted"})
+        self.assertEqual(claimed.status_code, 200)
+        self.assertEqual(claimed.json()["owner_user_id"], self.user_id)
+
+        with Database(self.settings.output_dir) as db:
+            new_round = db.create_round(
+                ["咖啡"],
+                pages=1,
+                max_creators=None,
+                name="FOLLOW-UP-NEW-ROUND",
+                category="咖啡",
+                categories={"咖啡": "咖啡"},
+            )
+            db.add_creator_round(new_round, "xhs", "u1")
+            db.upsert_creator(normalize_user_info(user_payload("u1", "咖啡师", fans=20000)))
+
+        new_detail = self.client.get(
+            f"/api/rounds/{new_round}/creators/xhs/u1"
+        ).json()
+        self.assertEqual(new_detail["owner_user_id"], self.user_id)
+
+        all_rows = self.client.get(
+            "/api/creators?platform=xhs&search=咖啡师"
+        ).json()["items"]
+        latest = next(row for row in all_rows if row["user_id"] == "u1")
+        self.assertEqual(latest["owner_user_id"], self.user_id)
 
     def test_create_round_without_start(self) -> None:
         response = self.client.post(
@@ -601,6 +999,81 @@ class ApiTests(unittest.TestCase):
                 os.environ.pop("DATAFLOW_TOKEN", None)
             else:
                 os.environ["DATAFLOW_TOKEN"] = old_token
+
+    def test_round_archive_and_safe_purge(self) -> None:
+        impact = self.client.get(f"/api/rounds/{self.round_id}/impact")
+        self.assertEqual(impact.status_code, 200, impact.text)
+        self.assertTrue(impact.json()["can_purge"])
+        archived = self.client.post(f"/api/rounds/{self.round_id}/archive")
+        self.assertEqual(archived.status_code, 200, archived.text)
+        self.assertTrue(archived.json()["archived"])
+        active = self.client.get("/api/rounds").json()
+        self.assertFalse(any(item["id"] == self.round_id for item in active))
+        all_rounds = self.client.get("/api/rounds?include_archived=true").json()
+        self.assertTrue(any(item["id"] == self.round_id for item in all_rounds))
+        restored = self.client.post(f"/api/rounds/{self.round_id}/restore")
+        self.assertEqual(restored.status_code, 200)
+        self.assertFalse(restored.json()["archived"])
+
+        wrong_name = self.client.request(
+            "DELETE",
+            f"/api/rounds/{self.round_id}",
+            json={"confirm_name": "wrong"},
+        )
+        self.assertEqual(wrong_name.status_code, 400)
+        deleted = self.client.request(
+            "DELETE",
+            f"/api/rounds/{self.round_id}",
+            json={"confirm_name": "API-TEST"},
+        )
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertIn("backup", deleted.json())
+        self.assertEqual(self.client.get(f"/api/rounds/{self.round_id}").status_code, 404)
+
+    def test_round_with_leads_cannot_be_purged(self) -> None:
+        lead = self.client.post(
+            "/api/leads",
+            json={
+                "platform": "xhs",
+                "nickname": "保留线索",
+                "source_round_id": self.round_id,
+            },
+        )
+        self.assertEqual(lead.status_code, 200, lead.text)
+        impact = self.client.get(f"/api/rounds/{self.round_id}/impact").json()
+        self.assertFalse(impact["can_purge"])
+        response = self.client.request(
+            "DELETE",
+            f"/api/rounds/{self.round_id}",
+            json={"confirm_name": "API-TEST"},
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_invalid_owner_and_expected_status_are_rejected(self) -> None:
+        self.assertEqual(self.client.get("/api/creators?owner=abc").status_code, 400)
+        self.assertEqual(self.client.get("/api/leads?owner=abc").status_code, 400)
+        response = self.client.patch(
+            f"/api/rounds/{self.round_id}/creators/xhs/u1",
+            json={"status": "shortlisted", "expected_status": "bogus"},
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_member_without_collection_cannot_mutate_keywords(self) -> None:
+        with Database(self.settings.output_dir) as db:
+            db.create_user(
+                "viewer-test",
+                hash_password("viewer-password-123"),
+                role="member",
+                can_collect=False,
+            )
+        login = self.client.post(
+            "/api/auth/login",
+            json={"username": "viewer-test", "password": "viewer-password-123"},
+        )
+        self.assertEqual(login.status_code, 200, login.text)
+        self.client.headers.update({"X-CSRF-Token": login.json()["csrf_token"]})
+        response = self.client.post("/api/keywords", json={"word": "越权关键词"})
+        self.assertEqual(response.status_code, 403)
 
 
 if __name__ == "__main__":

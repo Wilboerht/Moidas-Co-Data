@@ -10,10 +10,11 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from .api import DOUYIN_COST, XHS_COST, DataFlowAPI
+from .api import XHS_COST, DataFlowAPI
 from .client import DataFlowClient, DataFlowError
 from .config import load_settings
 from .db import Database
+from .matching import match_round_leads
 from .normalize import (
     as_int,
     normalize_search_item,
@@ -316,13 +317,15 @@ def cmd_round_delete(settings: Any, args: argparse.Namespace) -> None:
         _out("删除轮次会移除该轮达人、笔记关联、任务记录；确认请加 --yes")
         return
     with Database(settings.output_dir) as db:
+        _out(f"已备份: {db.backup(f'round-{args.round_id}-cli-delete')}")
         try:
-            result = db.delete_round(args.round_id)
+            result = db.delete_round(args.round_id, force=args.force)
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
     _out(
         f"已删除轮次 #{result['id']} {result['name']}："
         f"达人行 {result['creator_rounds']}、笔记关联 {result['note_hits']}，"
+        f"解绑线索 {result.get('lead_links', 0)} 条，"
         f"清理孤立达人 {result['orphan_creators']} 个、笔记 {result['orphan_notes']} 条"
     )
 
@@ -551,7 +554,8 @@ def cmd_import_excel(settings: Any, args: argparse.Namespace) -> None:
                         "round": {
                             "platform": platform,
                             "user_id": user_id,
-                            "source_keywords": json.dumps([source], ensure_ascii=False),
+                            "source_keywords": "[]",
+                            "source_labels": json.dumps([source], ensure_ascii=False),
                             "sample_notes": 0,
                             "sample_likes": 0,
                             "sample_collected": 0,
@@ -574,9 +578,15 @@ def cmd_import_excel(settings: Any, args: argparse.Namespace) -> None:
 
         db.import_creator_rows(round_id, items)
         db.update_round(round_id, status="done", finished_at=utc_now(), error=None)
+        matched = 0
+        if getattr(settings, "lead_match_enabled", True):
+            try:
+                matched = int(match_round_leads(db, round_id).get("matched") or 0)
+            except Exception as exc:
+                _out(f"线索匹配失败：{exc}")
         _out(
             f"Excel 导入完成：轮次 #{round_id} {round_name}，共 {len(items)} 条；"
-            f"有账号ID {with_id} 条，有粉丝数据 {enriched} 条"
+            f"有账号ID {with_id} 条，有粉丝数据 {enriched} 条；匹配线索 {matched} 条"
         )
         _out("打开面板：uv run codata-panel")
 
@@ -619,6 +629,11 @@ def build_parser() -> argparse.ArgumentParser:
     round_delete = round_sub.add_parser("delete", help="删除轮次及其达人/笔记关联")
     round_delete.add_argument("round_id", type=int)
     round_delete.add_argument("--yes", action="store_true", help="确认删除")
+    round_delete.add_argument(
+        "--force",
+        action="store_true",
+        help="即使轮次关联线索也强制删除（会先自动备份数据库）",
+    )
 
     round_run = round_sub.add_parser("run", help="运行轮次")
     round_run.add_argument("round_id", type=int)

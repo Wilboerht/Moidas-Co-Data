@@ -1,4 +1,6 @@
 import type {
+  ActionQueueResponse,
+  ActivityCalendarResponse,
   ApiCall,
   AuthResponse,
   AuthUser,
@@ -8,18 +10,23 @@ import type {
   CreatorDetail,
   CreatorListResponse,
   CreatorQuery,
+  Counts,
   DashboardData,
   Facets,
   Job,
   Keyword,
   Lead,
+  LeadCreateResponse,
   LeadDetail,
   LeadFacets,
+  LeadIdentityHealth,
   LeadListResponse,
+  LeadMatchResult,
   LeadOwner,
   LeadQuery,
   Meta,
   Round,
+  RoundImpact,
   Settings,
 } from "./types";
 
@@ -111,27 +118,40 @@ export const api = {
       body: JSON.stringify({ new_password: newPassword }),
     }),
   revokeUserSessions: (userId: number) =>
-    request<{ ok: boolean }>(`/users/${userId}/revoke-sessions`, {
-      method: "POST",
-    }),
-  getRounds: () => request<Round[]>("/rounds"),
+    request<{ ok: boolean; revoked: number; kept_current: boolean }>(
+      `/users/${userId}/revoke-sessions`,
+      { method: "POST" },
+    ),
+  getRounds: (includeArchived = false) =>
+    request<Round[]>(`/rounds${includeArchived ? "?include_archived=true" : ""}`),
   getRound: (roundId: number) => request<Round>(`/rounds/${roundId}`),
+  archiveRound: (roundId: number) =>
+    request<Round>(`/rounds/${roundId}/archive`, { method: "POST" }),
+  restoreRound: (roundId: number) =>
+    request<Round>(`/rounds/${roundId}/restore`, { method: "POST" }),
+  getRoundImpact: (roundId: number) => request<RoundImpact>(`/rounds/${roundId}/impact`),
+  deleteRound: (roundId: number, confirmName: string) =>
+    request<{ id: number; backup: string; impact: RoundImpact }>(`/rounds/${roundId}`, {
+      method: "DELETE",
+      body: JSON.stringify({ confirm_name: confirmName }),
+    }),
   createRound: (payload: CreateRoundPayload) =>
     request<{ round: Round; job_id: number | null }>("/rounds", {
       method: "POST",
       body: JSON.stringify({ ...payload, start: true }),
     }),
-  runRound: (roundId: number, refreshUsers = false, force = false) =>
+  runRound: (roundId: number, refreshUsers = false, force = false, provider?: string) =>
     request<{ job_id: number; job: Job | null }>(`/rounds/${roundId}/run`, {
       method: "POST",
-      body: JSON.stringify({ refresh_users: refreshUsers, force }),
+      body: JSON.stringify({ refresh_users: refreshUsers, force, provider }),
     }),
   cancelJob: (jobId: number) =>
     request<Job | null>(`/jobs/${jobId}/cancel`, { method: "POST" }),
+  getLatestJob: () => request<Job | null>("/jobs/latest"),
   getMeta: () => request<Meta>("/meta"),
   getCreators: (roundId: number | null, query: CreatorQuery) => {
     const params = new URLSearchParams();
-    params.set("platform", query.platform);
+    if (query.platform) params.set("platform", query.platform);
     params.set("page", String(query.page));
     params.set("page_size", String(query.page_size));
     params.set("sort", query.sort);
@@ -141,10 +161,13 @@ export const api = {
     if (query.tiers.length) params.set("tier", query.tiers.join(","));
     if (query.directions.length) params.set("direction", query.directions.join(","));
     if (query.sources.length) params.set("source", query.sources.join(","));
+    if (query.sources.length && query.source_mode === "all") params.set("source_mode", "all");
+    if (query.labels.length) params.set("label", query.labels.join(","));
     if (query.owner) params.set("owner", query.owner);
     if (query.min_fans) params.set("min_fans", query.min_fans);
     if (query.max_fans) params.set("max_fans", query.max_fans);
     if (query.only_unenriched) params.set("only_unenriched", "true");
+    if (query.needs_action) params.set("needs_action", "true");
     const path = roundId === null ? "/creators" : `/rounds/${roundId}/creators`;
     return request<CreatorListResponse>(`${path}?${params.toString()}`);
   },
@@ -166,6 +189,8 @@ export const api = {
       match_direction?: string;
       tags_manual?: string;
       remark?: string;
+      expected_updated_at?: string;
+      expected_status?: string;
     },
   ) =>
     request<CreatorDetail>(`/rounds/${roundId}/creators/${platform}/${encodeURIComponent(userId)}`, {
@@ -181,6 +206,12 @@ export const api = {
     request<CreatorDetail>(`/rounds/${roundId}/creators/${platform}/${encodeURIComponent(userId)}/claim`, {
       method: "POST",
     }),
+  assignCreator: (roundId: number, platform: string, userId: string, ownerUserId: number | null) =>
+    request<CreatorDetail>(`/rounds/${roundId}/creators/${platform}/${encodeURIComponent(userId)}/assign`, {
+      method: "POST",
+      body: JSON.stringify({ owner_user_id: ownerUserId }),
+    }),
+  getCreatorOwners: () => request<LeadOwner[]>("/creators/owners"),
   releaseCreator: (roundId: number, platform: string, userId: string) =>
     request<CreatorDetail>(`/rounds/${roundId}/creators/${platform}/${encodeURIComponent(userId)}/release`, {
       method: "POST",
@@ -219,7 +250,7 @@ export const api = {
     owner_user_id: number | null;
     raw_json?: Record<string, unknown>;
   }) =>
-    request<LeadDetail>("/leads", {
+    request<LeadCreateResponse>("/leads", {
       method: "POST",
       body: JSON.stringify(payload),
     }),
@@ -233,12 +264,21 @@ export const api = {
     source_round_id: number | null;
     owner_user_id: number | null;
   }>) =>
-    request<{ created: number; ids: number[]; errors: { index: number; error: string }[] }>("/leads/bulk", {
+    request<{
+      created: number;
+      revived: number;
+      existing: number;
+      ids: number[];
+      revived_ids: number[];
+      existing_ids: number[];
+      match_errors: number;
+      errors: { index: number; error: string }[];
+    }>("/leads/bulk", {
       method: "POST",
       body: JSON.stringify({ items }),
     }),
   updateLead: (leadId: number, payload: Partial<Lead>) =>
-    request<LeadDetail>(`/leads/${leadId}`, {
+    request<LeadDetail & { match_error?: string }>(`/leads/${leadId}`, {
       method: "PATCH",
       body: JSON.stringify(payload),
     }),
@@ -247,13 +287,21 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ owner_user_id: ownerUserId }),
     }),
-  convertLead: (leadId: number, payload: { account_id: string; profile_url: string; fetch: boolean }) =>
+  matchLead: (leadId: number) =>
+    request<LeadDetail & { match: LeadMatchResult }>(`/leads/${leadId}/match`, {
+      method: "POST",
+    }),
+  convertLead: (
+    leadId: number,
+    payload: { account_id: string; profile_url: string; fetch: boolean; provider?: string },
+  ) =>
     request<{ lead: Lead; creator: unknown; rounds: number[] }>(`/leads/${leadId}/convert`, {
       method: "POST",
       body: JSON.stringify(payload),
     }),
   getLeadFacets: (roundId: number | null) =>
     request<LeadFacets>(`/leads/facets${roundId === null ? "" : `?round_id=${roundId}`}`),
+  getLeadIdentityHealth: () => request<LeadIdentityHealth>("/leads/identity-health"),
   getLeadOwners: () => request<LeadOwner[]>("/leads/owners"),
   getJob: (roundId: number) => request<Job | null>(`/rounds/${roundId}/job`),
   getActiveJob: () => request<Job | null>(`/jobs/active`),
@@ -275,6 +323,27 @@ export const api = {
     request<{ ok: boolean }>(`/keywords/${id}`, { method: "DELETE" }),
   getDashboard: (roundId: number | null) =>
     request<DashboardData>(`/dashboard${roundId == null ? "" : `?round_id=${roundId}`}`),
+  getActivityCalendar: (days = 365, tzOffset = -new Date().getTimezoneOffset()) =>
+    request<ActivityCalendarResponse>(
+      `/dashboard/activity?days=${days}&tz_offset=${tzOffset}`,
+    ),
+  getCounts: () => request<Counts>("/counts"),
+  getActionQueue: (params: {
+    roundId: number | null;
+    scope: "all" | "pending" | "unclaimed";
+    sort: "potential" | "ratio" | "updated";
+    includeOthers?: boolean;
+    limit?: number;
+  }) => {
+    const search = new URLSearchParams({
+      scope: params.scope,
+      sort: params.sort,
+      limit: String(params.limit ?? 6),
+    });
+    if (params.includeOthers) search.set("include_others", "true");
+    if (params.roundId !== null) search.set("round_id", String(params.roundId));
+    return request<ActionQueueResponse>(`/dashboard/queue?${search.toString()}`);
+  },
   getSettings: () => request<Settings>("/settings"),
   updateDataflowToken: (token: string) =>
     request<Settings & { balance: Balance | null }>("/settings/dataflow-token", {
@@ -298,6 +367,36 @@ export const api = {
     request<Balance>(`/balance?provider=${encodeURIComponent(provider)}`),
 };
 
+export async function downloadFile(url: string, fallbackName: string): Promise<void> {
+  const response = await fetch(url, { credentials: "same-origin" });
+  if (!response.ok) {
+    if (response.status === 401) {
+      window.dispatchEvent(new Event("codata:unauthorized"));
+    }
+    let message = response.statusText;
+    try {
+      const payload = await response.json();
+      message = detailMessage(payload.detail) || response.statusText;
+    } catch {
+      // ignore non-JSON errors
+    }
+    throw new Error(message || "下载失败");
+  }
+  const blob = await response.blob();
+  const disposition = response.headers.get("content-disposition") || "";
+  const match = /filename="?([^";]+)"?/i.exec(disposition);
+  const name = match?.[1] || fallbackName;
+  const objectUrl = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = objectUrl;
+  anchor.download = name;
+  anchor.rel = "noopener";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(objectUrl);
+}
+
 export function exportUrl(
   roundId: number | null,
   format: "csv" | "xlsx",
@@ -315,10 +414,15 @@ export function exportUrl(
     if (query.tiers.length) params.set("tier", query.tiers.join(","));
     if (query.directions.length) params.set("direction", query.directions.join(","));
     if (query.sources.length) params.set("source", query.sources.join(","));
+    if (query.sources.length && query.source_mode === "all") params.set("source_mode", "all");
+    if (query.labels.length) params.set("label", query.labels.join(","));
     if (query.owner) params.set("owner", query.owner);
     if (query.min_fans) params.set("min_fans", query.min_fans);
     if (query.max_fans) params.set("max_fans", query.max_fans);
     if (query.only_unenriched) params.set("only_unenriched", "true");
+    if (query.needs_action) params.set("needs_action", "true");
+    params.set("sort", query.sort);
+    params.set("order", query.order);
   }
   return roundId === null
     ? `${BASE}/creators/export?${params.toString()}`

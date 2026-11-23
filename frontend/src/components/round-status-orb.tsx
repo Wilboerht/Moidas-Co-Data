@@ -6,6 +6,8 @@ const STATUS_STATES: Record<string, OrbState> = {
   running: "searching",
   done: "done",
   failed: "error",
+  cancelled: "idle",
+  archived: "idle",
   error: "error",
 };
 

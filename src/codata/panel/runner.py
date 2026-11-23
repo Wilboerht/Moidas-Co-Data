@@ -17,14 +17,16 @@ def start_round_job(
     round_id: int,
     refresh_users: bool = False,
     force: bool = False,
+    created_by: int | None = None,
 ) -> tuple[int, Path]:
+    log_dir = settings.output_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
     job_id = db.claim_job(
         round_id,
         settings.max_active_jobs,
         getattr(settings, "job_stale_minutes", 30),
+        created_by=created_by,
     )
-    log_dir = settings.output_dir / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
     cutoff = time.time() - max(1, getattr(settings, "log_retention_days", 90)) * 86400
     for old in log_dir.glob("round_*.log"):
         try:
@@ -64,12 +66,65 @@ def start_round_job(
     except Exception as exc:
         db.update_job(job_id, status="failed", stage="启动失败", error=str(exc))
         raise
-    db.update_job(job_id, pid=process.pid)
+    try:
+        db.update_job(job_id, pid=process.pid)
+    except Exception:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        raise
     return job_id, log_path
 
 
-def terminate_job_process(pid: int | None) -> None:
+def _process_command_line(pid: int) -> str:
+    if os.name == "nt":
+        try:
+            result = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    f"(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine",
+                ],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                check=False,
+                timeout=10,
+            )
+        except Exception:
+            return ""
+        return result.stdout or ""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return " ".join(
+        part for part in raw.decode("utf-8", errors="replace").split("\x00") if part
+    )
+
+
+def _process_matches(pid: int, round_id: int | None, job_id: int | None) -> bool:
+    if round_id is None or job_id is None:
+        return False
+    text = _process_command_line(pid)
+    return (
+        "codata.jobs" in text
+        and f"--round-id {round_id}" in text
+        and f"--job-id {job_id}" in text
+    )
+
+
+def terminate_job_process(
+    pid: int | None,
+    round_id: int | None = None,
+    job_id: int | None = None,
+) -> None:
     if not pid:
+        return
+    if not _process_matches(int(pid), round_id, job_id):
         return
     try:
         if os.name == "nt":
@@ -77,6 +132,7 @@ def terminate_job_process(pid: int | None) -> None:
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
                 capture_output=True,
                 check=False,
+                timeout=10,
             )
         else:
             os.kill(int(pid), 15)

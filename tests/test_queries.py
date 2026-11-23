@@ -8,7 +8,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from codata.panel.queries import filter_rows, format_display, sort_rows
+from codata.panel.queries import filter_rows, format_display, sort_rows, to_csv_bytes
 
 
 def frame() -> pd.DataFrame:
@@ -20,7 +20,8 @@ def frame() -> pd.DataFrame:
                 "粉丝层级": "尾部",
                 "采用状态": "待审核",
                 "匹配方向": "咖啡",
-                "数据来源": "咖啡、手冲",
+                "命中关键词": "咖啡、手冲",
+                "来源标签": "小红书",
                 "账号ID": "u1",
             },
             {
@@ -29,7 +30,8 @@ def frame() -> pd.DataFrame:
                 "粉丝层级": "",
                 "采用状态": "候选",
                 "匹配方向": "未分类",
-                "数据来源": "咖啡",
+                "命中关键词": "咖啡",
+                "来源标签": "小红书",
                 "账号ID": "u2",
             },
         ]
@@ -87,6 +89,13 @@ class FilterTests(unittest.TestCase):
         result = sort_rows(frame(), "粉丝数 ↓")
         self.assertEqual(result["账号ID"].tolist()[0], "u1")
         self.assertEqual(result["账号ID"].tolist()[1], "u2")
+
+    def test_csv_export_escapes_formulas(self) -> None:
+        data = frame()
+        data.loc[0, "昵称"] = "=HYPERLINK(\"https://evil.example\")"
+        encoded = to_csv_bytes(data, list(data.columns))
+        text = encoded.decode("utf-8-sig")
+        self.assertIn("'=HYPERLINK", text)
 
 
 if __name__ == "__main__":

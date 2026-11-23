@@ -45,15 +45,18 @@ type InvalidLine = { line: number; raw: string; reason: string };
 
 type BulkResult = {
   created: number;
+  revived: number;
+  existing: number;
+  matchErrors: number;
   failures: { line: number; raw: string; error: string }[];
 };
 
 const HEADER_TOKENS = new Set([
   "平台", "platform",
   "昵称", "nickname",
-  "账号", "账号id", "account", "account_id",
-  "主页", "主页url", "profile", "profile_url", "链接", "url",
-  "原始标题", "标题", "raw_title", "title",
+  "账号", "账号id", "account", "accountid",
+  "主页", "主页url", "profile", "profileurl", "链接", "url",
+  "原始标题", "标题", "rawtitle", "title",
 ]);
 
 function splitRow(line: string) {
@@ -79,6 +82,37 @@ function splitRow(line: string) {
   return cells.map((item) => item.trim());
 }
 
+type LeadColumn = "platform" | "nickname" | "account_id" | "profile_url" | "raw_title";
+type HeaderMap = Partial<Record<LeadColumn, number>>;
+
+const COLUMN_ALIASES: Record<string, LeadColumn> = {
+  platform: "platform",
+  平台: "platform",
+  nickname: "nickname",
+  昵称: "nickname",
+  account: "account_id",
+  accountid: "account_id",
+  账号: "account_id",
+  账号id: "account_id",
+  profile: "profile_url",
+  profileurl: "profile_url",
+  主页: "profile_url",
+  主页url: "profile_url",
+  链接: "profile_url",
+  url: "profile_url",
+  rawtitle: "raw_title",
+  原始标题: "raw_title",
+  标题: "raw_title",
+  title: "raw_title",
+};
+
+function headerKey(value: string) {
+  return value
+    .replace(/^\ufeff/, "")
+    .toLowerCase()
+    .replace(/[\s_-]+/g, "");
+}
+
 function parseLeadText(
   text: string,
   platforms: { code: string; label: string }[],
@@ -92,6 +126,7 @@ function parseLeadText(
   const items: ParsedLead[] = [];
   const invalid: InvalidLine[] = [];
   let headers = 0;
+  let headerMap: HeaderMap | null = null;
 
   text.split(/\r?\n/).forEach((raw, index) => {
     const trimmed = raw.trim();
@@ -99,11 +134,46 @@ function parseLeadText(
     const line = index + 1;
     const cells = splitRow(trimmed);
     const urlIndex = cells.findIndex((cell) => /^https?:\/\//i.test(cell));
-    const isHeader = urlIndex < 0 && cells.some((cell) => HEADER_TOKENS.has(cell.toLowerCase()));
+    const isHeader =
+      urlIndex < 0 && cells.some((cell) => HEADER_TOKENS.has(headerKey(cell)));
     if (isHeader) {
       headers += 1;
+      const next: HeaderMap = {};
+      cells.forEach((cell, cellIndex) => {
+        const field = COLUMN_ALIASES[headerKey(cell)];
+        if (field && next[field] === undefined) next[field] = cellIndex;
+      });
+      if (Object.keys(next).length >= 2) headerMap = next;
       return;
     }
+
+    if (headerMap) {
+      const value = (field: LeadColumn) => {
+        const cellIndex = headerMap?.[field];
+        return cellIndex === undefined ? "" : (cells[cellIndex] ?? "").trim();
+      };
+      const platformCell = value("platform").toLowerCase();
+      const platform = aliases.get(platformCell) ?? defaultPlatform;
+      const nickname = value("nickname");
+      const accountId = value("account_id");
+      const profileUrl = value("profile_url");
+      const rawTitle = value("raw_title");
+      if (!nickname && !accountId && !profileUrl) {
+        invalid.push({ line, raw: trimmed, reason: "缺少昵称、账号 ID 或主页 URL" });
+        return;
+      }
+      items.push({
+        line,
+        raw: trimmed,
+        platform,
+        nickname,
+        account_id: accountId,
+        profile_url: profileUrl,
+        raw_title: rawTitle,
+      });
+      return;
+    }
+
     const rest = urlIndex >= 0 ? cells.filter((_, i) => i !== urlIndex) : cells;
     let platform = defaultPlatform;
     let fields = rest;
@@ -139,6 +209,7 @@ export function BulkLeadDialog({
   rounds,
   sources,
   onCreated,
+  defaultPlatform = "xhs",
 }: {
   open: boolean;
   onClose: () => void;
@@ -146,10 +217,11 @@ export function BulkLeadDialog({
   rounds: { id: number; name: string }[];
   sources: { code: string; label: string }[];
   onCreated: () => void | Promise<void>;
+  defaultPlatform?: string;
 }) {
   const fileRef = useRef<HTMLInputElement>(null);
   const [text, setText] = useState("");
-  const [platform, setPlatform] = useState("xhs");
+  const [platform, setPlatform] = useState(defaultPlatform);
   const [source, setSource] = useState("manual");
   const [roundId, setRoundId] = useState("none");
   const [fileName, setFileName] = useState("");
@@ -166,34 +238,78 @@ export function BulkLeadDialog({
   };
 
   const mutation = useMutation({
-    mutationFn: () => {
+    mutationFn: async () => {
       if (!parsed.items.length) throw new Error("没有可导入的行");
-      return api.createLeadsBulk(
-        parsed.items.map((item) => ({
-          platform: item.platform,
-          nickname: item.nickname,
-          account_id: item.account_id,
-          profile_url: item.profile_url,
-          raw_title: item.raw_title,
-          source,
-          source_round_id: roundId === "none" ? null : Number(roundId),
-          owner_user_id: null,
-        })),
-      );
+      const payload = parsed.items.map((item) => ({
+        platform: item.platform,
+        nickname: item.nickname,
+        account_id: item.account_id,
+        profile_url: item.profile_url,
+        raw_title: item.raw_title,
+        source,
+        source_round_id: roundId === "none" ? null : Number(roundId),
+        owner_user_id: null,
+      }));
+      const result = {
+        created: 0,
+        revived: 0,
+        existing: 0,
+        ids: [] as number[],
+        revived_ids: [] as number[],
+        existing_ids: [] as number[],
+        match_errors: 0,
+        errors: [] as { index: number; error: string }[],
+      };
+      let offset = 0;
+      for (let index = 0; index < payload.length; index += 500) {
+        const chunk = payload.slice(index, index + 500);
+        const part = await api.createLeadsBulk(chunk);
+        result.created += part.created;
+        result.revived += part.revived;
+        result.existing += part.existing;
+        result.ids.push(...part.ids);
+        result.revived_ids.push(...part.revived_ids);
+        result.existing_ids.push(...part.existing_ids);
+        result.match_errors += part.match_errors;
+        result.errors.push(
+          ...part.errors.map((error) => ({
+            index: offset + error.index,
+            error: error.error,
+          })),
+        );
+        offset += chunk.length;
+      }
+      return result;
     },
     onSuccess: async (data) => {
+      const existing = data.existing ?? 0;
+      const revived = data.revived ?? 0;
+      const matchErrors = data.match_errors ?? 0;
+      const summary = [
+        data.created > 0 ? `新建 ${data.created} 条` : "",
+        revived > 0 ? `恢复 ${revived} 条` : "",
+        existing > 0 ? `已存在 ${existing} 条` : "",
+      ]
+        .filter(Boolean)
+        .join("，");
       if (data.errors.length > 0) {
         const failures = data.errors.map((error) => {
           const item = parsed.items[error.index - 1];
           return { line: item?.line ?? error.index, raw: item?.raw ?? "", error: error.error };
         });
-        setResult({ created: data.created, failures });
+        setResult({ created: data.created, revived, existing, matchErrors, failures });
         setText(failures.map((failure) => failure.raw).join("\n"));
-        toast.warning(`已创建 ${data.created} 条，${failures.length} 条失败`);
+        toast.warning(`${summary || "未写入"}，${failures.length} 条失败`);
         await onCreated();
         return;
       }
-      toast.success(`已创建 ${data.created} 条线索`);
+      if (matchErrors > 0) {
+        toast.warning(`${summary || "已导入"}，${matchErrors} 条自动匹配失败`);
+      } else if (revived > 0 || existing > 0) {
+        toast.warning(`${summary}`);
+      } else {
+        toast.success(summary || "导入完成");
+      }
       resetDraft();
       await onCreated();
       onClose();
@@ -268,7 +384,11 @@ export function BulkLeadDialog({
             {result && result.failures.length > 0 ? (
               <div className="space-y-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
                 <p className="font-medium">
-                  已创建 {result.created} 条，{result.failures.length} 条失败
+                  新建 {result.created} 条
+                  {result.revived > 0 ? `，恢复 ${result.revived} 条` : ""}
+                  {result.existing > 0 ? `，已存在 ${result.existing} 条` : ""}
+                  ，{result.failures.length} 条失败
+                  {result.matchErrors > 0 ? `，${result.matchErrors} 条匹配失败` : ""}
                 </p>
                 <ul className="space-y-0.5 text-xs">
                   {result.failures.slice(0, 5).map((failure) => (

@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { ChevronRight, Plus, RotateCw } from "lucide-react";
@@ -39,10 +40,12 @@ export function TasksPage() {
   const { user } = useAuth();
   const { refreshRounds } = useRound();
   const canCollect = user?.role === "admin" || Boolean(user?.can_collect);
+  const isAdmin = user?.role === "admin";
+  const [showArchived, setShowArchived] = useState(false);
 
   const tasksQuery = useQuery({
-    queryKey: ["task-list"],
-    queryFn: api.getRounds,
+    queryKey: ["task-list", showArchived],
+    queryFn: () => api.getRounds(isAdmin && showArchived),
     refetchInterval: (query) => {
       const active = (query.state.data ?? []).some((item) => isActive(item.job?.status));
       return active ? 2500 : false;
@@ -86,6 +89,14 @@ export function TasksPage() {
         }
         actions={
           <>
+            {isAdmin ? (
+              <Button
+                variant={showArchived ? "secondary" : "outline"}
+                onClick={() => setShowArchived((value) => !value)}
+              >
+                {showArchived ? "隐藏已归档" : "显示已归档"}
+              </Button>
+            ) : null}
             <Button variant="outline" onClick={refresh} disabled={tasksQuery.isFetching}>
               <RotateCw className={tasksQuery.isFetching ? "animate-spin" : undefined} />
               刷新
@@ -136,8 +147,11 @@ export function TasksPage() {
             <TableBody>
               {tasks.map((item) => {
                 const job = item.job;
-                const status = job?.status ?? item.status;
-                const statusLabel = job?.status_label ?? item.status_label;
+                const archived = Boolean(item.archived);
+                const status = archived ? "archived" : job?.status ?? item.status;
+                const statusLabel = archived
+                  ? "已归档"
+                  : job?.status_label ?? item.status_label;
                 const progress = progressOf(item);
                 return (
                   <TableRow key={item.id} className="hover:bg-muted/50">

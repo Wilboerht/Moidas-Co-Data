@@ -15,6 +15,7 @@ jobs:
           python-version: "3.13"
       - run: uv lock --check
       - run: uv sync --frozen
+      - run: uvx ruff check --select F,E9 src tests
       - run: uv run python -m unittest discover -s tests -v
 
   frontend:
@@ -30,4 +31,5 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - run: npm ci
+      - run: npm test
       - run: npm run build

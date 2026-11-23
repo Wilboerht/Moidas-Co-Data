@@ -8,15 +8,19 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from codata.identity import normalize_identity, profile_id_from_url
 from codata.normalize import (
+    as_optional_int,
     derive_match_direction,
     derive_tags,
     fans_tier,
+    first_str,
     format_fans_wan,
     normalize_search_item,
     normalize_tier_label,
     normalize_user_info,
 )
+from codata.normalize_platform import as_timestamp, normalize_user_platform
 from helpers import search_item, user_payload
 
 
@@ -72,6 +76,49 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(derive_match_direction([]), "未分类")
         self.assertEqual(derive_match_direction(["咖啡"]), "咖啡")
         self.assertEqual(derive_match_direction(["咖啡", "母婴"]), "多垂类")
+
+    def test_metric_parsing_handles_units_and_invalid_values(self) -> None:
+        self.assertEqual(as_optional_int("1.2万+"), 12_000)
+        self.assertEqual(as_optional_int("10K"), 10_000)
+        self.assertEqual(as_optional_int("2亿+"), 200_000_000)
+        self.assertEqual(as_optional_int("1.5千"), 1_500)
+        self.assertIsNone(as_optional_int("NaN"))
+        self.assertIsNone(as_optional_int(float("inf")))
+        self.assertIsNone(as_optional_int("-1万"))
+        self.assertEqual(as_optional_int(0), 0)
+        self.assertEqual(first_str(12345), "12345")
+        self.assertEqual(first_str("", None, 42), "42")
+
+    def test_zero_fans_are_not_treated_as_missing(self) -> None:
+        creator = normalize_user_platform(
+            "xhs",
+            {"user_id": "u0", "nickname": "零粉", "fans": 0, "note_count": 0},
+        )
+        self.assertEqual(creator["fans"], 0)
+        self.assertEqual(creator["posted"], 0)
+
+    def test_timestamp_formats(self) -> None:
+        self.assertEqual(as_timestamp(1_700_000_000), 1_700_000_000)
+        self.assertEqual(as_timestamp(1_700_000_000_000), 1_700_000_000)
+        self.assertEqual(as_timestamp(1_700_000_000_000_000), 1_700_000_000)
+        self.assertEqual(as_timestamp("20240101"), 1_704_067_200)
+
+    def test_identity_rejects_spoofed_hosts_and_conflicts(self) -> None:
+        self.assertEqual(
+            profile_id_from_url("xhs", "https://evil.example/user/profile/u1"), ""
+        )
+        self.assertEqual(
+            profile_id_from_url("xhs", "https://www.xiaohongshu.com/user/profile/u1?x=1"),
+            "u1",
+        )
+        self.assertEqual(profile_id_from_url("instagram", "https://www.instagram.com/stories/a/1"), "")
+        account, profile = normalize_identity(
+            "xhs",
+            "u1",
+            "https://www.xiaohongshu.com/user/profile/u2",
+        )
+        self.assertEqual(account, "u1")
+        self.assertEqual(profile, "https://www.xiaohongshu.com/user/profile/u1")
 
 
 if __name__ == "__main__":

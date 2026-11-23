@@ -10,6 +10,7 @@ from typing import Any
 
 from .config import load_settings
 from .db import Database
+from .identity import normalize_identity
 from .normalize import utc_now
 
 
@@ -37,10 +38,28 @@ def _groups(rows: list[dict[str, Any]]) -> dict[tuple[str, str], list[dict[str, 
     return grouped
 
 
-def _existing_lead(db: Database, platform: str, legacy_user_id: str) -> int | None:
+def _existing_lead(
+    db: Database,
+    platform: str,
+    legacy_user_id: str,
+    account_id: str = "",
+    profile_url: str = "",
+) -> int | None:
+    conditions = ["legacy_user_id = ?"]
+    params: list[Any] = [legacy_user_id]
+    if account_id:
+        conditions.append(
+            "(account_id = ? AND status NOT IN ('duplicate', 'discarded'))"
+        )
+        params.append(account_id)
+    if profile_url:
+        conditions.append(
+            "(profile_url = ? AND status NOT IN ('duplicate', 'discarded'))"
+        )
+        params.append(profile_url)
     row = db._conn.execute(
-        "SELECT id FROM leads WHERE platform = ? AND legacy_user_id = ? LIMIT 1",
-        (platform, legacy_user_id),
+        f"SELECT id FROM leads WHERE platform = ? AND ({' OR '.join(conditions)}) LIMIT 1",
+        [platform, *params],
     ).fetchone()
     return int(row["id"]) if row else None
 
@@ -51,11 +70,19 @@ def _insert_lead(
     legacy_user_id: str,
     rows: list[dict[str, Any]],
     now: str,
+    *,
+    account_id: str = "",
+    profile_url: str = "",
 ) -> int:
     primary = rows[0]
-    account_id = next(
+    raw_account = next(
         (str(row.get("account_id") or "").strip() for row in rows if str(row.get("account_id") or "").strip()),
         "",
+    )
+    account_id, profile_url = normalize_identity(
+        platform,
+        account_id or raw_account,
+        profile_url or primary.get("creator_profile_url") or "",
     )
     converted = bool(account_id)
     lead_id = int(
@@ -71,7 +98,7 @@ def _insert_lead(
                 platform,
                 primary.get("creator_nickname") or "",
                 account_id,
-                primary.get("creator_profile_url") or "",
+                profile_url,
                 primary.get("raw_title") or "",
                 primary.get("round_id"),
                 primary.get("owner_user_id"),
@@ -90,15 +117,16 @@ def _insert_lead(
         db._conn.execute(
             """
             INSERT OR IGNORE INTO lead_rounds
-            (lead_id, round_id, source_keywords, raw_title, data_round,
+            (lead_id, round_id, source_keywords, source_labels, raw_title, data_round,
              top_note_id, sample_notes, sample_likes, sample_collected, sample_comments,
              sample_interactions, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 lead_id,
                 row.get("round_id"),
                 row.get("source_keywords") or "[]",
+                row.get("source_labels") or "[]",
                 row.get("raw_title") or "",
                 row.get("data_round") or "",
                 row.get("top_note_id") or "",
@@ -140,6 +168,43 @@ def _merge_resolved_rows(
         "SELECT 1 FROM creators WHERE platform = ? AND user_id = ?",
         (platform, account_id),
     ).fetchone()
+    legacy_leads = db._conn.execute(
+        "SELECT id, owner_user_id, status FROM leads WHERE platform = ? AND account_id = ?",
+        (platform, legacy_user_id),
+    ).fetchall()
+    for legacy_lead in legacy_leads:
+        conflict = db._conn.execute(
+            "SELECT id FROM leads WHERE platform = ? AND account_id = ? AND id <> ?",
+            (platform, account_id, legacy_lead["id"]),
+        ).fetchone()
+        if conflict:
+            db._conn.execute(
+                "UPDATE leads SET owner_user_id = COALESCE(owner_user_id, ?) WHERE id = ?",
+                (legacy_lead["owner_user_id"], conflict["id"]),
+            )
+            db._conn.execute(
+                "UPDATE leads SET status = 'duplicate', updated_at = ? WHERE id = ? "
+                "AND status <> 'converted'",
+                (now, legacy_lead["id"]),
+            )
+        else:
+            db._conn.execute(
+                "UPDATE leads SET account_id = ? WHERE id = ?",
+                (account_id, legacy_lead["id"]),
+            )
+    db._conn.execute(
+        "UPDATE leads SET matched_user_id = ? WHERE platform = ? AND matched_user_id = ?",
+        (account_id, platform, legacy_user_id),
+    )
+    db._conn.execute(
+        "UPDATE leads SET converted_user_id = ? "
+        "WHERE converted_platform = ? AND converted_user_id = ?",
+        (account_id, platform, legacy_user_id),
+    )
+    db._conn.execute(
+        "UPDATE lead_attempts SET candidate_user_id = ? WHERE candidate_user_id = ?",
+        (account_id, legacy_user_id),
+    )
     db._conn.execute(
         "UPDATE notes SET author_id = ? WHERE platform = ? AND author_id = ?",
         (account_id, platform, legacy_user_id),
@@ -224,6 +289,8 @@ def migrate(db: Database, *, apply: bool) -> dict[str, Any]:
         "legacy_identities": len(grouped),
         "resolved_identities": 0,
         "unresolved_identities": 0,
+        "account_conflicts": 0,
+        "conflicts": 0,
         "leads_before": db._conn.execute("SELECT COUNT(*) FROM leads").fetchone()[0],
         "creators_before": db._conn.execute("SELECT COUNT(*) FROM creators").fetchone()[0],
         "creator_rounds_before": db._conn.execute("SELECT COUNT(*) FROM creator_rounds").fetchone()[0],
@@ -240,20 +307,44 @@ def migrate(db: Database, *, apply: bool) -> dict[str, Any]:
     created = 0
     skipped = 0
     preserved = 0
+    conflicts = 0
     affected_rounds: set[int] = set()
     with db._conn:
         for (platform, legacy_user_id), group in grouped.items():
-            if _existing_lead(db, platform, legacy_user_id) is not None:
+            raw_accounts = [
+                str(row.get("account_id") or "").strip()
+                for row in group
+                if str(row.get("account_id") or "").strip()
+            ]
+            account_id, profile_url = normalize_identity(
+                platform,
+                raw_accounts[0] if raw_accounts else "",
+                group[0].get("creator_profile_url") or "",
+            )
+            if len({normalize_identity(platform, value, "")[0] for value in raw_accounts}) > 1:
+                report["account_conflicts"] += 1
+            if (
+                _existing_lead(
+                    db, platform, legacy_user_id, account_id, profile_url
+                )
+                is not None
+            ):
                 skipped += 1
                 continue
-            lead_id = _insert_lead(db, platform, legacy_user_id, group, now)
+            try:
+                _insert_lead(
+                    db,
+                    platform,
+                    legacy_user_id,
+                    group,
+                    now,
+                    account_id=account_id,
+                    profile_url=profile_url,
+                )
+            except sqlite3.IntegrityError:
+                conflicts += 1
+                continue
             created += 1
-            account_id = str(
-                db._conn.execute(
-                    "SELECT account_id FROM leads WHERE id = ?", (lead_id,)
-                ).fetchone()["account_id"]
-                or ""
-            ).strip()
             if not account_id:
                 preserved += len(group)
                 continue
@@ -269,6 +360,7 @@ def migrate(db: Database, *, apply: bool) -> dict[str, Any]:
             "created": created,
             "skipped_existing": skipped,
             "preserved_unresolved_rows": preserved,
+            "conflicts": conflicts,
             "creators_after": db._conn.execute("SELECT COUNT(*) FROM creators").fetchone()[0],
             "creator_rounds_after": db._conn.execute("SELECT COUNT(*) FROM creator_rounds").fetchone()[0],
         }

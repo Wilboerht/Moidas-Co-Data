@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import sys
 import tempfile
 import unittest
@@ -73,6 +72,45 @@ class MigrateLeadsTests(unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(preserved)
         self.assertEqual(migrate(self.db, apply=True)["created"], 0)
+
+    def test_migration_remaps_lead_references(self) -> None:
+        self._import(self.round_a, "import:legacy3", "real3", "达人丙")
+        lead_id = self.db.create_lead(
+            platform="xhs", nickname="旧引用线索", account_id="import:legacy3"
+        )
+        self.db._conn.execute(
+            """
+            UPDATE leads SET matched_platform = 'xhs', matched_user_id = 'import:legacy3',
+                converted_platform = 'xhs', converted_user_id = 'import:legacy3'
+            WHERE id = ?
+            """,
+            (lead_id,),
+        )
+        self.db._conn.commit()
+        migrate(self.db, apply=True)
+        lead = self.db.get_lead(lead_id)
+        self.assertEqual(lead["status"], "duplicate")
+        self.assertEqual(lead["matched_user_id"], "real3")
+        self.assertEqual(lead["converted_user_id"], "real3")
+        active = self.db._conn.execute(
+            "SELECT * FROM leads WHERE account_id = 'real3' AND status <> 'duplicate'"
+        ).fetchone()
+        self.assertIsNotNone(active)
+        self.assertEqual(active["status"], "converted")
+
+    def test_migration_skips_existing_account_and_continues(self) -> None:
+        self.db.create_lead(
+            platform="xhs", nickname="已有账号线索", account_id="real4"
+        )
+        self._import(self.round_a, "import:legacy4", "real4", "达人丁")
+        self._import(self.round_b, "import:legacy5", "real5", "达人戊")
+        report = migrate(self.db, apply=True)
+        self.assertGreaterEqual(report["skipped_existing"], 1)
+        self.assertEqual(report["created"], 1)
+        created = self.db._conn.execute(
+            "SELECT 1 FROM leads WHERE account_id = 'real5'"
+        ).fetchone()
+        self.assertIsNotNone(created)
 
 
 if __name__ == "__main__":

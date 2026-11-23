@@ -9,6 +9,8 @@ from typing import Any
 
 from .config import load_settings
 from .db import Database
+from .matching import match_round_leads
+from .normalize import as_optional_int
 from .platforms import load_registry
 from .providers import build_provider
 from .providers_multi import EveryInfraProvider
@@ -50,11 +52,9 @@ def candidate_id(item: dict[str, Any]) -> str:
 
 def candidate_followers(item: dict[str, Any]) -> int:
     for key in ("follower_count", "fans", "fans_count", "followers"):
-        value = item.get(key)
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            continue
+        parsed = as_optional_int(item.get(key))
+        if parsed is not None:
+            return parsed
     return 0
 
 
@@ -78,13 +78,16 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--platform", default="xhs")
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--retry-days", type=int, default=7)
+    parser.add_argument("--apply", action="store_true", help="实际调用服务商并补全（默认仅报告）")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
+    if args.apply and args.dry_run:
+        raise SystemExit("--apply 和 --dry-run 不能同时使用")
 
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-    settings = load_settings(require_credentials=True)
+    settings = load_settings(require_credentials=False)
     with Database(settings.output_dir) as db:
         candidates = db.backfill_candidates(args.platform, args.limit, args.retry_days)
         print(f"待处理: {len(candidates)} 条 ({args.platform})")
@@ -93,9 +96,10 @@ def main(argv: list[str] | None = None) -> None:
         for item in candidates:
             nickname = extract_nickname(item.get("raw_json"), item.get("nickname") or "")
             print(f"- {item['user_id']} | {nickname or '(无昵称)'}")
-        if args.dry_run:
-            print("dry-run，不发起 API 请求")
+        if not args.apply:
+            print("dry-run：不发起 API 请求；确认后加 --apply 执行补全")
             return
+        print(f"已备份: {db.backup('backfill')}")
 
         registry = load_registry(settings)
         option = registry.resolve(args.platform, "everyinfra")
@@ -107,6 +111,7 @@ def main(argv: list[str] | None = None) -> None:
         matched = 0
         skipped = 0
         failed = 0
+        affected_rounds: set[int] = set()
         try:
             for index, item in enumerate(candidates, 1):
                 imported_id = item["user_id"]
@@ -121,6 +126,8 @@ def main(argv: list[str] | None = None) -> None:
                     result = provider.search_users(nickname)
                     duration_ms = int((time.perf_counter() - started) * 1000)
                     search_price = provider.search_price
+                    search_attempts = max(1, int(provider.client.last_attempts or 1))
+                    search_cost = provider.client.last_cost or provider.search_cost_tokens * search_attempts
                     db.log_api_call(
                         None,
                         args.platform,
@@ -128,12 +135,14 @@ def main(argv: list[str] | None = None) -> None:
                         {"keyword": nickname},
                         None,
                         200,
-                        provider.search_cost_tokens,
+                        search_cost,
                         duration_ms,
                         path=provider.search_path,
                         provider=provider.provider_id,
                         cost_native=float(search_price.amount) if search_price else 0.0,
                         cost_currency=search_price.currency if search_price else "token",
+                        estimated_cost=search_cost,
+                        attempt=search_attempts,
                     )
                     selected, note = choose_exact(result.items, nickname)
                     if selected is None:
@@ -163,6 +172,8 @@ def main(argv: list[str] | None = None) -> None:
                     payload = provider.user(real_id)
                     duration_ms = int((time.perf_counter() - started) * 1000)
                     user_price = provider.user_price
+                    user_attempts = max(1, int(provider.client.last_attempts or 1))
+                    user_cost = provider.client.last_cost or provider.user_cost_tokens * user_attempts
                     db.log_api_call(
                         None,
                         args.platform,
@@ -170,21 +181,25 @@ def main(argv: list[str] | None = None) -> None:
                         {"userId": real_id},
                         None,
                         200,
-                        provider.user_cost_tokens,
+                        user_cost,
                         duration_ms,
                         path=provider.user_path,
                         provider=provider.provider_id,
                         cost_native=float(user_price.amount) if user_price else 0.0,
                         cost_currency=user_price.currency if user_price else "token",
+                        estimated_cost=user_cost,
+                        attempt=user_attempts,
                     )
                     creator = provider.normalize_user(payload, real_id)
-                    db.enrich_imported_creator(
-                        args.platform,
-                        imported_id,
-                        creator,
-                        account_id=real_id,
-                        query=nickname,
-                        selection_note=note,
+                    affected_rounds.update(
+                        db.enrich_imported_creator(
+                            args.platform,
+                            imported_id,
+                            creator,
+                            account_id=real_id,
+                            query=nickname,
+                            selection_note=note,
+                        )
                     )
                     matched += 1
                     print(
@@ -204,7 +219,20 @@ def main(argv: list[str] | None = None) -> None:
         finally:
             provider.close()
 
-        print(f"完成: 匹配 {matched}，跳过 {skipped}，失败 {failed}")
+        lead_matches = 0
+        if affected_rounds and getattr(settings, "lead_match_enabled", True):
+            for round_id in sorted(affected_rounds):
+                try:
+                    lead_matches += int(
+                        match_round_leads(db, round_id).get("matched") or 0
+                    )
+                except Exception as exc:
+                    print(f"[lead-match] 轮次 {round_id} 匹配线索失败: {exc}")
+
+        print(
+            f"完成: 匹配 {matched}，跳过 {skipped}，失败 {failed}，"
+            f"命中线索 {lead_matches}"
+        )
 
 
 if __name__ == "__main__":

@@ -99,7 +99,8 @@
       "auth_prefix": "Bearer ",
       "success_codes": [],
       "balance_path": "/socialdatax/api/v1/points/balance",
-      "balance_currency": "points"
+      "balance_currency": "points",
+      "balance_token_rate": "10"
     },
     "redfox": {
       "label": "RedFoxHub",
@@ -117,7 +118,8 @@
         2000
       ],
       "balance_path": "/story/web/points/api-key/balance",
-      "balance_currency": "points"
+      "balance_currency": "points",
+      "balance_token_rate": "100"
     }
   },
   "platforms": {

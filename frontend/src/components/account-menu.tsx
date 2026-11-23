@@ -2,6 +2,7 @@ import { useState, type FormEvent } from "react";
 import { ChevronUp, KeyRound, LogOut, UserRound } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "@/shared/auth-context";
+import { MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH } from "@/shared/constants";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -35,8 +36,12 @@ export function AccountMenu() {
 
   const submitPassword = async (event: FormEvent) => {
     event.preventDefault();
+    if (newPassword.length < MIN_PASSWORD_LENGTH) {
+      setError(`密码至少需要 ${MIN_PASSWORD_LENGTH} 个字符`);
+      return;
+    }
     if (newPassword !== confirmPassword) {
-      setError("两次输入的新密码不一致");
+      setError("两次输入的密码不一致");
       return;
     }
     setSubmitting(true);
@@ -108,18 +113,44 @@ export function AccountMenu() {
               </div>
               <div className="space-y-2">
                 <Label htmlFor="new-password">新密码</Label>
-                <Input id="new-password" type="password" autoComplete="new-password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} />
-                <p className="text-xs text-muted-foreground">至少 10 个字符。</p>
+                <Input
+                  id="new-password"
+                  type="password"
+                  autoComplete="new-password"
+                  value={newPassword}
+                  minLength={MIN_PASSWORD_LENGTH}
+                  maxLength={MAX_PASSWORD_LENGTH}
+                  onChange={(event) => setNewPassword(event.target.value)}
+                />
+                <p className="text-xs text-muted-foreground">
+                  至少 {MIN_PASSWORD_LENGTH} 个字符，最多 {MAX_PASSWORD_LENGTH} 个字符。
+                </p>
               </div>
               <div className="space-y-2">
                 <Label htmlFor="confirm-password">确认新密码</Label>
-                <Input id="confirm-password" type="password" autoComplete="new-password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} />
+                <Input
+                  id="confirm-password"
+                  type="password"
+                  autoComplete="new-password"
+                  value={confirmPassword}
+                  minLength={MIN_PASSWORD_LENGTH}
+                  maxLength={MAX_PASSWORD_LENGTH}
+                  onChange={(event) => setConfirmPassword(event.target.value)}
+                />
               </div>
               {error ? <p className="text-sm text-destructive">{error}</p> : null}
             </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setPasswordOpen(false)} disabled={submitting}>取消</Button>
-              <Button type="submit" disabled={submitting || !currentPassword || !newPassword || !confirmPassword}>
+              <Button
+                type="submit"
+                disabled={
+                  submitting ||
+                  !currentPassword ||
+                  newPassword.length < MIN_PASSWORD_LENGTH ||
+                  newPassword !== confirmPassword
+                }
+              >
                 保存
               </Button>
             </DialogFooter>

@@ -7,6 +7,7 @@ import sys
 from .auth import hash_password, normalize_username, validate_password, validate_username
 from .config import load_settings
 from .db import Database
+from .matching import backfill_matches
 
 
 def _read_password(provided: str | None) -> str:
@@ -43,6 +44,14 @@ def main(argv: list[str] | None = None) -> None:
     reset.add_argument("--password", help="仅用于自动化；交互使用时省略")
 
     sub.add_parser("list-users", help="列出账号")
+    backups = sub.add_parser("backups-prune", help="按保留策略清理数据库备份（默认仅报告）")
+    backups.add_argument("--apply", action="store_true", help="删除超出保留策略的备份")
+    dedupe = sub.add_parser("leads-dedupe", help="清理重复线索并启用唯一索引")
+    dedupe.add_argument("--apply", action="store_true", help="写入清理结果（默认仅报告）")
+    matches = sub.add_parser("leads-backfill-matches", help="按账号/主页回填线索与达人的匹配")
+    matches.add_argument("--apply", action="store_true", help="写入匹配结果（默认仅报告）")
+    matches.add_argument("--round-id", type=int, help="只处理指定轮次")
+    matches.add_argument("--limit", type=int, help="最多处理多少个轮次")
 
     args = parser.parse_args(argv)
     settings = load_settings(require_credentials=False)
@@ -79,6 +88,84 @@ def main(argv: list[str] | None = None) -> None:
                         f"{status} collect={'yes' if user.get('can_collect') else 'no'} "
                         f"last_login={user['last_login_at'] or '-'}"
                     )
+            elif args.command == "backups-prune":
+                report = db.prune_backups(
+                    settings.backup_retention_days,
+                    settings.backup_retention_count,
+                    apply=args.apply,
+                )
+                print(
+                    f"备份 {report['backups']} 份，待清理 {report['expired']} 份，"
+                    f"约 {report['bytes']} 字节；已删除 {report['deleted']} 份"
+                )
+                for error in report["errors"]:
+                    print(f"- {error}", file=sys.stderr)
+                if not args.apply:
+                    print("dry-run：未删除，加 --apply 执行清理")
+            elif args.command == "leads-dedupe":
+                if args.apply:
+                    print(f"已备份: {db.backup('leads-dedupe')}")
+                report = db.dedupe_leads(apply=args.apply)
+                print(
+                    f"重复组 {report['groups']}，重复线索 {report['duplicates']}，"
+                    f"合并轮次关联 {report['merged_rounds']}，"
+                    f"身份规范化 {report.get('identity_updates', 0)}，"
+                    f"字段冲突组 {report.get('conflict_groups', 0)}"
+                )
+                for item in report["samples"]:
+                    print(
+                        f"- 保留 #{item['keep']}，标记重复 {item['drop']} "
+                        f"({item['platform']} / {item['account_id'] or '-'})"
+                    )
+                if args.apply:
+                    indexes = report.get("indexes") or {}
+                    for name, ready in indexes.items():
+                        print(f"唯一索引 {name}: {'已启用' if ready else '未启用（仍有重复）'}")
+                    db.audit(
+                        None,
+                        "leads.dedupe",
+                        details={
+                            "groups": report["groups"],
+                            "duplicates": report["duplicates"],
+                            "merged_rounds": report["merged_rounds"],
+                            "conflict_groups": report.get("conflict_groups", 0),
+                        },
+                    )
+                else:
+                    print("dry-run：未写入，加 --apply 执行清理")
+            elif args.command == "leads-backfill-matches":
+                if args.apply:
+                    print(f"已备份: {db.backup('leads-backfill-matches')}")
+                report = backfill_matches(
+                    db,
+                    apply=args.apply,
+                    round_id=args.round_id,
+                    limit=args.limit,
+                )
+                print(
+                    f"扫描轮次 {report['rounds']}，达人 {report['creators']}，"
+                    f"命中线索 {report['matched']}，更新 {report['updated']}，"
+                    f"冲突 {report['ambiguous']}，疑似昵称 {report['suggested']}，"
+                    f"匹配记录 {report['attempts']}"
+                )
+                for item in report["examples"]:
+                    print(
+                        f"- 线索 #{item['lead_id']} → 达人 {item['user_id']} "
+                        f"({item['confidence']})"
+                    )
+                if args.apply:
+                    db.audit(
+                        None,
+                        "leads.backfill_matches",
+                        details={
+                            "rounds": report["rounds"],
+                            "matched": report["matched"],
+                            "updated": report["updated"],
+                            "ambiguous": report["ambiguous"],
+                        },
+                    )
+                else:
+                    print("dry-run：未写入，加 --apply 执行匹配")
         except ValueError as exc:
             print(f"错误: {exc}", file=sys.stderr)
             raise SystemExit(1) from exc

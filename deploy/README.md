@@ -27,8 +27,6 @@ sudo chown -R root:root /opt/codata
 ```bash
 sudo mkdir -p /opt/codata/data
 sudo chown -R codata:codata /opt/codata/data
-sudo chown codata:codata /opt/codata/.env
-sudo chmod 600 /opt/codata/.env
 ```
 
 ## 2. 安装依赖并构建前端
@@ -43,7 +41,7 @@ sudo npm --prefix /opt/codata/frontend run build
 ## 3. 配置 .env
 
 ```bash
-sudo -u codata cp .env.example .env
+sudo cp .env.example .env
 sudo chown codata:codata .env
 sudo chmod 600 .env
 sudo -u codata nano .env
@@ -73,6 +71,7 @@ CODATA_ALLOWED_HOSTS=codata.example.com
 CODATA_ALLOWED_ORIGINS=https://codata.example.com
 CODATA_COOKIE_SECURE=true
 CODATA_ENABLE_DOCS=false
+CODATA_PROVIDER_TRUST_ENV=false
 ```
 
 `CODATA_ALLOWED_HOSTS` 和 `CODATA_ALLOWED_ORIGINS` 必须和实际域名完全一致，否则 Host/Origin 校验会返回 400/403。`DATAFLOW_ALLOWED_HOSTS` / `RNOTE_ALLOWED_HOSTS` 是出站服务商域名白名单，不要把文档域名当成 API host。
@@ -86,7 +85,7 @@ cd /opt/codata
 sudo -u codata .venv/bin/codata-admin create-admin --username admin
 ```
 
-会交互式要求输入密码（至少 10 个字符）。后续用户可以在页面「用户管理」中创建，也可以使用同一 CLI 重置密码。
+会交互式要求输入密码（至少 6 个字符）。后续用户可以在页面「用户管理」中创建，也可以使用同一 CLI 重置密码。
 
 ## 5. 启动服务
 
@@ -191,7 +190,9 @@ sudo npm --prefix /opt/codata/frontend run build
 sudo systemctl restart codata
 ```
 
-应用启动时如检测到 schema 版本升级，会在 `data/` 下自动生成 `codata.sqlite.bak-schema-v*` 备份后再迁移。不要在同一份 SQLite 上启动多个 Uvicorn worker；如果后续需要多实例/高并发，再迁移到 Postgres 并把采集任务拆到独立 worker。
+应用启动时如检测到 schema 版本升级，会在 `data/` 下自动生成 `codata.sqlite.bak-schema-v*` 备份后再迁移。默认保留 90 天内且最近 10 份的应用备份，启动时自动清理；可用 `CODATA_BACKUP_RETENTION_DAYS` 和 `CODATA_BACKUP_RETENTION_COUNT` 调整，0 表示对应规则不限制。先运行 `sudo -u codata /opt/codata/.venv/bin/codata-admin backups-prune` 查看待清理文件，确认后再加 `--apply`。
+
+不要在同一份 SQLite 上启动多个 Uvicorn worker；如果后续需要多实例/高并发，再迁移到 Postgres 并把采集任务拆到独立 worker。
 
 ## 9. 后续接 SSO
 

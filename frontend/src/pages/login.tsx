@@ -34,7 +34,7 @@ export function LoginPage() {
       <div className="flex flex-1 items-center justify-center p-6">
         <div className="w-full max-w-sm">
           <div className="mb-6 flex justify-center">
-            <img src={moidasLogo} alt="Moidas" className="h-10 w-auto" />
+            <img src={moidasLogo} alt="Moidas" width={1583} height={462} className="h-10 w-auto" />
           </div>
 
           <Card className="py-0 shadow-sm">
