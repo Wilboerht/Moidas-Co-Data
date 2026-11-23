@@ -294,21 +294,23 @@ def _iter_export_items(
     sort: str = "fans",
     order: str = "desc",
 ) -> Generator[dict[str, Any], None, None]:
-    page = 1
-    while True:
-        result = db.query_creators(
-            round_id,
-            sort=sort,
-            order=order,
-            page=page,
-            page_size=page_size,
-            **filters,
-        )
-        for raw in result["items"]:
-            yield _creator_dict(raw)
-        if page * page_size >= result["total"]:
-            break
-        page += 1
+    with db._conn:
+        db._conn.execute("BEGIN")
+        page = 1
+        while True:
+            result = db.query_creators(
+                round_id,
+                sort=sort,
+                order=order,
+                page=page,
+                page_size=page_size,
+                **filters,
+            )
+            for raw in result["items"]:
+                yield _creator_dict(raw)
+            if page * page_size >= result["total"]:
+                break
+            page += 1
 
 
 def _json_list(value: Any) -> list[Any]:
@@ -403,6 +405,15 @@ def _creator_dict(row: dict[str, Any]) -> dict[str, Any]:
         "data_round": data_round,
         "status": normalize_status(row.get("status")),
         "status_label": STATUS_LABELS.get(normalize_status(row.get("status")), normalize_status(row.get("status"))),
+        "round_status": normalize_status(row.get("round_status") or row.get("status")),
+        "round_status_label": STATUS_LABELS.get(
+            normalize_status(row.get("round_status") or row.get("status")),
+            normalize_status(row.get("round_status") or row.get("status")),
+        ),
+        "cooperation_status": normalize_status(row.get("cooperation_status") or row.get("status")),
+        "cooperation_updated_at": row.get("cooperation_updated_at") or "",
+        "updated_at": row.get("updated_at") or "",
+        "enrichment_status": row.get("enrichment_status") or "not_fetched",
         "match_direction": row.get("match_direction") or "",
         "posted": row.get("posted"),
         "liked": row.get("liked"),
@@ -637,16 +648,23 @@ KeywordText = Annotated[str, StringConstraints(strip_whitespace=True, min_length
 
 class UpdateCreatorRequest(BaseModel):
     status: str | None = Field(None, max_length=40)
+    cooperation_status: str | None = Field(None, max_length=40)
     match_direction: str | None = Field(None, max_length=100)
     tags_manual: str | None = Field(None, max_length=500)
     remark: str | None = Field(None, max_length=2000)
     expected_updated_at: str | None = Field(None, max_length=40)
     expected_status: str | None = Field(None, max_length=40)
+    expected_cooperation_status: str | None = Field(None, max_length=40)
+    expected_cooperation_updated_at: str | None = Field(None, max_length=40)
 
 
 class BatchItem(BaseModel):
     platform: str = Field(min_length=1, max_length=20)
     user_id: str = Field(min_length=1, max_length=100)
+    expected_updated_at: str | None = Field(None, max_length=40)
+    expected_status: str | None = Field(None, max_length=40)
+    expected_cooperation_status: str | None = Field(None, max_length=40)
+    expected_cooperation_updated_at: str | None = Field(None, max_length=40)
 
 
 class BatchUpdateRequest(UpdateCreatorRequest):
@@ -1924,6 +1942,8 @@ def update_creator(
     actor = require_user(http_request)
     owner_before = _ensure_creator_exists(db, round_id, platform, user_id)
     status = _validated_status(request.status)
+    cooperation_status = _validated_status(request.cooperation_status)
+    expected_cooperation_status = _validated_status(request.expected_cooperation_status)
     if request.expected_status is not None:
         expected = normalize_status(request.expected_status, default="")
         if expected not in STATUS_CODES:
@@ -1934,11 +1954,14 @@ def update_creator(
             platform,
             user_id,
             status=status,
+            cooperation_status=cooperation_status,
             match_direction=request.match_direction,
             tags_manual=request.tags_manual,
             remark=request.remark,
             expected_updated_at=request.expected_updated_at,
             expected_status=request.expected_status,
+            expected_cooperation_status=expected_cooperation_status,
+            expected_cooperation_updated_at=request.expected_cooperation_updated_at,
             claim_user_id=int(actor["id"]),
         )
     except ValueError as exc:
@@ -1964,6 +1987,7 @@ def update_creator(
         http_request.headers.get("user-agent", ""),
         details={
             "status": status,
+            "cooperation_status": cooperation_status,
             "match_direction": request.match_direction,
             "tags_manual": request.tags_manual,
             "remark": request.remark,
@@ -1993,6 +2017,7 @@ def batch_update(
         value is not None
         for value in (
             request.status,
+            request.cooperation_status,
             request.match_direction,
             request.tags_manual,
             request.remark,
@@ -2004,10 +2029,12 @@ def batch_update(
             if owner and owner.get("owner_user_id") is None:
                 auto_claim_targets += 1
     status = _validated_status(request.status)
-    changed = db.bulk_update_review(
+    cooperation_status = _validated_status(request.cooperation_status)
+    result = db.bulk_update_review(
         round_id,
-        [(item.platform, item.user_id) for item in request.items],
+        [item.model_dump() for item in request.items],
         status=status,
+        cooperation_status=cooperation_status,
         match_direction=request.match_direction,
         tags_manual=request.tags_manual,
         remark=request.remark,
@@ -2031,8 +2058,10 @@ def batch_update(
         _client_ip(http_request),
         http_request.headers.get("user-agent", ""),
         details={
-            "changed": changed,
+            "changed": result["changed"],
+            "conflicts": len(result["conflicts"]),
             "status": status,
+            "cooperation_status": cooperation_status,
             "match_direction": request.match_direction,
             "tags_manual": request.tags_manual,
             "remark": request.remark,
@@ -2040,7 +2069,7 @@ def batch_update(
             "owner_user_id": request.owner_user_id,
         },
     )
-    return {"changed": changed}
+    return result
 
 
 @app.post("/api/rounds/{round_id}/creators/{platform}/{user_id}/claim")

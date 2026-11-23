@@ -43,6 +43,31 @@ import { Switch } from "@/components/ui/switch";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 
+function UserStatusBadge({ user }: { user: AuthUser }) {
+  const status = user.disabled
+    ? {
+        label: "停用",
+        className: "border-rose-200 bg-rose-50 font-normal text-rose-700",
+        title: "账号已停用，无法登录",
+      }
+    : user.must_change_password
+      ? {
+          label: "待改密",
+          className: "border-amber-200 bg-amber-50 font-normal text-amber-700",
+          title: "下次登录需要修改密码",
+        }
+      : {
+          label: "启用",
+          className: "border-emerald-200 bg-emerald-50 font-normal text-emerald-700",
+          title: "账号正常",
+        };
+  return (
+    <Badge variant="outline" className={status.className} title={status.title}>
+      {status.label}
+    </Badge>
+  );
+}
+
 export function UsersPage() {
   const { user } = useAuth();
   const queryClient = useQueryClient();
@@ -240,25 +265,11 @@ export function UsersPage() {
                     </Badge>
                   </TableCell>
                   <TableCell className="text-center">
-                    <div className="flex flex-wrap justify-center gap-1">
-                      <Badge
-                        variant="outline"
-                        className={
-                          item.disabled
-                            ? "border-rose-200 bg-rose-50 font-normal text-rose-700"
-                            : "border-emerald-200 bg-emerald-50 font-normal text-emerald-700"
-                        }
-                      >
-                        {item.disabled ? "停用" : "启用"}
-                      </Badge>
-                      {item.must_change_password ? (
-                        <Badge variant="outline" className="border-amber-200 bg-amber-50 font-normal text-amber-700">
-                          待改密
-                        </Badge>
-                      ) : null}
-                    </div>
+                    <UserStatusBadge user={item} />
                   </TableCell>
-                  <TableCell className="text-muted-foreground">{fmtDateTime(item.last_login_at)}</TableCell>
+                  <TableCell className="text-muted-foreground">
+                    {item.last_login_at ? fmtDateTime(item.last_login_at) : "从未登录"}
+                  </TableCell>
                   <TableCell className="text-muted-foreground">{fmtDateTime(item.created_at)}</TableCell>
                   <TableCell className="text-right">
                     <DropdownMenu>

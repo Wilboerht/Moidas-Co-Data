@@ -82,6 +82,11 @@ export interface Creator {
   data_round: string;
   status: string;
   status_label: string;
+  round_status: string;
+  round_status_label: string;
+  cooperation_status: string;
+  cooperation_updated_at: string;
+  enrichment_status: "not_fetched" | "partial" | "complete";
   match_direction: string;
   posted: number | null;
   liked: number | null;
@@ -484,8 +489,16 @@ export interface CreateRoundPayload {
 }
 
 export interface BatchUpdatePayload {
-  items: { platform: string; user_id: string }[];
+  items: {
+    platform: string;
+    user_id: string;
+    expected_updated_at?: string;
+    expected_status?: string;
+    expected_cooperation_status?: string;
+    expected_cooperation_updated_at?: string;
+  }[];
   status?: string | null;
+  cooperation_status?: string | null;
   match_direction?: string | null;
   tags_manual?: string | null;
   remark?: string | null;

@@ -25,7 +25,7 @@ class JobBusyError(RuntimeError):
     """A round already has a pending or running job."""
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 SCHEMA = """
@@ -113,6 +113,8 @@ CREATE TABLE IF NOT EXISTS creators (
     raw_json TEXT,
     follow_up_user_id INTEGER,
     followed_at TEXT,
+    cooperation_status TEXT,
+    cooperation_updated_at TEXT,
     PRIMARY KEY (platform, user_id)
 );
 
@@ -403,40 +405,46 @@ LEFT JOIN notes n ON n.platform = cr.platform AND n.note_id = cr.top_note_id
 LEFT JOIN users fu ON fu.id = c.follow_up_user_id
 """
 
+ENRICHMENT_SQL = """
+CASE
+    WHEN c.fetched_at IS NULL OR c.fetched_at = '' THEN 'not_fetched'
+    WHEN c.fans IS NOT NULL AND c.posted IS NOT NULL AND c.liked IS NOT NULL THEN 'complete'
+    ELSE 'partial'
+END
+"""
+
 ALL_ROUNDS_FROM_SQL = """
 FROM (
     SELECT cr.*,
-           ROW_NUMBER() OVER (
-               PARTITION BY cr.platform, cr.user_id
-               ORDER BY cr.round_id DESC, cr.updated_at DESC
-           ) AS rn,
-           (
-               SELECT json_group_array(value)
-               FROM (
-                   SELECT DISTINCT s.value AS value
-                   FROM creator_round_sources s
-                   JOIN rounds active2 ON active2.id = s.round_id
-                   WHERE active2.archived_at IS NULL
-                     AND s.platform = cr.platform AND s.user_id = cr.user_id
-                     AND s.kind = 'keyword'
-                   ORDER BY value
-               )
-           ) AS source_keywords_all,
-           (
-               SELECT json_group_array(value)
-               FROM (
-                   SELECT DISTINCT s.value AS value
-                   FROM creator_round_sources s
-                   JOIN rounds active2 ON active2.id = s.round_id
-                   WHERE active2.archived_at IS NULL
-                     AND s.platform = cr.platform AND s.user_id = cr.user_id
-                     AND s.kind = 'label'
-                   ORDER BY value
-               )
-           ) AS source_labels_all
-    FROM creator_rounds cr
-    JOIN rounds active_round ON active_round.id = cr.round_id
-    WHERE active_round.archived_at IS NULL
+           COALESCE(sources.keyword_values, '[]') AS source_keywords_all,
+           COALESCE(sources.label_values, '[]') AS source_labels_all
+    FROM (
+        SELECT cr.*,
+               ROW_NUMBER() OVER (
+                   PARTITION BY cr.platform, cr.user_id
+                   ORDER BY cr.round_id DESC, cr.updated_at DESC
+               ) AS rn
+        FROM creator_rounds cr
+        JOIN rounds active_round ON active_round.id = cr.round_id
+        WHERE active_round.archived_at IS NULL
+    ) cr
+    LEFT JOIN (
+        SELECT platform, user_id,
+               MAX(CASE WHEN kind = 'keyword' THEN source_values END) AS keyword_values,
+               MAX(CASE WHEN kind = 'label' THEN source_values END) AS label_values
+        FROM (
+            SELECT s.platform, s.user_id, s.kind, json_group_array(s.value) AS source_values
+            FROM (
+                SELECT DISTINCT s.platform, s.user_id, s.kind, s.value
+                FROM creator_round_sources s
+                JOIN rounds active2 ON active2.id = s.round_id
+                WHERE active2.archived_at IS NULL
+                ORDER BY s.platform, s.user_id, s.kind, s.value
+            ) s
+            GROUP BY s.platform, s.user_id, s.kind
+        )
+        GROUP BY platform, user_id
+    ) sources ON sources.platform = cr.platform AND sources.user_id = cr.user_id
 ) cr
 JOIN rounds r ON r.id = cr.round_id
 LEFT JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id
@@ -451,19 +459,25 @@ SELECT cr.round_id, cr.platform, cr.user_id,
        cr.source_keywords, cr.source_labels,
        cr.sample_notes, cr.sample_likes, cr.sample_collected,
        cr.sample_comments, cr.sample_interactions, cr.top_note_id,
-       cr.auto_tags, cr.status, cr.match_direction, cr.tags_manual, cr.remark,
+       cr.auto_tags, cr.status, cr.status AS round_status, cr.match_direction, cr.tags_manual, cr.remark,
        cr.data_round, cr.tier_label, cr.account_id,
        c.follow_up_user_id AS owner_user_id, c.followed_at AS claimed_at,
        COALESCE(fu.username, '') AS owner_username,
+       COALESCE(c.cooperation_status, 'pending') AS cooperation_status,
+       c.cooperation_updated_at, cr.updated_at,
        cr.cooperation_platform, cr.raw_title,
        n.title AS top_title, n.url AS top_url, n.liked AS top_liked,
-       r.name AS round_name, {TIER_SQL} AS derived_tier
+       r.name AS round_name, {TIER_SQL} AS derived_tier,
+       {ENRICHMENT_SQL} AS enrichment_status
 """
 
 CREATOR_SELECT_ALL_SQL = CREATOR_SELECT_SQL.replace(
     "cr.source_keywords, cr.source_labels,",
     "COALESCE(cr.source_keywords_all, cr.source_keywords) AS source_keywords, "
     "COALESCE(cr.source_labels_all, cr.source_labels) AS source_labels,",
+).replace(
+    "cr.auto_tags, cr.status,",
+    "cr.auto_tags, COALESCE(c.cooperation_status, 'pending') AS status,",
 )
 
 LEAD_FROM_SQL = """
@@ -843,6 +857,36 @@ class Database:
         )
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_creators_created_at ON creators (created_at)"
+        )
+        if "cooperation_status" not in creator_columns:
+            self._conn.execute("ALTER TABLE creators ADD COLUMN cooperation_status TEXT")
+            self._conn.execute("ALTER TABLE creators ADD COLUMN cooperation_updated_at TEXT")
+            self._conn.execute(
+                """
+                UPDATE creators SET
+                    cooperation_status = COALESCE(
+                        (
+                            SELECT cr.status FROM creator_rounds cr
+                            WHERE cr.platform = creators.platform
+                              AND cr.user_id = creators.user_id
+                              AND cr.status <> 'pending'
+                            ORDER BY cr.updated_at DESC, cr.round_id DESC
+                            LIMIT 1
+                        ),
+                        'pending'
+                    ),
+                    cooperation_updated_at = (
+                        SELECT cr.updated_at FROM creator_rounds cr
+                        WHERE cr.platform = creators.platform
+                          AND cr.user_id = creators.user_id
+                          AND cr.status <> 'pending'
+                        ORDER BY cr.round_id DESC, cr.updated_at DESC
+                        LIMIT 1
+                    )
+                """
+            )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_creators_cooperation_status ON creators (cooperation_status)"
         )
         existing = {
             row["name"]
@@ -1381,9 +1425,8 @@ class Database:
         queries = {
             "creators": "SELECT COUNT(*) AS n FROM creator_rounds WHERE round_id = ?",
             "creators_reviewed": "SELECT COUNT(*) AS n FROM creator_rounds cr "
-            "LEFT JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id "
-            "WHERE cr.round_id = ? AND (cr.status <> 'pending' OR c.follow_up_user_id IS NOT NULL)",
-            "creators_claimed": "SELECT COUNT(*) AS n FROM creator_rounds cr "
+            "WHERE cr.round_id = ? AND cr.status <> 'pending'",
+            "creators_claimed": "SELECT COUNT(DISTINCT cr.platform || '|' || cr.user_id) AS n FROM creator_rounds cr "
             "LEFT JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id "
             "WHERE cr.round_id = ? AND c.follow_up_user_id IS NOT NULL",
             "notes": "SELECT COUNT(DISTINCT nh.note_id) AS n FROM note_hits nh "
@@ -1464,6 +1507,13 @@ class Database:
                 (round_id,),
             ).fetchall()
         ]
+        affected_creators = [
+            (item["platform"], item["user_id"])
+            for item in self._conn.execute(
+                "SELECT DISTINCT platform, user_id FROM creator_rounds WHERE round_id = ?",
+                (round_id,),
+            ).fetchall()
+        ]
         counts: dict[str, Any] = {"lead_links": lead_links}
         with self._conn:
             cur = self._conn.execute(
@@ -1498,6 +1548,8 @@ class Database:
                 )
             cur = self._conn.execute("DELETE FROM rounds WHERE id = ?", (round_id,))
             counts["rounds"] = max(0, cur.rowcount)
+            for platform, user_id in affected_creators:
+                self._sync_cooperation_status(platform, user_id)
             cur = self._conn.execute(
                 """
                 DELETE FROM creators
@@ -1805,11 +1857,39 @@ class Database:
         ).fetchone()
         return dict(row) if row else None
 
+    def _sync_cooperation_status(self, platform: str, user_id: str) -> None:
+        row = self._conn.execute(
+            """
+            SELECT status, updated_at FROM creator_rounds
+            WHERE platform = ? AND user_id = ? AND status <> 'pending'
+            ORDER BY updated_at DESC, round_id DESC LIMIT 1
+            """,
+            (platform, user_id),
+        ).fetchone()
+        if row is None:
+            row = self._conn.execute(
+                """
+                SELECT status, updated_at FROM creator_rounds
+                WHERE platform = ? AND user_id = ?
+                ORDER BY round_id DESC, updated_at DESC LIMIT 1
+                """,
+                (platform, user_id),
+            ).fetchone()
+        if row is not None:
+            self._conn.execute(
+                "UPDATE creators SET cooperation_status = ?, cooperation_updated_at = ? "
+                "WHERE platform = ? AND user_id = ?",
+                (row["status"], row["updated_at"], platform, user_id),
+            )
+
     def creator_is_fresh(self, platform: str, user_id: str, cache_days: int) -> bool:
         row = self._conn.execute(
-            "SELECT fetched_at FROM creators WHERE platform = ? AND user_id = ?", (platform, user_id)
+            "SELECT fetched_at, fans, posted, liked FROM creators WHERE platform = ? AND user_id = ?",
+            (platform, user_id),
         ).fetchone()
         if not row or not row["fetched_at"]:
+            return False
+        if any(row[field] is None for field in ("fans", "posted", "liked")):
             return False
         try:
             fetched = datetime.fromisoformat(row["fetched_at"])
@@ -2107,6 +2187,8 @@ class Database:
                         now,
                     ),
                 )
+        for entry in stats:
+            self._sync_cooperation_status(entry["platform"], entry["user_id"])
         self.rebuild_search_index(round_id)
         return len(stats)
 
@@ -2264,6 +2346,11 @@ class Database:
                         now,
                     ),
                 )
+        for identity in {
+            (str(item["round"].get("platform", "xhs")), str(item["round"]["user_id"]))
+            for item in items
+        }:
+            self._sync_cooperation_status(*identity)
         self.rebuild_search_index(round_id)
         return len(items)
 
@@ -2273,14 +2360,41 @@ class Database:
         platform: str,
         user_id: str,
         status: str | None = None,
+        cooperation_status: str | None = None,
         match_direction: str | None = None,
         tags_manual: str | None = None,
         remark: str | None = None,
         expected_updated_at: str | None = None,
         expected_status: str | None = None,
+        expected_cooperation_status: str | None = None,
+        expected_cooperation_updated_at: str | None = None,
         claim_user_id: int | None = None,
     ) -> None:
         updates: dict[str, Any] = {}
+        if cooperation_status is not None:
+            where = "platform = ? AND user_id = ?"
+            values: list[Any] = [
+                normalize_status(cooperation_status),
+                utc_now(),
+                platform,
+                user_id,
+            ]
+            if expected_cooperation_status is not None:
+                where += " AND cooperation_status = ?"
+                values.append(normalize_status(expected_cooperation_status, default=""))
+            if expected_cooperation_updated_at is not None:
+                where += " AND cooperation_updated_at = ?"
+                values.append(expected_cooperation_updated_at)
+            with self._conn:
+                cur = self._conn.execute(
+                    f"UPDATE creators SET cooperation_status = ?, cooperation_updated_at = ? WHERE {where}",
+                    values,
+                )
+                if (
+                    expected_cooperation_status is not None
+                    or expected_cooperation_updated_at is not None
+                ) and cur.rowcount == 0:
+                    raise ValueError("合作状态已被其他人更新，请刷新后重试")
         if status is not None:
             updates["status"] = normalize_status(status)
         if match_direction is not None:
@@ -2323,21 +2437,24 @@ class Database:
                     "WHERE platform = ? AND user_id = ? AND follow_up_user_id IS NULL",
                     (claim_user_id, utc_now(), platform, user_id),
                 )
+        if status is not None:
+            self._sync_cooperation_status(platform, user_id)
         if tags_manual is not None:
             self._refresh_search_row(round_id, platform, user_id)
 
     def bulk_update_review(
         self,
         round_id: int,
-        items: Iterable[tuple[str, str]],
+        items: Iterable[Any],
         status: str | None = None,
+        cooperation_status: str | None = None,
         match_direction: str | None = None,
         tags_manual: str | None = None,
         remark: str | None = None,
         claim_user_id: int | None = None,
         set_owner: bool = False,
         owner_user_id: int | None = None,
-    ) -> int:
+    ) -> dict[str, Any]:
         updates: dict[str, Any] = {}
         if status is not None:
             updates["status"] = normalize_status(status)
@@ -2348,21 +2465,87 @@ class Database:
         if remark is not None:
             updates["remark"] = remark
         updates = {key: value for key, value in updates.items() if key in REVIEW_FIELDS}
-        if not updates and not set_owner:
-            return 0
+        if not updates and cooperation_status is None and not set_owner:
+            return {"changed": 0, "conflicts": []}
         if updates:
             updates["updated_at"] = utc_now()
         sets = ", ".join(f"{key} = ?" for key in updates)
         values = list(updates.values())
-        item_list = list(items)
+        item_list = [
+            item if isinstance(item, dict) else {"platform": item[0], "user_id": item[1]}
+            for item in items
+        ]
         changed = 0
+        conflicts: list[dict[str, Any]] = []
         with self._conn:
-            for platform, user_id in item_list:
+            for item in item_list:
+                platform = str(item["platform"])
+                user_id = str(item["user_id"])
+                current = self._conn.execute(
+                    "SELECT status, updated_at FROM creator_rounds "
+                    "WHERE round_id = ? AND platform = ? AND user_id = ?",
+                    (round_id, platform, user_id),
+                ).fetchone()
+                creator = self._conn.execute(
+                    "SELECT cooperation_status, cooperation_updated_at FROM creators "
+                    "WHERE platform = ? AND user_id = ?",
+                    (platform, user_id),
+                ).fetchone()
+                conflict_reason = ""
+                if current is None:
+                    conflict_reason = "missing"
+                elif (
+                    updates
+                    and item.get("expected_updated_at") is not None
+                    and current["updated_at"] != item["expected_updated_at"]
+                ):
+                    conflict_reason = "updated_at"
+                elif (
+                    updates
+                    and item.get("expected_status") is not None
+                    and current["status"] != normalize_status(item["expected_status"], default="")
+                ):
+                    conflict_reason = "status"
+                if cooperation_status is not None and not conflict_reason:
+                    current_cooperation = (creator["cooperation_status"] if creator else None) or "pending"
+                    current_cooperation_updated = creator["cooperation_updated_at"] if creator else None
+                    if (
+                        item.get("expected_cooperation_status") is not None
+                        and current_cooperation != normalize_status(
+                            item["expected_cooperation_status"], default=""
+                        )
+                    ):
+                        conflict_reason = "cooperation_status"
+                    elif (
+                        item.get("expected_cooperation_updated_at") is not None
+                        and current_cooperation_updated != item["expected_cooperation_updated_at"]
+                    ):
+                        conflict_reason = "cooperation_updated_at"
+                if conflict_reason:
+                    conflicts.append({
+                        "platform": platform,
+                        "user_id": user_id,
+                        "reason": conflict_reason,
+                        "status": current["status"] if current else None,
+                        "updated_at": current["updated_at"] if current else None,
+                        "cooperation_status": (creator["cooperation_status"] if creator else None) or "pending",
+                        "cooperation_updated_at": creator["cooperation_updated_at"] if creator else None,
+                    })
+                    continue
                 item_changed = False
                 if updates:
                     cur = self._conn.execute(
                         f"UPDATE creator_rounds SET {sets} WHERE round_id = ? AND platform = ? AND user_id = ?",
                         [*values, round_id, platform, user_id],
+                    )
+                    item_changed = item_changed or cur.rowcount > 0
+                    if status is not None:
+                        self._sync_cooperation_status(platform, user_id)
+                if cooperation_status is not None:
+                    cur = self._conn.execute(
+                        "UPDATE creators SET cooperation_status = ?, cooperation_updated_at = ? "
+                        "WHERE platform = ? AND user_id = ?",
+                        (normalize_status(cooperation_status), utc_now(), platform, user_id),
                     )
                     item_changed = item_changed or cur.rowcount > 0
                 if set_owner:
@@ -2398,9 +2581,9 @@ class Database:
                 if item_changed:
                     changed += 1
         if tags_manual is not None:
-            for platform, user_id in item_list:
-                self._refresh_search_row(round_id, platform, user_id)
-        return changed
+            for item in item_list:
+                self._refresh_search_row(round_id, item["platform"], item["user_id"])
+        return {"changed": changed, "conflicts": conflicts}
 
     def creator_owner_options(self) -> list[dict[str, Any]]:
         rows = self._conn.execute(
@@ -2613,13 +2796,15 @@ class Database:
                    cr.source_keywords, cr.source_labels,
                    cr.sample_notes, cr.sample_likes, cr.sample_collected,
                    cr.sample_comments, cr.sample_interactions, cr.top_note_id,
-                   cr.auto_tags, cr.status, cr.match_direction, cr.tags_manual, cr.remark,
+                   cr.auto_tags, cr.status, cr.status AS round_status, cr.match_direction, cr.tags_manual, cr.remark,
                    cr.data_round, cr.tier_label, cr.account_id,
                    c.follow_up_user_id AS owner_user_id, c.followed_at AS claimed_at,
                    COALESCE(u.username, '') AS owner_username,
+                   COALESCE(c.cooperation_status, 'pending') AS cooperation_status,
+                   c.cooperation_updated_at, cr.updated_at,
                    cr.cooperation_platform, cr.raw_title,
                    n.title AS top_title, n.url AS top_url, n.liked AS top_liked,
-                   r.name AS round_name
+                   r.name AS round_name, {ENRICHMENT_SQL} AS enrichment_status
             FROM creator_rounds cr
             JOIN rounds r ON r.id = cr.round_id
             LEFT JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id
@@ -2718,7 +2903,8 @@ class Database:
                 params.extend(source_params)
         status_values = [value for value in (statuses or []) if value]
         if status_values:
-            conditions.append(f"cr.status IN ({','.join('?' * len(status_values))})")
+            status_sql = "COALESCE(c.cooperation_status, 'pending')" if round_id is None else "cr.status"
+            conditions.append(f"{status_sql} IN ({','.join('?' * len(status_values))})")
             params.extend(status_values)
         tier_values = [value for value in (tiers or []) if value]
         if tier_values:
@@ -2760,7 +2946,7 @@ class Database:
         if label_values:
             add_source_filter("label", label_values)
         if only_unenriched:
-            conditions.append("c.fans IS NULL")
+            conditions.append(f"({ENRICHMENT_SQL}) != 'complete'")
         if needs_action:
             unclaimed = "(c.follow_up_user_id IS NULL AND cr.status IN ('pending', 'shortlisted'))"
             if action_actor_id is not None and not action_include_others:
@@ -2884,6 +3070,10 @@ class Database:
             "liked": f"(c.liked IS NULL) ASC, c.liked {direction}",
             "posted": f"(c.posted IS NULL) ASC, c.posted {direction}",
             "sample_likes": f"cr.sample_likes {direction}",
+            "ratio": (
+                "CASE WHEN c.fans > 0 "
+                f"THEN CAST(cr.sample_interactions AS REAL) / c.fans ELSE 0 END {direction}"
+            ),
             "sample_average": (
                 "CASE WHEN cr.sample_notes > 0 "
                 f"THEN CAST(cr.sample_interactions AS REAL) / cr.sample_notes ELSE 0 END {direction}"
@@ -2926,9 +3116,10 @@ class Database:
         params: list[Any] = [*base_params]
         if platform:
             params.append(platform)
+        status_sql = "COALESCE(c.cooperation_status, 'pending')" if round_id is None else "cr.status"
         status_rows = self._conn.execute(
-            f"SELECT cr.status AS value, COUNT(*) AS count {from_sql} "
-            f"WHERE {base_condition}{platform_condition} GROUP BY cr.status ORDER BY count DESC",
+            f"SELECT {status_sql} AS value, COUNT(*) AS count {from_sql} "
+            f"WHERE {base_condition}{platform_condition} GROUP BY value ORDER BY count DESC",
             params,
         ).fetchall()
         tier_rows = self._conn.execute(
@@ -4253,6 +4444,7 @@ class Database:
                     "WHERE platform = ? AND user_id = ?",
                     (owner_user_id, now, platform, user_id),
                 )
+        self._sync_cooperation_status(platform, user_id)
         if commit and self._has_fts:
             self.rebuild_search_index(round_id)
         return inserted
@@ -4346,7 +4538,7 @@ class Database:
             f"""
             SELECT
                 COUNT(*) AS creators,
-                SUM(CASE WHEN c.fans IS NOT NULL THEN 1 ELSE 0 END) AS enriched,
+                SUM(CASE WHEN {ENRICHMENT_SQL} = 'complete' THEN 1 ELSE 0 END) AS enriched,
                 SUM(CASE WHEN cr.status = 'pending' THEN 1 ELSE 0 END) AS pending,
                 SUM(CASE WHEN cr.status = 'adopted' THEN 1 ELSE 0 END) AS adopted
             FROM creator_rounds cr
@@ -4372,9 +4564,9 @@ class Database:
             )
             SELECT
                 COUNT(*) AS creators,
-                SUM(CASE WHEN c.fans IS NOT NULL THEN 1 ELSE 0 END) AS enriched,
-                SUM(CASE WHEN cr.status = 'pending' THEN 1 ELSE 0 END) AS pending,
-                SUM(CASE WHEN cr.status = 'adopted' THEN 1 ELSE 0 END) AS adopted
+                SUM(CASE WHEN {ENRICHMENT_SQL} = 'complete' THEN 1 ELSE 0 END) AS enriched,
+                SUM(CASE WHEN COALESCE(c.cooperation_status, 'pending') = 'pending' THEN 1 ELSE 0 END) AS pending,
+                SUM(CASE WHEN c.cooperation_status = 'adopted' THEN 1 ELSE 0 END) AS adopted
             FROM latest cr
             LEFT JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id
             WHERE cr.rn = 1
@@ -4395,10 +4587,10 @@ class Database:
                 JOIN rounds active_round ON active_round.id = cr.round_id
                 WHERE active_round.archived_at IS NULL
             )
-            SELECT cr.status AS status,
+            SELECT COALESCE(c.cooperation_status, 'pending') AS status,
                    {TIER_SQL} AS label,
                    COUNT(*) AS n,
-                   SUM(CASE WHEN c.fans IS NOT NULL THEN 1 ELSE 0 END) AS enriched
+                   SUM(CASE WHEN {ENRICHMENT_SQL} = 'complete' THEN 1 ELSE 0 END) AS enriched
             FROM latest cr
             LEFT JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id
             WHERE cr.rn = 1
@@ -4410,7 +4602,7 @@ class Database:
             SELECT cr.status AS status,
                    {TIER_SQL} AS label,
                    COUNT(*) AS n,
-                   SUM(CASE WHEN c.fans IS NOT NULL THEN 1 ELSE 0 END) AS enriched
+                   SUM(CASE WHEN {ENRICHMENT_SQL} = 'complete' THEN 1 ELSE 0 END) AS enriched
             FROM creator_rounds cr
             LEFT JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id
             WHERE cr.round_id = ?
@@ -4606,10 +4798,10 @@ class Database:
 
     def round_efficiency(self, limit: int = 6) -> dict[str, Any]:
         rows = self._conn.execute(
-            """
+            f"""
             SELECT r.id AS round_id, r.name, r.platform, r.status, r.created_at, r.finished_at,
                    COUNT(cr.user_id) AS creators,
-                   COALESCE(SUM(CASE WHEN c.fans IS NOT NULL THEN 1 ELSE 0 END), 0) AS enriched,
+                   COALESCE(SUM(CASE WHEN {ENRICHMENT_SQL} = 'complete' THEN 1 ELSE 0 END), 0) AS enriched,
                    COALESCE(SUM(CASE WHEN cr.status = 'pending' THEN 1 ELSE 0 END), 0) AS pending,
                    COALESCE(SUM(CASE WHEN cr.status <> 'pending' THEN 1 ELSE 0 END), 0) AS reviewed,
                    COALESCE(SUM(CASE WHEN cr.status = 'adopted' THEN 1 ELSE 0 END), 0) AS adopted,

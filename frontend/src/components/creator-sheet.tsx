@@ -45,29 +45,40 @@ export function CreatorSheet({
   detailKey,
   statuses,
   onClose,
+  onCancelSwitch,
 }: {
   roundId: number;
   detailKey: string;
   statuses: StatusDef[];
   onClose: () => void;
+  onCancelSwitch?: (roundId: number) => void;
 }) {
   const queryClient = useQueryClient();
   const { refreshRounds } = useRound();
   const dirtyRef = useRef(false);
+  const [activeRoundId, setActiveRoundId] = useState(roundId);
   const [closeConfirmOpen, setCloseConfirmOpen] = useState(false);
+  const [switchConfirmOpen, setSwitchConfirmOpen] = useState(false);
   const [platform, userId] = detailKey.split("|");
+  useEffect(() => {
+    if (roundId === activeRoundId) return;
+    if (dirtyRef.current) {
+      setSwitchConfirmOpen(true);
+      return;
+    }
+    setActiveRoundId(roundId);
+  }, [roundId, activeRoundId]);
   const detail = useQuery({
-    queryKey: ["creator", roundId, platform, userId],
-    queryFn: () => api.getCreator(roundId, platform, userId),
+    queryKey: ["creator", activeRoundId, platform, userId],
+    queryFn: () => api.getCreator(activeRoundId, platform, userId),
     enabled: Boolean(platform && userId),
   });
   const profileHref = safeHttpUrl(detail.data?.profile_url);
-  const isEnriched = detail.data
-    ? Boolean(detail.data.fetched_at) ||
-      (detail.data.fans != null &&
-        detail.data.posted != null &&
-        detail.data.liked != null)
-    : false;
+  const enrichmentLabel = {
+    not_fetched: "未抓取",
+    partial: "部分完整",
+    complete: "完整",
+  }[detail.data?.enrichment_status ?? "not_fetched"];
   const requestClose = () => {
     if (dirtyRef.current) {
       setCloseConfirmOpen(true);
@@ -96,7 +107,7 @@ export function CreatorSheet({
               <SheetDescription className="flex flex-wrap items-center gap-x-2 gap-y-1">
                 <span>
                   {detail.data?.platform_label || platform}
-                  {isEnriched ? " · 资料已补全" : " · 资料待补全"}
+                  {` · ${enrichmentLabel}`}
                 </span>
                 {profileHref ? (
                   <a
@@ -129,7 +140,8 @@ export function CreatorSheet({
           </div>
         ) : detail.data ? (
           <CreatorDetailForm
-            roundId={roundId}
+            key={`${activeRoundId}:${platform}:${userId}`}
+            roundId={activeRoundId}
             detail={detail.data}
             statuses={statuses}
             onSaved={async (updated) => {
@@ -138,7 +150,7 @@ export function CreatorSheet({
               await queryClient.invalidateQueries({ queryKey: ["dashboard"] });
               await queryClient.invalidateQueries({ queryKey: ["activity"] });
               await refreshRounds();
-              queryClient.setQueryData(["creator", roundId, platform, userId], updated);
+              queryClient.setQueryData(["creator", activeRoundId, platform, userId], updated);
             }}
             onDirtyChange={(dirty) => { dirtyRef.current = dirty; }}
           />
@@ -166,6 +178,34 @@ export function CreatorSheet({
                 }}
               >
                 放弃并关闭
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+        <AlertDialog open={switchConfirmOpen} onOpenChange={setSwitchConfirmOpen}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>放弃当前修改并切换轮次？</AlertDialogTitle>
+              <AlertDialogDescription>当前轮次有未保存的标注。继续编辑可返回原轮次，切换后这些修改不会保留。</AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel
+                onClick={() => {
+                  setSwitchConfirmOpen(false);
+                  onCancelSwitch?.(activeRoundId);
+                }}
+              >
+                返回原轮次
+              </AlertDialogCancel>
+              <AlertDialogAction
+                variant="destructive"
+                onClick={() => {
+                  dirtyRef.current = false;
+                  setSwitchConfirmOpen(false);
+                  setActiveRoundId(roundId);
+                }}
+              >
+                放弃修改并切换
               </AlertDialogAction>
             </AlertDialogFooter>
           </AlertDialogContent>
@@ -243,7 +283,11 @@ function CreatorDetailForm({
       await onSaved(updated);
       toast.success("已保存备注");
     },
-    onError: (error) => toast.error(error instanceof Error ? error.message : "保存失败"),
+    onError: async (error) => {
+      toast.error(error instanceof Error ? error.message : "保存失败");
+      await queryClient.invalidateQueries({ queryKey: ["creator", roundId, detail.platform, detail.user_id] });
+      await queryClient.invalidateQueries({ queryKey: ["creators"] });
+    },
   });
 
   const claimMutation = useMutation({
@@ -331,7 +375,10 @@ function CreatorDetailForm({
     detail.data_round && detail.data_round !== detail.round_name
       ? detail.data_round
       : "";
+  const cooperationStatusLabel = statuses.find((item) => item.code === detail.cooperation_status)?.label ?? detail.cooperation_status;
   const concreteMetadata: [string, string][] = [
+    ["主档合作状态", cooperationStatusLabel],
+    ["最新轮次审核", detail.round_status_label],
     ["粉丝层级", detail.fans_tier],
     ["账号 ID", detail.account_id],
     ["小红书号", detail.red_id],

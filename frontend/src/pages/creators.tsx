@@ -18,7 +18,7 @@ import { canonicalSearch } from "@/shared/query-string";
 import { fmtNumber, safeHttpUrl, shorten } from "@/shared/format";
 import { useAuth } from "@/shared/auth-context";
 import { useRound } from "@/shared/round-context";
-import type { Creator, CreatorQuery } from "@/shared/types";
+import type { BatchUpdatePayload, Creator, CreatorQuery } from "@/shared/types";
 import { EmptyState, ErrorState, Page, PageHeader, Section } from "@/components/page";
 import { MultiSelect } from "@/components/multi-select";
 import { CreatorSheet } from "@/components/creator-sheet";
@@ -33,6 +33,16 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Card, CardContent, CardDescription, CardTitle } from "@/components/ui/card";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import {
   Dialog,
   DialogContent,
@@ -69,7 +79,8 @@ const ALL_COLUMNS = [
   ["fans", "粉丝数"],
   ["fans_wan", "粉丝（万）"],
   ["fans_tier", "粉丝层级"],
-  ["status", "采用状态"],
+  ["status", "筛选状态"],
+  ["round_status", "最新轮次审核"],
   ["match_direction", "匹配方向"],
   ["top_title", "代表作"],
   ["posted", "笔记数"],
@@ -143,6 +154,13 @@ function facetOptions(items: { value: string; count: number }[] | undefined) {
   return (items ?? []).map((item) => ({ value: item.value, label: `${item.value} (${item.count})` }));
 }
 
+type EditMode = "keep" | "set" | "clear";
+
+export function editedValue(mode: EditMode, value: string): string | null {
+  if (mode === "clear") return "";
+  return mode === "set" ? value : null;
+}
+
 export function CreatorsPage() {
   const { user } = useAuth();
   const { meta, rounds, round, refreshRounds, loading, error: bootstrapError } = useRound();
@@ -194,8 +212,13 @@ export function CreatorsPage() {
   const [batchOpen, setBatchOpen] = useState(false);
   const [batchStatus, setBatchStatus] = useState("none");
   const [batchDirection, setBatchDirection] = useState("");
+  const [batchDirectionMode, setBatchDirectionMode] = useState<"keep" | "set" | "clear">("keep");
   const [batchRemark, setBatchRemark] = useState("");
+  const [batchRemarkMode, setBatchRemarkMode] = useState<"keep" | "set" | "clear">("keep");
+  const [batchTags, setBatchTags] = useState("");
+  const [batchTagsMode, setBatchTagsMode] = useState<"keep" | "set" | "clear">("keep");
   const [batchOwner, setBatchOwner] = useState("keep");
+  const [batchCloseConfirmOpen, setBatchCloseConfirmOpen] = useState(false);
   const detailKey = params.get("creator");
   const detailRoundParam = params.get("creator_round");
   const parsedDetailRound = detailRoundParam ? Number(detailRoundParam) : NaN;
@@ -333,42 +356,74 @@ export function CreatorsPage() {
 
   const batchMutation = useMutation({
     mutationFn: async () => {
-      const groups = new Map<number, { platform: string; user_id: string }[]>();
+      const groups = new Map<number, BatchUpdatePayload["items"]>();
       for (const item of Object.values(selected)) {
         const targetRound = item.round_id ?? roundFilter ?? rounds[0]?.id;
         if (targetRound == null) continue;
         const rows = groups.get(targetRound) ?? [];
-        rows.push({ platform: item.platform, user_id: item.user_id });
+        rows.push({
+          platform: item.platform,
+          user_id: item.user_id,
+          expected_updated_at: item.updated_at || undefined,
+          expected_status: item.round_status,
+          expected_cooperation_status: item.cooperation_status,
+          expected_cooperation_updated_at: item.cooperation_updated_at || undefined,
+        });
         groups.set(targetRound, rows);
       }
       const results = await Promise.all(
         [...groups.entries()].flatMap(([targetRound, items]) =>
-          chunk(items).map((part) =>
-            api.batchUpdate(targetRound, {
-              items: part,
-        status: batchStatus === "none" ? null : batchStatus,
-        match_direction: batchDirection || null,
-        remark: batchRemark || null,
-        set_owner: user?.role === "admin" && batchOwner !== "keep",
-        owner_user_id:
-          batchOwner === "unassigned"
-            ? null
-            : batchOwner !== "keep"
-              ? Number(batchOwner)
-              : undefined,
-      }),
-          ),
+          chunk(items).map(async (part) => {
+            try {
+              return await api.batchUpdate(targetRound, {
+                items: part,
+                status: roundFilter !== null && batchStatus !== "none" ? batchStatus : null,
+                cooperation_status: roundFilter === null && batchStatus !== "none" ? batchStatus : null,
+                match_direction: editedValue(batchDirectionMode, batchDirection),
+                tags_manual: editedValue(batchTagsMode, batchTags),
+                remark: editedValue(batchRemarkMode, batchRemark),
+                set_owner: user?.role === "admin" && batchOwner !== "keep",
+                owner_user_id:
+                  batchOwner === "unassigned"
+                    ? null
+                    : batchOwner !== "keep"
+                      ? Number(batchOwner)
+                      : undefined,
+              });
+            } catch (error) {
+              return {
+                changed: 0,
+                conflicts: [],
+                error: error instanceof Error ? error.message : "批量更新失败",
+              };
+            }
+          }),
         ),
       );
-      return { changed: results.reduce((sum, item) => sum + item.changed, 0) };
+      return {
+        changed: results.reduce((sum, item) => sum + item.changed, 0),
+        conflicts: results.flatMap((item) => item.conflicts),
+        errors: results.flatMap((item) => "error" in item && item.error ? [item.error] : []),
+      };
     },
     onSuccess: async (result) => {
-      toast.success(`已更新 ${result.changed} 位达人`);
-      setSelected({});
-      setBatchOpen(false);
+      const issues = result.conflicts.length + result.errors.length;
+      if (issues > 0) {
+        toast.warning(
+          `已更新 ${result.changed} 位达人；${result.conflicts.length} 位版本冲突，${result.errors.length} 组请求失败`,
+        );
+      } else {
+        toast.success(`已更新 ${result.changed} 位达人`);
+        setSelected({});
+        setBatchOpen(false);
+      }
       setBatchStatus("none");
       setBatchDirection("");
+      setBatchDirectionMode("keep");
       setBatchRemark("");
+      setBatchRemarkMode("keep");
+      setBatchTags("");
+      setBatchTagsMode("keep");
       setBatchOwner("keep");
       await queryClient.invalidateQueries({ queryKey: ["creators"] });
       await queryClient.invalidateQueries({ queryKey: ["facets"] });
@@ -383,11 +438,19 @@ export function CreatorsPage() {
     mutationFn: async ({ item, status }: { item: CreatorRow; status: string }) => {
       const targetRound = item.round_id ?? roundFilter ?? rounds[0]?.id;
       if (targetRound == null) throw new Error("无法确定该达人所属轮次");
-      return api.updateCreator(targetRound, item.platform, item.user_id, {
-        status,
-        expected_status: item.status,
-        expected_updated_at: item.updated_at || undefined,
-      });
+      return api.updateCreator(targetRound, item.platform, item.user_id,
+        roundFilter === null
+          ? {
+              cooperation_status: status,
+              expected_cooperation_status: item.cooperation_status,
+              expected_cooperation_updated_at: item.cooperation_updated_at || undefined,
+            }
+          : {
+              status,
+              expected_status: item.status,
+              expected_updated_at: item.updated_at || undefined,
+            },
+      );
     },
     onSuccess: async (_updated, variables) => {
       const label = statuses.find((item) => item.code === variables.status)?.label ?? variables.status;
@@ -397,7 +460,11 @@ export function CreatorsPage() {
       await queryClient.invalidateQueries({ queryKey: ["dashboard"] });
       await queryClient.invalidateQueries({ queryKey: ["activity"] });
     },
-    onError: (error) => toast.error(error instanceof Error ? error.message : "状态更新失败"),
+    onError: async (error) => {
+      toast.error(error instanceof Error ? error.message : "状态更新失败");
+      await queryClient.invalidateQueries({ queryKey: ["creators"] });
+      await queryClient.invalidateQueries({ queryKey: ["facets"] });
+    },
   });
 
   const claimMutation = useMutation({
@@ -477,9 +544,21 @@ export function CreatorsPage() {
   const selectedCount = Object.values(selected).length;
   const batchHasChanges =
     batchStatus !== "none" ||
-    Boolean(batchDirection.trim()) ||
-    Boolean(batchRemark.trim()) ||
+    batchDirectionMode === "clear" ||
+    (batchDirectionMode === "set" && Boolean(batchDirection.trim())) ||
+    batchRemarkMode === "clear" ||
+    (batchRemarkMode === "set" && Boolean(batchRemark.trim())) ||
+    batchTagsMode === "clear" ||
+    (batchTagsMode === "set" && Boolean(batchTags.trim())) ||
     (user?.role === "admin" && batchOwner !== "keep");
+  const requestBatchClose = () => {
+    if (batchMutation.isPending) return;
+    if (batchHasChanges) {
+      setBatchCloseConfirmOpen(true);
+      return;
+    }
+    setBatchOpen(false);
+  };
   const advancedFilterCount =
     directionFilter.length + sourceFilter.length +
     (minFans ? 1 : 0) + (maxFans ? 1 : 0) + (onlyUnenriched ? 1 : 0) + (needsAction ? 1 : 0);
@@ -539,6 +618,7 @@ export function CreatorsPage() {
           onChange={(status) => statusMutation.mutate({ item, status })}
         />
       );
+      case "round_status": return <StatusBadge status={item.round_status} label={item.round_status_label} />;
       case "match_direction": return shorten(item.match_direction, 36) || "—";
       case "top_title": return shorten(item.top_title, 48) || "—";
       case "posted": return fmtNumber(item.posted);
@@ -812,7 +892,7 @@ export function CreatorsPage() {
                   </Select>
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  关键词是多标签统计，同一达人可计入多个关键词；全部轮次视图会合并历史命中关键词，状态取最新轮次，跟进人跨轮次保持。
+                  关键词是多标签统计，同一达人可计入多个关键词；全部轮次合并历史命中，合作状态取主档，最新轮次审核用于待办，跟进人跨轮次保持。
                 </p>
               </div>
               <div className="space-y-2">
@@ -919,7 +999,7 @@ export function CreatorsPage() {
                 <Download />导出 Excel
               </Button>
               <Button variant="ghost" size="sm" onClick={() => runExport("csv", "all")}>
-                导出全部 CSV
+                忽略筛选导出 CSV
               </Button>
             </div>
             <DropdownMenu>
@@ -936,7 +1016,7 @@ export function CreatorsPage() {
                   导出当前筛选 Excel
                 </DropdownMenuItem>
                 <DropdownMenuItem onSelect={() => runExport("csv", "all")}>
-                  导出全部 CSV
+                  忽略筛选导出 CSV
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
@@ -1058,11 +1138,11 @@ export function CreatorsPage() {
       </CardContent>
       </Card>
 
-      <Dialog open={batchOpen} onOpenChange={setBatchOpen}>
+      <Dialog open={batchOpen} onOpenChange={(open) => { if (!open) requestBatchClose(); }}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>批量修改 {selectedCount} 位达人</DialogTitle>
-            <DialogDescription>留空的字段不会被修改；未分配的达人默认会自动归你跟进，管理员显式设置跟进人时以设置为准。</DialogDescription>
+            <DialogDescription>字段可设置为不修改、设置新值或清空；{roundFilter === null ? "合作状态修改主档，本轮审核不变。" : "仅修改本轮审核，主档合作状态不变。"}未分配的达人默认会自动归你跟进。</DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
             <div className="space-y-2">
@@ -1095,22 +1175,77 @@ export function CreatorsPage() {
               </div>
             ) : null}
             <div className="space-y-2">
-              <Label htmlFor="batch-direction">匹配方向</Label>
-              <Input id="batch-direction" value={batchDirection} onChange={(event) => setBatchDirection(event.target.value)} placeholder="不修改" />
+              <Label htmlFor="batch-direction-mode">匹配方向</Label>
+              <Select value={batchDirectionMode} onValueChange={(value) => setBatchDirectionMode(value as EditMode)}>
+                <SelectTrigger id="batch-direction-mode" className="w-full"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="keep">不修改</SelectItem>
+                  <SelectItem value="set">设置新值</SelectItem>
+                  <SelectItem value="clear">清空</SelectItem>
+                </SelectContent>
+              </Select>
+              {batchDirectionMode === "set" ? (
+                <Input id="batch-direction" value={batchDirection} onChange={(event) => setBatchDirection(event.target.value)} placeholder="输入匹配方向" />
+              ) : null}
             </div>
             <div className="space-y-2">
-              <Label htmlFor="batch-remark">备注</Label>
-              <Textarea id="batch-remark" value={batchRemark} onChange={(event) => setBatchRemark(event.target.value)} placeholder="不修改" rows={3} />
+              <Label htmlFor="batch-tags-mode">人工标签</Label>
+              <Select value={batchTagsMode} onValueChange={(value) => setBatchTagsMode(value as EditMode)}>
+                <SelectTrigger id="batch-tags-mode" className="w-full"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="keep">不修改</SelectItem>
+                  <SelectItem value="set">设置新值</SelectItem>
+                  <SelectItem value="clear">清空</SelectItem>
+                </SelectContent>
+              </Select>
+              {batchTagsMode === "set" ? (
+                <Input id="batch-tags" value={batchTags} onChange={(event) => setBatchTags(event.target.value)} placeholder="多个标签用逗号分隔" />
+              ) : null}
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="batch-remark-mode">备注</Label>
+              <Select value={batchRemarkMode} onValueChange={(value) => setBatchRemarkMode(value as EditMode)}>
+                <SelectTrigger id="batch-remark-mode" className="w-full"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="keep">不修改</SelectItem>
+                  <SelectItem value="set">设置新值</SelectItem>
+                  <SelectItem value="clear">清空</SelectItem>
+                </SelectContent>
+              </Select>
+              {batchRemarkMode === "set" ? (
+                <Textarea id="batch-remark" value={batchRemark} onChange={(event) => setBatchRemark(event.target.value)} placeholder="输入备注" rows={3} />
+              ) : null}
             </div>
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setBatchOpen(false)}>取消</Button>
+            <Button variant="outline" onClick={requestBatchClose}>取消</Button>
             <Button onClick={() => batchMutation.mutate()} disabled={batchMutation.isPending || !batchHasChanges}>
               {batchMutation.isPending ? "应用中…" : "应用修改"}
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <AlertDialog open={batchCloseConfirmOpen} onOpenChange={setBatchCloseConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>放弃批量修改？</AlertDialogTitle>
+            <AlertDialogDescription>尚未应用的批量设置将被放弃。</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>继续编辑</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              onClick={() => {
+                setBatchCloseConfirmOpen(false);
+                setBatchOpen(false);
+              }}
+            >
+              放弃并关闭
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {detailKey && detailRoundId !== null ? (
         <CreatorSheet
@@ -1121,6 +1256,11 @@ export function CreatorsPage() {
             const next = new URLSearchParams(params);
             next.delete("creator");
             next.delete("creator_round");
+            setParams(next, { replace: true });
+          }}
+          onCancelSwitch={(previousRoundId) => {
+            const next = new URLSearchParams(params);
+            next.set("creator_round", String(previousRoundId));
             setParams(next, { replace: true });
           }}
         />

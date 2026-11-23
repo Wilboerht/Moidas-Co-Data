@@ -1,4 +1,4 @@
-import { api } from "./api";
+import { api, downloadFile } from "./api";
 import type { CreatorQuery } from "./types";
 import { vi } from "vitest";
 
@@ -47,5 +47,23 @@ describe("API query contracts", () => {
     vi.stubGlobal("fetch", fetchMock);
     await api.getLeadFacets(7);
     expect(fetchMock.mock.calls[0][0]).toBe("/api/leads/facets?round_id=7");
+  });
+
+  it("downloads without buffering the whole export as a blob", async () => {
+    const cancel = vi.fn().mockResolvedValue(undefined);
+    const blob = vi.fn();
+    const response = {
+      ok: true,
+      status: 200,
+      headers: new Headers({ "Content-Disposition": 'attachment; filename="creators.csv"' }),
+      body: { cancel },
+      blob,
+    } as unknown as Response;
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response));
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    await downloadFile("/api/creators/export", "fallback.csv");
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(click).toHaveBeenCalledOnce();
+    expect(blob).not.toHaveBeenCalled();
   });
 });

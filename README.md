@@ -9,7 +9,7 @@ Pipeline:
 ## Features
 
 - **Rounds & tasks** — create collection rounds by platform, category, and keyword set; background jobs with live progress, logs, cancel, forced runs, and archive/restore.
-- **Creator library** — server-side pagination, filtering, sorting, detail drawer, batch review, CSV/Excel export. Creator ownership is a responsibility marker, not an edit lock.
+- **Creator library** — server-side pagination, filtering, sorting, detail drawer, batch review, CSV/Excel export. Creator follow-up ownership is a responsibility marker, not an edit lock. Round review status is independent of the master cooperation status: new collection rounds require fresh review without erasing historical cooperation outcomes. Profile completeness is reported as not fetched, partial, or complete.
 - **Lead library** — manual/bulk lead intake, local identity matching against collected creators, ownership, conversion to creators with cost-aware fetch options.
 - **Provider selection** — pick the cheapest configured provider automatically and pre-flight balance checks; transient per-item failures are recorded instead of aborting the whole round.
 - **Cost tracking** — per-request price config, token/USD conversion, live job costs, and API call audit.

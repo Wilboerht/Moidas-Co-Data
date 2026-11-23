@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -10,7 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from codata.db import Database
+from codata.db import Database, SCHEMA
 from codata.normalize import normalize_user_info
 from helpers import user_payload
 
@@ -332,7 +333,8 @@ class DatabaseTests(unittest.TestCase):
             match_direction="咖啡",
             remark="批量",
         )
-        self.assertEqual(changed, 2)
+        self.assertEqual(changed["changed"], 2)
+        self.assertEqual(changed["conflicts"], [])
         rows = {row["user_id"]: row for row in self.db.creator_table(round_id)}
         self.assertEqual(rows["u1"]["status"], "shortlisted")
         self.assertEqual(rows["u2"]["match_direction"], "咖啡")
@@ -586,6 +588,151 @@ class DatabaseTests(unittest.TestCase):
             {path.name for path in root.glob("codata.sqlite.bak-*")},
             {"codata.sqlite.bak-test-03", "codata.sqlite.bak-test-04"},
         )
+
+    def test_cooperation_status_is_independent_of_latest_round(self) -> None:
+        old_round = self._seed_round()
+        self.db.update_review(old_round, "xhs", "u1", status="adopted")
+        old_cooperation = self.db.get_creator("xhs", "u1")["cooperation_updated_at"]
+        new_round = self.db.create_round(["新轮次"], name="COOP-NEW")
+        self.db.add_creator_round(new_round, "xhs", "u1")
+        row = self.db.query_creators(None)["items"][0]
+        self.assertEqual(row["status"], "adopted")
+        self.assertEqual(row["cooperation_status"], "adopted")
+        self.assertEqual(row["round_status"], "pending")
+        self.assertEqual(row["round_id"], new_round)
+        self.assertTrue(row["updated_at"])
+        self.assertEqual(row["enrichment_status"], "complete")
+        self.assertEqual(self.db.dashboard_breakdown(None)["metrics"]["adopted"], 1)
+        facets = self.db.creator_facets(None)
+        adopted = next(item for item in facets["statuses"] if item["value"] == "adopted")
+        self.assertEqual(adopted["count"], 1)
+
+        self.db.update_review(
+            new_round,
+            "xhs",
+            "u1",
+            cooperation_status="rejected",
+            expected_cooperation_status="adopted",
+            expected_cooperation_updated_at=old_cooperation,
+        )
+        row = self.db.query_creators(None)["items"][0]
+        self.assertEqual(row["status"], "rejected")
+        self.assertEqual(row["round_status"], "pending")
+        with self.assertRaises(ValueError):
+            self.db.update_review(
+                new_round,
+                "xhs",
+                "u1",
+                cooperation_status="shortlisted",
+                expected_cooperation_status="adopted",
+                expected_cooperation_updated_at=old_cooperation,
+            )
+        self.db.update_review(new_round, "xhs", "u1", status="rejected")
+        self.db._conn.execute(
+            "UPDATE creator_rounds SET updated_at = '2000-01-01' WHERE round_id = ?",
+            (new_round,),
+        )
+        self.db.update_review(old_round, "xhs", "u1", status="shortlisted")
+        self.assertEqual(
+            self.db.get_creator("xhs", "u1")["cooperation_status"],
+            "shortlisted",
+        )
+
+    def test_cooperation_status_recalculated_after_round_delete(self) -> None:
+        old_round = self._seed_round()
+        self.db.update_review(old_round, "xhs", "u1", status="adopted")
+        new_round = self.db.create_round(["新轮次"], name="COOP-DELETE")
+        self.db.add_creator_round(new_round, "xhs", "u1")
+        self.db.delete_round(old_round)
+        self.assertEqual(self.db.get_creator("xhs", "u1")["cooperation_status"], "pending")
+
+    def test_enrichment_status_partial_and_complete(self) -> None:
+        round_id = self._seed_round()
+        partial = normalize_user_info({"code": 0, "data": {"userid": "u-partial"}})
+        self.db.upsert_creator(partial)
+        self.db.add_creator_round(round_id, "xhs", "u-partial")
+        result = self.db.query_creators(None, search="u-partial", only_unenriched=True)
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["items"][0]["enrichment_status"], "partial")
+        self.assertFalse(self.db.creator_is_fresh("xhs", "u-partial", 30))
+        self.assertEqual(self.db.dashboard_breakdown(None)["metrics"]["enriched"], 1)
+
+        complete = normalize_user_info(user_payload("u-partial"))
+        self.db.upsert_creator(complete)
+        result = self.db.query_creators(None, search="u-partial", only_unenriched=True)
+        self.assertEqual(result["total"], 0)
+        self.assertTrue(self.db.creator_is_fresh("xhs", "u-partial", 30))
+        self.assertEqual(self.db.dashboard_breakdown(None)["metrics"]["enriched"], 2)
+
+    def test_bulk_update_returns_version_conflicts(self) -> None:
+        round_id = self._seed_round()
+        rows = {row["user_id"]: row for row in self.db.creator_table(round_id)}
+        result = self.db.bulk_update_review(
+            round_id,
+            [
+                {
+                    "platform": "xhs",
+                    "user_id": "u1",
+                    "expected_updated_at": rows["u1"]["updated_at"],
+                    "expected_status": "pending",
+                },
+                {
+                    "platform": "xhs",
+                    "user_id": "u2",
+                    "expected_updated_at": "stale-version",
+                    "expected_status": "pending",
+                },
+            ],
+            status="shortlisted",
+        )
+        self.assertEqual(result["changed"], 1)
+        self.assertEqual(len(result["conflicts"]), 1)
+        self.assertEqual(result["conflicts"][0]["user_id"], "u2")
+        statuses = {
+            row["user_id"]: row["status"]
+            for row in self.db.creator_table(round_id)
+        }
+        self.assertEqual(statuses["u1"], "shortlisted")
+        self.assertEqual(statuses["u2"], "pending")
+        global_result = self.db.bulk_update_review(
+            round_id,
+            [{
+                "platform": "xhs",
+                "user_id": "u1",
+                "expected_updated_at": "stale-round-version",
+                "expected_cooperation_status": "shortlisted",
+            }],
+            cooperation_status="adopted",
+        )
+        self.assertEqual(global_result["changed"], 1)
+        self.assertEqual(global_result["conflicts"], [])
+        self.assertEqual(self.db.get_creator("xhs", "u1")["cooperation_status"], "adopted")
+
+    def test_schema_v9_backfills_cooperation_status(self) -> None:
+        self.db.close()
+        path = Path(self.tmp.name) / "legacy"
+        path.mkdir()
+        legacy = sqlite3.connect(path / "codata.sqlite")
+        legacy.executescript(
+            SCHEMA.replace(
+                "    cooperation_status TEXT,\n    cooperation_updated_at TEXT,\n",
+                "",
+            )
+        )
+        legacy.execute("PRAGMA user_version = 8")
+        legacy.execute("INSERT INTO rounds (id, name, status, created_at) VALUES (1, 'OLD', 'done', '2026-01-01')")
+        legacy.execute("INSERT INTO creators (platform, user_id, nickname) VALUES ('xhs', 'u1', '达人')")
+        legacy.execute(
+            "INSERT INTO creator_rounds (round_id, platform, user_id, status, updated_at) "
+            "VALUES (1, 'xhs', 'u1', 'adopted', '2026-01-02')"
+        )
+        legacy.commit()
+        legacy.close()
+        self.db = Database(path)
+        creator = self.db.get_creator("xhs", "u1")
+        self.assertEqual(creator["cooperation_status"], "adopted")
+        self.assertEqual(creator["cooperation_updated_at"], "2026-01-02")
+        self.assertEqual(self.db._conn.execute("PRAGMA user_version").fetchone()[0], 9)
 
     def test_failed_api_call_records_estimated_cost(self) -> None:
         round_id = self._seed_round()

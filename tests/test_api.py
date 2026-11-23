@@ -532,6 +532,29 @@ class ApiTests(unittest.TestCase):
         ).json()
         self.assertEqual(missing["total"], 0)
 
+    def test_export_uses_read_snapshot(self) -> None:
+        with Database(self.settings.output_dir) as db:
+            db.upsert_creator(normalize_user_info(user_payload("u2", "第二位", fans=5000)))
+            db.add_creator_round(self.round_id, "xhs", "u2")
+        stream_db = Database(self.settings.output_dir)
+        stream = api_server._iter_export_items(
+            stream_db,
+            None,
+            {},
+            page_size=1,
+        )
+        try:
+            first = next(stream)
+            self.assertEqual(first["user_id"], "u1")
+            with Database(self.settings.output_dir) as db:
+                db.upsert_creator(normalize_user_info(user_payload("u3", "第三位", fans=30000)))
+                db.add_creator_round(self.round_id, "xhs", "u3")
+            remaining = [first, *list(stream)]
+            self.assertEqual({item["user_id"] for item in remaining}, {"u1", "u2"})
+        finally:
+            stream.close()
+            stream_db.close()
+
     def test_filtered_export(self) -> None:
         self.client.patch(
             f"/api/rounds/{self.round_id}/creators/xhs/u1",
@@ -797,6 +820,42 @@ class ApiTests(unittest.TestCase):
         ).json()["items"]
         latest = next(row for row in all_rows if row["user_id"] == "u1")
         self.assertEqual(latest["owner_user_id"], self.user_id)
+
+    def test_cooperation_status_api_and_batch_conflicts(self) -> None:
+        new_round = self.round_id
+        response = self.client.patch(
+            f"/api/rounds/{new_round}/creators/xhs/u1",
+            json={
+                "cooperation_status": "adopted",
+                "expected_cooperation_status": "pending",
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["cooperation_status"], "adopted")
+        self.assertEqual(response.json()["round_status"], "pending")
+
+        payload = self.client.get("/api/creators?platform=xhs").json()
+        self.assertEqual(payload["items"][0]["status"], "adopted")
+        self.assertEqual(payload["items"][0]["round_status"], "pending")
+        self.assertTrue(payload["items"][0]["updated_at"])
+        dashboard = self.client.get("/api/dashboard").json()
+        self.assertEqual(dashboard["metrics"]["adopted"], 1)
+
+        conflict = self.client.post(
+            f"/api/rounds/{new_round}/creators/batch",
+            json={
+                "items": [{
+                    "platform": "xhs",
+                    "user_id": "u1",
+                    "expected_cooperation_updated_at": "stale-version",
+                }],
+                "cooperation_status": "rejected",
+            },
+        )
+        self.assertEqual(conflict.status_code, 200, conflict.text)
+        self.assertEqual(conflict.json()["changed"], 0)
+        self.assertEqual(len(conflict.json()["conflicts"]), 1)
+        self.assertEqual(self.client.get("/api/dashboard").json()["metrics"]["adopted"], 1)
 
     def test_create_round_without_start(self) -> None:
         response = self.client.post(

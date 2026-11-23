@@ -1,9 +1,10 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { vi } from "vitest";
 import { CreatorSheet } from "./creator-sheet";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { api } from "@/shared/api";
 import type { CreatorDetail } from "@/shared/types";
 
@@ -72,7 +73,8 @@ describe("CreatorSheet", () => {
     });
 
     render(
-      <QueryClientProvider client={queryClient}>
+      <TooltipProvider>
+        <QueryClientProvider client={queryClient}>
         <MemoryRouter>
           <CreatorSheet
             roundId={1}
@@ -81,7 +83,8 @@ describe("CreatorSheet", () => {
             onClose={onClose}
           />
         </MemoryRouter>
-      </QueryClientProvider>,
+        </QueryClientProvider>
+      </TooltipProvider>,
     );
 
     const input = await screen.findByLabelText("人工标签");
@@ -96,5 +99,64 @@ describe("CreatorSheet", () => {
     await user.click(screen.getByRole("button", { name: "关闭" }));
     await user.click(await screen.findByRole("button", { name: "放弃并关闭" }));
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("confirms before switching rounds with unsaved edits", async () => {
+    vi.mocked(api.getCreator).mockImplementation(async (roundId) => ({
+      ...detail,
+      status: roundId === 2 ? "adopted" : "pending",
+      status_label: roundId === 2 ? "已采用" : "待审核",
+    }));
+    vi.mocked(api.getCreatorOwners).mockResolvedValue([]);
+    const onCancelSwitch = vi.fn();
+    const user = userEvent.setup();
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const view = await act(async () => render(
+      <TooltipProvider>
+        <QueryClientProvider client={queryClient}>
+        <MemoryRouter>
+          <CreatorSheet
+            roundId={1}
+            detailKey="xhs|u1"
+            statuses={[
+              { code: "pending", label: "待审核", color: "", order: 1 },
+              { code: "adopted", label: "已采用", color: "", order: 2 },
+            ]}
+            onClose={vi.fn()}
+            onCancelSwitch={onCancelSwitch}
+          />
+        </MemoryRouter>
+        </QueryClientProvider>
+      </TooltipProvider>,
+    ));
+
+    const input = await screen.findByLabelText("人工标签");
+    await user.type(input, "咖啡");
+    await act(async () => {
+      view.rerender(
+      <TooltipProvider>
+        <QueryClientProvider client={queryClient}>
+        <MemoryRouter>
+          <CreatorSheet
+            roundId={2}
+            detailKey="xhs|u1"
+            statuses={[
+              { code: "pending", label: "待审核", color: "", order: 1 },
+              { code: "adopted", label: "已采用", color: "", order: 2 },
+            ]}
+            onClose={vi.fn()}
+            onCancelSwitch={onCancelSwitch}
+          />
+        </MemoryRouter>
+        </QueryClientProvider>
+      </TooltipProvider>,
+      );
+    });
+    expect(await screen.findByText("放弃当前修改并切换轮次？")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "返回原轮次" }));
+    expect(onCancelSwitch).toHaveBeenCalledWith(1);
+    expect(api.getCreator).not.toHaveBeenCalledWith(2, "xhs", "u1");
   });
 });

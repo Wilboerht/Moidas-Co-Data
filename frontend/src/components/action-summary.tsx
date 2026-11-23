@@ -20,7 +20,7 @@ export function ActionSummary({ roundId }: { roundId: number | null }) {
   const counts = query.data?.counts;
   const search = new URLSearchParams({
     needs_action: "true",
-    sort: "sample_average",
+    sort: "ratio",
     order: "desc",
   });
   if (roundId !== null) search.set("round", String(roundId));

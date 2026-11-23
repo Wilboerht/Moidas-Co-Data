@@ -20,7 +20,8 @@ def _rows(db: Database) -> list[dict[str, Any]]:
         for row in db._conn.execute(
             """
             SELECT cr.*, c.nickname AS creator_nickname, c.raw_json AS creator_raw_json,
-                   c.profile_url AS creator_profile_url
+                   c.profile_url AS creator_profile_url,
+                   c.follow_up_user_id AS creator_follow_up_user_id
             FROM creator_rounds cr
             JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id
             WHERE c.user_id LIKE 'import:%'
@@ -101,7 +102,7 @@ def _insert_lead(
                 profile_url,
                 primary.get("raw_title") or "",
                 primary.get("round_id"),
-                primary.get("owner_user_id"),
+                primary.get("owner_user_id") or primary.get("creator_follow_up_user_id"),
                 "converted" if converted else "unverified",
                 legacy_user_id,
                 primary.get("creator_raw_json") or "{}",

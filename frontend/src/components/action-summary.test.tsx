@@ -27,7 +27,7 @@ describe("ActionSummary", () => {
     const link = await screen.findByRole("link", { name: "待处理 4 条，进入达人库处理" });
     expect(link).toHaveAttribute(
       "href",
-      "/creators?needs_action=true&sort=sample_average&order=desc&round=3",
+      "/creators?needs_action=true&sort=ratio&order=desc&round=3",
     );
     await waitFor(() => {
       expect(queryClient.getQueryData(["action-queue", 3])).toBeDefined();

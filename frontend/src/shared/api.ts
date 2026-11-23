@@ -186,11 +186,14 @@ export const api = {
     userId: string,
     payload: {
       status?: string;
+      cooperation_status?: string;
       match_direction?: string;
       tags_manual?: string;
       remark?: string;
       expected_updated_at?: string;
       expected_status?: string;
+      expected_cooperation_status?: string;
+      expected_cooperation_updated_at?: string;
     },
   ) =>
     request<CreatorDetail>(`/rounds/${roundId}/creators/${platform}/${encodeURIComponent(userId)}`, {
@@ -198,7 +201,10 @@ export const api = {
       body: JSON.stringify(payload),
     }),
   batchUpdate: (roundId: number, payload: BatchUpdatePayload) =>
-    request<{ changed: number }>(`/rounds/${roundId}/creators/batch`, {
+    request<{
+      changed: number;
+      conflicts: { platform: string; user_id: string; reason: string }[];
+    }>(`/rounds/${roundId}/creators/batch`, {
       method: "POST",
       body: JSON.stringify(payload),
     }),
@@ -382,19 +388,17 @@ export async function downloadFile(url: string, fallbackName: string): Promise<v
     }
     throw new Error(message || "下载失败");
   }
-  const blob = await response.blob();
   const disposition = response.headers.get("content-disposition") || "";
   const match = /filename="?([^";]+)"?/i.exec(disposition);
   const name = match?.[1] || fallbackName;
-  const objectUrl = URL.createObjectURL(blob);
+  if (response.body) await response.body.cancel();
   const anchor = document.createElement("a");
-  anchor.href = objectUrl;
+  anchor.href = url;
   anchor.download = name;
   anchor.rel = "noopener";
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
-  URL.revokeObjectURL(objectUrl);
 }
 
 export function exportUrl(

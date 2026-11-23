@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Archive, ArrowLeft, RotateCcw, Trash2 } from "lucide-react";
+import { Archive, ArrowLeft, Info, RotateCcw, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/shared/api";
 import { fmtDateTime, fmtDuration, fmtNumber } from "@/shared/format";
@@ -43,6 +43,7 @@ import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   Table,
   TableBody,
@@ -51,6 +52,25 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+
+function InfoHint({ children }: { children: ReactNode }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          aria-label="查看说明"
+          className="inline-flex size-4 items-center justify-center rounded-full text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+        >
+          <Info className="size-3" aria-hidden="true" />
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="left" className="max-w-xs">
+        {children}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
 
 const PROVIDER_LABELS: Record<string, string> = {
   dataflow: "DataFlow",
@@ -476,15 +496,30 @@ export function TaskDetailPage() {
           <Section title="任务操作">
             <div className="space-y-4">
               <div className="flex items-center justify-between gap-4">
-                <Label htmlFor="force-refresh" className="text-sm font-medium">强制刷新达人资料</Label>
+                <div className="flex min-w-0 items-center gap-1">
+                  <Label htmlFor="force-refresh" className="text-sm font-medium">强制刷新达人资料</Label>
+                  <InfoHint>
+                    忽略已缓存的达人资料，重新请求服务商补全本轮所有达人；会增加接口调用次数和费用。
+                  </InfoHint>
+                </div>
                 <Switch id="force-refresh" checked={forceRefresh} onCheckedChange={setForceRefresh} />
               </div>
               <div className="flex items-center justify-between gap-4">
-                <Label htmlFor="force-run" className="text-sm font-medium">跳过余额检查</Label>
+                <div className="flex min-w-0 items-center gap-1">
+                  <Label htmlFor="force-run" className="text-sm font-medium">跳过余额检查</Label>
+                  <InfoHint>
+                    即使服务商余额不足或余额查询失败，也强制开始采集；可能产生超出预算的费用。
+                  </InfoHint>
+                </div>
                 <Switch id="force-run" checked={forceRun} onCheckedChange={setForceRun} />
               </div>
               <div className="space-y-2">
-                <Label htmlFor="run-provider">本次服务商</Label>
+                <div className="flex items-center gap-1">
+                  <Label htmlFor="run-provider">本次服务商</Label>
+                  <InfoHint>
+                    仅影响本次重新采集；自动模式会按当前配置选择价格更优的可用服务商。
+                  </InfoHint>
+                </div>
                 <Select value={providerValue} onValueChange={setProviderOverride}>
                   <SelectTrigger id="run-provider" className="w-full">
                     <SelectValue />
@@ -503,14 +538,23 @@ export function TaskDetailPage() {
                   </SelectContent>
                 </Select>
               </div>
-              <Button
-                variant="outline"
-                className="w-full"
-                disabled={taskBusy || Boolean(round?.archived)}
-                onClick={() => setConfirmOpen(true)}
-              >
-                {job ? "重新采集" : "开始采集"}
-              </Button>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span className="block w-full">
+                    <Button
+                      variant="outline"
+                      className="w-full"
+                      disabled={taskBusy || Boolean(round?.archived)}
+                      onClick={() => setConfirmOpen(true)}
+                    >
+                      {job ? "重新采集" : "开始采集"}
+                    </Button>
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent side="left" className="max-w-xs">
+                  使用当前关键词、页数和上限发起采集；已缓存达人资料默认不重复补全。
+                </TooltipContent>
+              </Tooltip>
               {running ? (
                 <Button
                   variant="destructive"
@@ -530,24 +574,44 @@ export function TaskDetailPage() {
           {isAdmin ? (
             <Section title="轮次管理">
               <div className="space-y-3">
-                <Button
-                  variant="outline"
-                  className="w-full"
-                  disabled={archiveBusy || running}
-                  onClick={() => void setArchived(!round?.archived)}
-                >
-                  {round?.archived ? <RotateCcw /> : <Archive />}
-                  {round?.archived ? "恢复轮次" : "归档轮次"}
-                </Button>
-                <Button
-                  variant="ghost"
-                  className="w-full text-destructive hover:bg-destructive/10 hover:text-destructive"
-                  disabled={running}
-                  onClick={() => void openDelete()}
-                >
-                  <Trash2 />
-                  永久删除
-                </Button>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span className="block w-full">
+                      <Button
+                        variant="outline"
+                        className="w-full"
+                        disabled={archiveBusy || running}
+                        onClick={() => void setArchived(!round?.archived)}
+                      >
+                        {round?.archived ? <RotateCcw /> : <Archive />}
+                        {round?.archived ? "恢复轮次" : "归档轮次"}
+                      </Button>
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent side="left" className="max-w-xs">
+                    {round?.archived
+                      ? "恢复后轮次会重新出现在默认列表中，数据和线索关联保留。"
+                      : "归档后从默认列表隐藏，保留全部数据和线索关联，可随时恢复。"}
+                  </TooltipContent>
+                </Tooltip>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span className="block w-full">
+                      <Button
+                        variant="ghost"
+                        className="w-full text-destructive hover:bg-destructive/10 hover:text-destructive"
+                        disabled={running}
+                        onClick={() => void openDelete()}
+                      >
+                        <Trash2 />
+                        永久删除
+                      </Button>
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent side="left" className="max-w-xs">
+                    彻底删除轮次及关联的达人、笔记、任务和接口记录，需要输入轮次名称确认并自动备份数据库；有关联线索时不能永久删除。
+                  </TooltipContent>
+                </Tooltip>
                 <p className="text-xs text-muted-foreground">
                   归档保留全部数据和线索关联；关联线索的轮次不能永久删除。
                 </p>
@@ -658,7 +722,7 @@ export function TaskDetailPage() {
             <div className="space-y-3 text-sm">
               <div className="grid grid-cols-2 gap-2 border p-3">
                 <span>达人-轮次：{fmtNumber(impact.creators)}</span>
-                <span>已审核/负责：{fmtNumber(impact.creators_reviewed)}</span>
+                <span>已审核：{fmtNumber(impact.creators_reviewed)}</span>
                 <span>笔记：{fmtNumber(impact.notes)}</span>
                 <span>关联线索：{fmtNumber(impact.leads)}</span>
                 <span>已转线索：{fmtNumber(impact.leads_converted)}</span>
