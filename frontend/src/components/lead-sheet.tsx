@@ -3,11 +3,11 @@ import { Link } from "react-router-dom";
 import { ExternalLink, Link2, LoaderCircle, MoreHorizontal } from "lucide-react";
 import { toast } from "sonner";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api } from "@/shared/api";
+import { api, ApiError } from "@/shared/api";
 import { useAuth } from "@/shared/auth-context";
 import { useRound } from "@/shared/round-context";
 import { assumeHttpUrl, fmtDateTime } from "@/shared/format";
-import type { LeadOwner, LeadStatusDef } from "@/shared/types";
+import type { LeadOwner, LeadStatusDef, LeadVerifyResult } from "@/shared/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -48,9 +48,48 @@ import { Switch } from "@/components/ui/switch";
 
 type ConfirmAction = "convert" | "duplicate" | "discarded";
 
+type IdentityMismatch = {
+  code: string;
+  message: string;
+  lead_id: number;
+  platform: string;
+  requested_user_id: string;
+  requested_handle: string;
+  requested_profile_url: string;
+  resolved_user_id: string;
+  resolved_handle: string;
+  resolved_nickname: string;
+  resolved_profile_url: string;
+  confidence: string;
+  status: string;
+  note: string;
+  provider: string;
+};
+
+const IDENTITY_STATUS_LABELS: Record<string, string> = {
+  unverified: "未校验",
+  verified: "已校验",
+  mismatch: "待确认",
+  not_found: "未找到",
+};
+
+const IDENTITY_CONFIDENCE_LABELS: Record<string, string> = {
+  account_id: "用户 ID 一致",
+  platform_handle: "平台账号一致",
+  profile_url: "主页一致",
+  nickname: "仅昵称一致",
+  manual_mismatch: "人工确认",
+  matched: "本地匹配",
+  local: "本地达人",
+  none: "无匹配",
+  round_account_id: "轮次账号",
+  auto: "自动匹配",
+};
+
 const MATCH_CONFIDENCE_LABELS: Record<string, string> = {
   account_id: "账号 ID",
   round_account_id: "轮次账号",
+  auto: "自动匹配",
   legacy_user_id: "历史导入 ID",
   nickname: "昵称疑似",
 };
@@ -67,38 +106,47 @@ export function LeadSheet({
   statuses,
   owners,
   canCollect,
+  canEditLeads,
   onClose,
 }: {
   leadId: number;
   statuses: LeadStatusDef[];
   owners: LeadOwner[];
   canCollect: boolean;
+  canEditLeads: boolean;
   onClose: () => void;
 }) {
   const queryClient = useQueryClient();
-  const { meta, rounds } = useRound();
+  const { meta, rounds, settings } = useRound();
   const query = useQuery({
     queryKey: ["lead", leadId],
     queryFn: () => api.getLead(leadId),
   });
   const lead = query.data;
   const [accountId, setAccountId] = useState("");
+  const [platformHandle, setPlatformHandle] = useState("");
   const [profileUrl, setProfileUrl] = useState("");
   const [nickname, setNickname] = useState("");
   const [platform, setPlatform] = useState("xhs");
+  const [provider, setProvider] = useState("auto");
   const [sourceRoundId, setSourceRoundId] = useState("none");
   const [fetchProfile, setFetchProfile] = useState(true);
+  const [verifyResult, setVerifyResult] = useState<LeadVerifyResult | null>(null);
+  const [mismatchResult, setMismatchResult] = useState<IdentityMismatch | null>(null);
 
   useEffect(() => {
     if (!lead) return;
     setAccountId(lead.account_id || "");
+    setPlatformHandle(lead.platform_handle || "");
     setProfileUrl(lead.profile_url || "");
     setNickname(lead.nickname || "");
     setPlatform(lead.platform || "xhs");
     setSourceRoundId(lead.source_round_id ? String(lead.source_round_id) : "none");
+    setVerifyResult(null);
   }, [
     lead?.id,
     lead?.account_id,
+    lead?.platform_handle,
     lead?.profile_url,
     lead?.nickname,
     lead?.platform,
@@ -107,9 +155,53 @@ export function LeadSheet({
 
   useEffect(() => {
     if (!lead) return;
-    setFetchProfile(!lead.matched_user_id);
-  }, [lead?.id, lead?.matched_user_id]);
+    setFetchProfile(!lead.matched_creator);
+  }, [lead?.id, lead?.matched_creator?.user_id]);
   const platforms = meta?.platforms ?? [];
+  const platformConfig = settings?.platforms.find((item) => item.code === platform);
+  const providerOptions = (platformConfig?.providers ?? []).filter(
+    (item) => item.enabled,
+  );
+  const automaticProvider = providerOptions
+    .filter((item) => item.ready)
+    .reduce<(typeof providerOptions)[number] | undefined>((best, item) => {
+      if (!best) return item;
+      return item.user_cost_tokens < best.user_cost_tokens ? item : best;
+    }, undefined);
+  const effectiveProviderId =
+    provider === "auto" ? automaticProvider?.id : provider;
+  const selectedProvider = providerOptions.find(
+    (item) => item.id === effectiveProviderId,
+  );
+  const providerReady = Boolean(selectedProvider?.ready);
+  const providerCostTokens = selectedProvider?.user_cost_tokens ?? 0;
+  const providerCostCny = selectedProvider?.user_cost_cny ?? "—";
+  const needsHandleResolution =
+    platform === "xhs" &&
+    !accountId.trim() &&
+    !profileUrl.trim() &&
+    Boolean(platformHandle.trim());
+  const providerTotalCostTokens =
+    providerCostTokens +
+    (needsHandleResolution ? (selectedProvider?.search_cost_tokens ?? 0) : 0);
+  const needsUserId =
+    !accountId.trim() &&
+    !profileUrl.trim() &&
+    Boolean(platformHandle.trim()) &&
+    platform !== "xhs" &&
+    platform !== "instagram" &&
+    platform !== "zhihu";
+  const providerLabel =
+    provider === "auto"
+      ? `自动（${selectedProvider?.label ?? "未配置"}）`
+      : selectedProvider?.label ?? provider;
+
+  useEffect(() => {
+    if (!settings || provider === "auto") return;
+    if (!providerOptions.some((item) => item.id === provider)) {
+      setProvider("auto");
+    }
+  }, [provider, providerOptions, settings]);
 
   const [confirmAction, setConfirmAction] = useState<ConfirmAction | null>(null);
   const [closeConfirmOpen, setCloseConfirmOpen] = useState(false);
@@ -136,6 +228,7 @@ export function LeadSheet({
         platform,
         nickname: nickname.trim(),
         account_id: accountId.trim(),
+        platform_handle: platformHandle.trim(),
         profile_url: profileUrl.trim(),
         source_round_id: sourceRoundId === "none" ? null : Number(sourceRoundId),
       }),
@@ -170,27 +263,73 @@ export function LeadSheet({
   });
 
   const convertMutation = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (confirmMismatch: boolean) => {
       if (dirty) {
         await api.updateLead(leadId, {
           platform,
           nickname: nickname.trim(),
           account_id: accountId.trim(),
+          platform_handle: platformHandle.trim(),
           profile_url: profileUrl.trim(),
           source_round_id: sourceRoundId === "none" ? null : Number(sourceRoundId),
         });
       }
       return api.convertLead(leadId, {
         account_id: accountId.trim(),
+        platform_handle: platformHandle.trim(),
         profile_url: profileUrl.trim(),
         fetch: fetchProfile,
+        provider,
+        confirm_mismatch: confirmMismatch,
       });
     },
     onSuccess: async () => {
       toast.success("线索已转为达人");
+      setMismatchResult(null);
+      setVerifyResult(null);
       await refresh();
     },
-    onError: (error) => toast.error(error instanceof Error ? error.message : "转换失败"),
+    onError: (error) => {
+      if (
+        error instanceof ApiError &&
+        error.status === 409 &&
+        error.detail &&
+        typeof error.detail === "object" &&
+        (error.detail as { code?: string }).code === "lead_identity_mismatch"
+      ) {
+        setMismatchResult(error.detail as IdentityMismatch);
+        setConfirmAction(null);
+        return;
+      }
+      toast.error(error instanceof Error ? error.message : "转换失败");
+    },
+  });
+
+  const verifyMutation = useMutation({
+    mutationFn: (options: { apply?: boolean; confirmMismatch?: boolean } = {}) =>
+      api.verifyLead(leadId, {
+        provider,
+        account_id: accountId.trim() || undefined,
+        platform_handle: platformHandle.trim() || undefined,
+        profile_url: profileUrl.trim() || undefined,
+        apply: options.apply,
+        confirm_mismatch: options.confirmMismatch,
+      }),
+    onSuccess: async (result) => {
+      setVerifyResult(result);
+      if (result.applied) {
+        toast.success("账号校验结果已保存");
+        await refresh();
+      } else if (result.status === "verified") {
+        toast.success("校验通过，可保存结果或直接转换");
+      } else if (result.status === "mismatch") {
+        toast.warning(result.note || "抓取结果与线索不一致，请确认");
+      } else {
+        toast.error(result.note || "未能校验账号");
+      }
+    },
+    onError: (error) =>
+      toast.error(error instanceof Error ? error.message : "校验失败"),
   });
 
   const matchMutation = useMutation({
@@ -232,9 +371,12 @@ export function LeadSheet({
     (platform !== (lead?.platform || "xhs") ||
       nickname !== (lead?.nickname || "") ||
       accountId !== (lead?.account_id || "") ||
+      platformHandle !== (lead?.platform_handle || "") ||
       profileUrl !== (lead?.profile_url || "") ||
       sourceRoundId !== (lead?.source_round_id ? String(lead.source_round_id) : "none"));
-  const canIdentify = Boolean(accountId.trim() || profileUrl.trim());
+  const canIdentify = Boolean(
+    accountId.trim() || platformHandle.trim() || profileUrl.trim(),
+  );
   const hasRounds = Boolean(
     lead &&
       (lead.rounds.length > 0 ||
@@ -248,6 +390,7 @@ export function LeadSheet({
     statusMutation.isPending ||
     ownerMutation.isPending ||
     convertMutation.isPending ||
+    verifyMutation.isPending ||
     matchMutation.isPending ||
     confirmSuggestionMutation.isPending;
 
@@ -264,7 +407,7 @@ export function LeadSheet({
   const ownedByMe = Boolean(
     lead && (lead.owner_user_id == null || lead.owner_user_id === user?.id || user?.role === "admin"),
   );
-  const editable = Boolean(lead && lead.status !== "converted" && canCollect && ownedByMe);
+  const editable = Boolean(lead && lead.status !== "converted" && canEditLeads && ownedByMe);
   const convertedUserId = lead?.converted_user_id || lead?.account_id || "";
   const convertedRoundId =
     lead?.rounds[0]?.round_id ?? lead?.source_round_id ?? lead?.matched_round_id ?? null;
@@ -283,8 +426,11 @@ export function LeadSheet({
           `${lead?.matched_platform || lead?.platform || ""}|${lead?.matched_user_id || ""}`,
         )}&creator_round=${matchedRoundId}`
       : null;
-  const matchedConfidence =
-    MATCH_CONFIDENCE_LABELS[lead?.match_confidence || ""] || lead?.match_confidence || "—";
+  const matchedConfidence = (() => {
+    const value = lead?.match_confidence;
+    const label = MATCH_CONFIDENCE_LABELS[value || ""] || value || "—";
+    return !canCollect && value === "round_account_id" ? "自动匹配" : label;
+  })();
 
   const profileHref = assumeHttpUrl(profileUrl);
 
@@ -294,31 +440,39 @@ export function LeadSheet({
       ? "正在抓取并转换，请稍候…"
       : locked
         ? "该线索已转为达人，资料只读。"
-        : !canCollect
-          ? "只读：当前账号没有采集权限"
+        : !canEditLeads
+          ? "当前为只读模式"
           : !ownedByMe
             ? `只读：线索由 ${lead?.owner_username || "其他成员"} 负责`
             : dirty
             ? "有未保存的修改"
-            : !canIdentify
-              ? "填写真实账号 ID 或主页 URL 后可转为达人"
-              : !hasRounds
+            : canCollect && !canIdentify
+              ? "填写平台账号、用户 ID 或主页 URL 后可转为达人"
+              : canCollect && !hasRounds
                 ? "该线索没有关联轮次，无法转为达人"
-                : matched
-                  ? "已关联达人，转换默认复用达人库资料"
-                  : "资料已保存";
+                : canCollect && fetchProfile && !providerReady
+                  ? "当前平台没有可用的采集服务商，请先在设置中配置"
+                  : matched
+                    ? canCollect
+                      ? "已关联达人，转换默认复用达人库资料"
+                      : "已关联达人"
+                    : "资料已保存";
 
   const confirmCopy =
     confirmAction === "convert"
       ? {
           title: "转为达人？",
-          description: matched
+          description: lead?.matched_creator
             ? fetchProfile
-              ? "将按已关联账号刷新达人资料后再转换，可能产生一次接口调用费用。转换后线索资料将不可再编辑。"
+              ? `将按已关联账号刷新达人资料后再转换，服务商：${providerLabel}，预计 ${providerTotalCostTokens} token（约 ${providerCostCny} 元）。转换后线索资料将不可再编辑。`
               : "达人资料已在达人库中，转换不会产生接口调用费用。转换后线索资料将不可再编辑。"
             : `将按${
-                accountId.trim() ? `账号 ID「${accountId.trim()}」` : "主页 URL"
-              }抓取并补全达人资料，可能产生一次接口调用费用。转换后线索资料将不可再编辑。`,
+                accountId.trim()
+                  ? `用户 ID「${accountId.trim()}」`
+                  : platformHandle.trim()
+                    ? `平台账号「${platformHandle.trim()}」`
+                    : "主页 URL"
+              }抓取并校验账号，服务商：${providerLabel}，预计 ${providerTotalCostTokens} token（约 ${providerCostCny} 元）。如抓取结果与账号不一致，会再次请你确认。`,
           action: "确认转换",
           variant: "default" as const,
         }
@@ -396,13 +550,24 @@ export function LeadSheet({
                     </Select>
                   </div>
                   <div className="space-y-2">
-                    <Label htmlFor="lead-account">真实账号 ID</Label>
+                    <Label htmlFor="lead-handle">平台账号</Label>
+                    <Input
+                      id="lead-handle"
+                      value={platformHandle}
+                      disabled={!editable}
+                      onChange={(event) => setPlatformHandle(event.target.value)}
+                      placeholder="小红书号 / 微博号 / 抖音号等"
+                      autoComplete="off"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="lead-account">平台用户 ID</Label>
                     <Input
                       id="lead-account"
                       value={accountId}
                       disabled={!editable}
                       onChange={(event) => setAccountId(event.target.value)}
-                      placeholder="填写后可用于转换"
+                      placeholder="采集接口使用的内部 ID，可校验后自动获取"
                       autoComplete="off"
                     />
                   </div>
@@ -414,7 +579,7 @@ export function LeadSheet({
                         value={profileUrl}
                         disabled={!editable}
                         onChange={(event) => setProfileUrl(event.target.value)}
-                        placeholder="https://..."
+                        placeholder="https://…"
                         className="pr-9"
                         autoComplete="off"
                       />
@@ -432,40 +597,207 @@ export function LeadSheet({
                       ) : null}
                     </div>
                   </div>
-                  <div className="flex items-center justify-between gap-4 border px-3 py-2 sm:col-span-2">
-                    <div>
-                      <Label htmlFor="lead-fetch-profile">转换时抓取最新资料</Label>
-                      <p className="text-xs text-muted-foreground">
-                        本地已有资料可关闭，避免重复计费。
-                      </p>
-                    </div>
-                    <Switch
-                      id="lead-fetch-profile"
-                      checked={fetchProfile}
-                      onCheckedChange={setFetchProfile}
-                      disabled={!editable}
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="lead-source-round">来源轮次</Label>
-                    <Select
-                      value={sourceRoundId}
-                      onValueChange={setSourceRoundId}
-                      disabled={!editable}
-                    >
-                      <SelectTrigger id="lead-source-round" className="w-full">
-                        <SelectValue placeholder="不关联" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="none">不关联</SelectItem>
-                        {rounds.map((round) => (
-                          <SelectItem key={round.id} value={String(round.id)}>
-                            {round.name}
+                  {canCollect ? (
+                    <div className="space-y-2 sm:col-span-2">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <Label htmlFor="lead-provider">采集服务商</Label>
+                        <span className="text-xs text-muted-foreground">
+                          {selectedProvider
+                            ? `${providerTotalCostTokens} token / 约 ${providerCostCny} 元${needsHandleResolution ? " 起（含搜索解析）" : ""}`
+                            : "当前平台没有可用服务商"}
+                        </span>
+                      </div>
+                      <Select
+                        value={provider}
+                        onValueChange={setProvider}
+                        disabled={!editable || busy || providerOptions.length === 0}
+                      >
+                        <SelectTrigger id="lead-provider" className="w-full">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="auto">
+                            自动选择最便宜（{automaticProvider?.label ?? "未配置"}）
                           </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </div>
+                          {providerOptions.map((item) => (
+                            <SelectItem
+                              key={item.id}
+                              value={item.id}
+                              disabled={!item.ready}
+                            >
+                              {item.label}
+                              {item.ready ? "" : "（未配置）"} ·{" "}
+                              {item.user_cost_tokens} token/次
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      {!providerReady ? (
+                        <p className="text-xs text-destructive">
+                          当前没有可用服务商，请先在设置中配置；关闭“抓取最新资料”可使用本地达人资料。
+                        </p>
+                      ) : null}
+                      {needsHandleResolution ? (
+                        <p className="text-xs text-amber-600">
+                          当前只有小红书号：校验会先按昵称搜索解析用户 ID，额外产生一次搜索费用（约{" "}
+                          {selectedProvider?.search_cost_tokens ?? 0} token）。如果已有主页 URL
+                          或 24 位用户 ID，直接填写可跳过搜索。
+                        </p>
+                      ) : null}
+                      {needsUserId ? (
+                        <p className="text-xs text-amber-600">
+                          该平台账号不能直接作为接口用户 ID，请填写主页 URL 或平台用户 ID 后再校验。
+                        </p>
+                      ) : null}
+                    </div>
+                  ) : null}
+                  {canCollect ? (
+                    <div className="space-y-2 border px-3 py-2 sm:col-span-2">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="min-w-0">
+                          <p className="flex flex-wrap items-center gap-2 text-sm font-medium">
+                            账号校验
+                            <Badge variant="secondary" className="font-normal">
+                              {lead.identity_status_label || IDENTITY_STATUS_LABELS[lead.identity_status] || lead.identity_status}
+                            </Badge>
+                          </p>
+                          <p className="text-xs text-muted-foreground">
+                            {lead.identity_checked_at
+                              ? `最近校验 ${fmtDateTime(lead.identity_checked_at)}`
+                              : "尚未校验；校验通过后会自动保存，不一致时需要确认。"}
+                            {lead.identity_note ? ` · ${lead.identity_note}` : ""}
+                          </p>
+                          <p className="text-xs text-muted-foreground">
+                            校验只确认身份；直接“转为达人”会在一次抓取中完成校验和补全。
+                          </p>
+                        </div>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={() => verifyMutation.mutate({ apply: true })}
+                          disabled={!canIdentify || !providerReady || busy || !editable}
+                          title={
+                            !providerReady
+                              ? "请先选择可用的采集服务商"
+                              : undefined
+                          }
+                        >
+                          {verifyMutation.isPending ? (
+                            <LoaderCircle className="animate-spin" />
+                          ) : null}
+                          校验账号
+                        </Button>
+                      </div>
+                      {verifyResult ? (
+                        <div className="space-y-1.5 border-t pt-2 text-xs">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <Badge
+                              variant={verifyResult.status === "verified" ? "secondary" : "outline"}
+                              className="font-normal"
+                            >
+                              {IDENTITY_STATUS_LABELS[verifyResult.status] || verifyResult.status}
+                            </Badge>
+                            <span className="text-muted-foreground">
+                              {IDENTITY_CONFIDENCE_LABELS[verifyResult.confidence] || verifyResult.confidence || "—"}
+                              {verifyResult.provider ? ` · ${verifyResult.provider}` : ""}
+                              {verifyResult.resolution === "search" ? " · 搜索结果解析" : ""}
+                              {verifyResult.cost
+                                ? ` · ${verifyResult.cost} token`
+                                : verifyResult.estimated_cost
+                                  ? ` · 未计费（预估 ${verifyResult.estimated_cost} token）`
+                                  : ""}
+                              {verifyResult.attempts > 1 ? ` · ${verifyResult.attempts} 次尝试` : ""}
+                            </span>
+                          </div>
+                          <p className="break-words">
+                            请求：{verifyResult.requested_user_id || verifyResult.requested_handle || verifyResult.requested_profile_url || "—"}
+                          </p>
+                          <p className="break-words">
+                            结果：{verifyResult.resolved_nickname || "—"}
+                            {verifyResult.resolved_user_id ? ` · ${verifyResult.resolved_user_id}` : ""}
+                            {verifyResult.resolved_handle ? ` · ${verifyResult.resolved_handle}` : ""}
+                          </p>
+                          {verifyResult.note ? (
+                            <p className="text-muted-foreground">{verifyResult.note}</p>
+                          ) : null}
+                          <div className="flex flex-wrap items-center gap-2">
+                            {verifyResult.resolved_profile_url ? (
+                              <a
+                                href={assumeHttpUrl(verifyResult.resolved_profile_url) || verifyResult.resolved_profile_url}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="text-primary underline-offset-4 hover:underline"
+                              >
+                                打开抓取到的主页
+                              </a>
+                            ) : null}
+                            {verifyResult.applied ? (
+                              <span className="text-muted-foreground">已保存</span>
+                            ) : verifyResult.status === "verified" || verifyResult.status === "mismatch" ? (
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant={verifyResult.status === "mismatch" ? "destructive" : "outline"}
+                                disabled={busy}
+                                onClick={() =>
+                                  verifyMutation.mutate({
+                                    apply: true,
+                                    confirmMismatch: verifyResult.status === "mismatch",
+                                  })
+                                }
+                              >
+                                {verifyMutation.isPending ? (
+                                  <LoaderCircle className="animate-spin" />
+                                ) : null}
+                                {verifyResult.status === "mismatch" ? "确认采用并保存" : "采用并保存"}
+                              </Button>
+                            ) : null}
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
+                  {canCollect ? (
+                    <div className="flex items-center justify-between gap-4 border px-3 py-2 sm:col-span-2">
+                      <div>
+                        <Label htmlFor="lead-fetch-profile">转换时抓取最新资料</Label>
+                        <p className="text-xs text-muted-foreground">
+                          {lead.matched_creator
+                            ? "本地已有关联达人资料，可关闭以避免重复计费。"
+                            : "本地没有关联达人资料，转换时必须抓取。"}
+                        </p>
+                      </div>
+                      <Switch
+                        id="lead-fetch-profile"
+                        checked={fetchProfile}
+                        onCheckedChange={setFetchProfile}
+                        disabled={!editable || !lead.matched_creator}
+                      />
+                    </div>
+                  ) : null}
+                  {canCollect ? (
+                    <div className="space-y-2">
+                      <Label htmlFor="lead-source-round">来源轮次</Label>
+                      <Select
+                        value={sourceRoundId}
+                        onValueChange={setSourceRoundId}
+                        disabled={!editable}
+                      >
+                        <SelectTrigger id="lead-source-round" className="w-full">
+                          <SelectValue placeholder="不关联" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="none">不关联</SelectItem>
+                          {rounds.map((round) => (
+                            <SelectItem key={round.id} value={String(round.id)}>
+                              {round.name}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  ) : null}
                   <div className="space-y-2">
                     <Label htmlFor="lead-owner">负责人</Label>
                     <Select
@@ -526,10 +858,16 @@ export function LeadSheet({
                           </span>
                         </p>
                         <p className="text-xs text-muted-foreground">
-                          匹配轮次{" "}
-                          {lead.matched_round_name ||
-                            (matchedRoundId != null ? `轮次 ${matchedRoundId}` : "—")}{" "}
-                          · 方式 {matchedConfidence}
+                          {canCollect ? (
+                            <>
+                              匹配轮次{" "}
+                              {lead.matched_round_name ||
+                                (matchedRoundId != null ? `轮次 ${matchedRoundId}` : "—")}{" "}
+                              · 方式 {matchedConfidence}
+                            </>
+                          ) : (
+                            <>方式 {matchedConfidence}</>
+                          )}
                           {lead.matched_at ? ` · ${fmtDateTime(lead.matched_at)}` : ""}
                         </p>
                       </div>
@@ -562,10 +900,12 @@ export function LeadSheet({
                     <dt className="text-xs text-muted-foreground">来源</dt>
                     <dd className="truncate">{lead.source_label || lead.source}</dd>
                   </div>
-                  <div className="min-w-0">
-                    <dt className="text-xs text-muted-foreground">来源轮次</dt>
-                    <dd className="truncate">{lead.source_round_name || lead.source_round_id || "—"}</dd>
-                  </div>
+                  {canCollect ? (
+                    <div className="min-w-0">
+                      <dt className="text-xs text-muted-foreground">来源轮次</dt>
+                      <dd className="truncate">{lead.source_round_name || lead.source_round_id || "—"}</dd>
+                    </div>
+                  ) : null}
                   <div className="min-w-0">
                     <dt className="text-xs text-muted-foreground">创建时间</dt>
                     <dd className="truncate">{lead.created_at ? fmtDateTime(lead.created_at) : "—"}</dd>
@@ -580,7 +920,7 @@ export function LeadSheet({
                       <dd className="break-words">{lead.raw_title}</dd>
                     </div>
                   ) : null}
-                  {lead.rounds.length > 1 ? (
+                  {canCollect && lead.rounds.length > 1 ? (
                     <div className="min-w-0 sm:col-span-2">
                       <dt className="text-xs text-muted-foreground">全部关联轮次</dt>
                       <dd className="mt-1 flex flex-wrap gap-1.5">
@@ -615,10 +955,20 @@ export function LeadSheet({
                             </span>
                             <span className="flex items-center gap-2">
                               <span className="text-xs text-muted-foreground">
-                                {attempt.provider === "round" ? "轮次匹配" : attempt.provider || "—"} ·{" "}
-                                {ATTEMPT_STATUS_LABELS[attempt.status] || attempt.status}
+                                {attempt.provider === "round"
+                                  ? canCollect
+                                    ? "轮次匹配"
+                                    : "匹配"
+                                  : attempt.provider || "—"}{" "}
+                                · {ATTEMPT_STATUS_LABELS[attempt.status] || attempt.status}
                                 {attempt.confidence
-                                  ? ` · ${MATCH_CONFIDENCE_LABELS[attempt.confidence] || attempt.confidence}`
+                                  ? ` · ${
+                                      canCollect
+                                        ? MATCH_CONFIDENCE_LABELS[attempt.confidence] || attempt.confidence
+                                        : attempt.confidence === "round_account_id"
+                                          ? "自动匹配"
+                                          : MATCH_CONFIDENCE_LABELS[attempt.confidence] || attempt.confidence
+                                    }`
                                   : ""}
                               </span>
                               {attempt.status === "suggested" &&
@@ -655,6 +1005,42 @@ export function LeadSheet({
                     </div>
                   </section>
                 ) : null}
+                {lead.identity_events.length > 0 ? (
+                  <section className="space-y-2 border-t pt-4">
+                    <h3 className="text-sm font-semibold">身份校验记录</h3>
+                    <div className="divide-y border-y text-sm">
+                      {lead.identity_events.slice(0, 6).map((event) => (
+                        <div key={event.id} className="space-y-0.5 py-2">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <span className="flex flex-wrap items-center gap-2">
+                              <span>{event.event_type}</span>
+                              <Badge variant="secondary" className="font-normal">
+                                {IDENTITY_STATUS_LABELS[event.status] || event.status}
+                              </Badge>
+                            </span>
+                            <span className="text-xs text-muted-foreground">
+                              {fmtDateTime(event.created_at)}
+                            </span>
+                          </div>
+                          <p className="text-xs text-muted-foreground">
+                            {event.old_user_id || event.old_handle || "—"} →{" "}
+                            {event.new_user_id || event.new_handle || "—"}
+                            {event.provider ? ` · ${event.provider}` : ""}
+                            {event.confidence
+                              ? ` · ${
+                                  IDENTITY_CONFIDENCE_LABELS[event.confidence] ||
+                                  event.confidence
+                                }`
+                              : ""}
+                          </p>
+                          {event.note ? (
+                            <p className="text-xs text-muted-foreground">{event.note}</p>
+                          ) : null}
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+                ) : null}
               </div>
             )}
           </div>
@@ -673,11 +1059,11 @@ export function LeadSheet({
               ) : !lead ? (
                 <span className="text-xs text-muted-foreground">加载中…</span>
               ) : !editable ? (
-                <span className="text-xs text-muted-foreground">
-                  {!canCollect
-                    ? "只读：当前账号没有采集权限"
-                    : `只读：线索由 ${lead?.owner_username || "其他成员"} 负责`}
-                </span>
+                !canEditLeads ? null : (
+                  <span className="text-xs text-muted-foreground">
+                    只读：线索由 {lead?.owner_username || "其他成员"} 负责
+                  </span>
+                )
               ) : (
                 <>
                   <DropdownMenu>
@@ -716,28 +1102,33 @@ export function LeadSheet({
                     {saveMutation.isPending ? <LoaderCircle className="animate-spin" /> : null}
                     保存资料
                   </Button>
-                  <Button
-                    onClick={() => setConfirmAction("convert")}
-                    disabled={
-                      !canIdentify ||
-                      !hasRounds ||
-                      !convertibleStatus ||
-                      busy ||
-                      !lead
-                    }
-                    title={
-                      !canIdentify
-                        ? "填写真实账号 ID 或主页 URL 后可转为达人"
-                        : !hasRounds
-                          ? "该线索没有关联轮次，无法转为达人"
-                          : !convertibleStatus
-                            ? "仅待核实/核实中的线索可以转换"
-                            : undefined
-                    }
-                  >
-                    {convertMutation.isPending ? <LoaderCircle className="animate-spin" /> : null}
-                    {convertMutation.isPending ? "转换中…" : "转为达人"}
-                  </Button>
+                  {canCollect ? (
+                    <Button
+                      onClick={() => setConfirmAction("convert")}
+                      disabled={
+                        !canIdentify ||
+                        !hasRounds ||
+                        !convertibleStatus ||
+                        (fetchProfile && !providerReady) ||
+                        busy ||
+                        !lead
+                      }
+                      title={
+                        !canIdentify
+                          ? "填写平台账号、用户 ID 或主页 URL 后可转为达人"
+                          : !hasRounds
+                            ? "该线索没有关联轮次，无法转为达人"
+                            : !convertibleStatus
+                              ? "仅待核实/核实中的线索可以转换"
+                              : fetchProfile && !providerReady
+                                ? "当前没有可用的采集服务商，请先选择或配置"
+                                : undefined
+                      }
+                    >
+                      {convertMutation.isPending ? <LoaderCircle className="animate-spin" /> : null}
+                      {convertMutation.isPending ? "转换中…" : "转为达人"}
+                    </Button>
+                  ) : null}
                 </>
               )}
             </div>
@@ -760,11 +1151,67 @@ export function LeadSheet({
                 event.preventDefault();
                 const action = confirmAction;
                 setConfirmAction(null);
-                if (action === "convert") convertMutation.mutate();
+                if (action === "convert") convertMutation.mutate(false);
                 else if (action) statusMutation.mutate(action);
               }}
             >
               {confirmCopy.action}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog
+        open={mismatchResult !== null}
+        onOpenChange={(open) => !open && setMismatchResult(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>账号不一致，是否继续？</AlertDialogTitle>
+            <AlertDialogDescription>
+              {mismatchResult ? (
+                <span className="block space-y-1">
+                  <span className="block">
+                    线索账号：
+                    {mismatchResult.requested_user_id ||
+                      mismatchResult.requested_handle ||
+                      mismatchResult.requested_profile_url ||
+                      "—"}
+                  </span>
+                  <span className="block">
+                    抓取结果：
+                    {mismatchResult.resolved_nickname || "—"}
+                    {mismatchResult.resolved_user_id
+                      ? ` · ${mismatchResult.resolved_user_id}`
+                      : ""}
+                    {mismatchResult.resolved_handle
+                      ? ` · ${mismatchResult.resolved_handle}`
+                      : ""}
+                  </span>
+                  <span className="block">
+                    置信度：
+                    {IDENTITY_CONFIDENCE_LABELS[mismatchResult.confidence] ||
+                      mismatchResult.confidence ||
+                      "—"}
+                    {mismatchResult.note ? ` · ${mismatchResult.note}` : ""}
+                  </span>
+                  <span className="block">
+                    确认是同一人后将使用抓取到的账号转换；否则请取消并修正账号。
+                  </span>
+                </span>
+              ) : null}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              onClick={() => {
+                setMismatchResult(null);
+                convertMutation.mutate(true);
+              }}
+            >
+              使用核实账号并转换
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -775,7 +1222,7 @@ export function LeadSheet({
           <AlertDialogHeader>
             <AlertDialogTitle>放弃未保存的修改？</AlertDialogTitle>
             <AlertDialogDescription>
-              昵称、真实账号 ID 和主页 URL 的修改尚未保存。
+              昵称、平台账号、平台用户 ID 和主页 URL 的修改尚未保存。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

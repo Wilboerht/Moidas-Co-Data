@@ -49,6 +49,20 @@ export function NewRoundPage() {
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState("");
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const hasUnsavedChanges = Boolean(
+    selected.length || newWords.trim() || vertical.trim() || roundName.trim() || refreshUsers ||
+    pages !== 1 || maxCreators !== 20 || platform !== "xhs" || provider !== "auto",
+  );
+
+  useEffect(() => {
+    if (!hasUnsavedChanges || creating) return;
+    const warn = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [hasUnsavedChanges, creating]);
 
   useEffect(() => {
     if (roundId === null && rounds.length > 0) {
@@ -65,15 +79,20 @@ export function NewRoundPage() {
   const yuanPerToken = settings?.token_cny ?? DEFAULT_YUAN_PER_TOKEN;
   const platformConfig = settings?.platforms.find((item) => item.code === platform);
   const providerOptions = platformConfig?.providers ?? [];
-  const effectiveProviderId =
-    provider === "auto"
-      ? platformConfig?.default_provider ?? providerOptions.find((item) => item.ready)?.id
-      : provider;
+  const searchCalls = words.length * pages;
+  const userCalls = maxCreators === null ? searchCalls * 10 : maxCreators;
+  const automaticProvider = providerOptions
+    .filter((item) => item.ready && item.enabled)
+    .reduce<(typeof providerOptions)[number] | undefined>((best, item) => {
+      if (!best) return item;
+      const total = searchCalls * item.search_cost_tokens + userCalls * item.user_cost_tokens;
+      const bestTotal = searchCalls * best.search_cost_tokens + userCalls * best.user_cost_tokens;
+      return total < bestTotal ? item : best;
+    }, undefined);
+  const effectiveProviderId = provider === "auto" ? automaticProvider?.id : provider;
   const selectedProvider = providerOptions.find((item) => item.id === effectiveProviderId);
   const cost = selectedProvider?.search_cost_tokens ?? 0;
   const userCost = selectedProvider?.user_cost_tokens ?? cost;
-  const searchCalls = words.length * pages;
-  const userCalls = maxCreators === null ? searchCalls * 10 : maxCreators;
   const totalCalls = words.length === 0 ? 0 : searchCalls + userCalls;
   const tokens = words.length === 0 ? 0 : searchCalls * cost + userCalls * userCost;
   const estimatedYuan = tokens * yuanPerToken;
@@ -173,7 +192,7 @@ export function NewRoundPage() {
       />
 
       {error ? (
-        <div className="border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+        <div role="alert" className="border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive">
           {error}
         </div>
       ) : null}
@@ -433,7 +452,7 @@ export function NewRoundPage() {
           </CardContent>
         </Card>
 
-        <div className="fixed inset-x-0 bottom-0 z-30 border-t bg-background px-4 py-3 lg:hidden">
+        <div className="fixed inset-x-0 bottom-0 z-30 border-t bg-background px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] lg:hidden">
           <div className="mx-auto flex max-w-[1500px] items-center gap-3">
             <div className="min-w-0 flex-1">
               <p className="text-xs text-muted-foreground">预估上限</p>

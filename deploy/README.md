@@ -67,6 +67,7 @@ SOCIALDATAX_API_KEY=
 REDFOX_API_KEY=
 
 CODATA_ROOT=/opt/codata
+CODATA_ENV_FILE=/opt/codata/data/runtime.env
 CODATA_ALLOWED_HOSTS=codata.example.com
 CODATA_ALLOWED_ORIGINS=https://codata.example.com
 CODATA_COOKIE_SECURE=true
@@ -75,6 +76,8 @@ CODATA_PROVIDER_TRUST_ENV=false
 ```
 
 `CODATA_ALLOWED_HOSTS` 和 `CODATA_ALLOWED_ORIGINS` 必须和实际域名完全一致，否则 Host/Origin 校验会返回 400/403。`DATAFLOW_ALLOWED_HOSTS` / `RNOTE_ALLOWED_HOSTS` 是出站服务商域名白名单，不要把文档域名当成 API host。
+
+在线更新的令牌保存到 `data/runtime.env`，启动时覆盖基础 `.env` 中的同名配置。该文件由 `codata` 用户写入，systemd 只需开放 `data/`；基础 `.env` 和代码可以保持只读。备份时必须同时包含 `.env` 与 `data/runtime.env`。
 
 ## 4. 创建管理员
 
@@ -85,7 +88,7 @@ cd /opt/codata
 sudo -u codata .venv/bin/codata-admin create-admin --username admin
 ```
 
-会交互式要求输入密码（至少 6 个字符）。后续用户可以在页面「用户管理」中创建，也可以使用同一 CLI 重置密码。
+会交互式要求输入密码（至少 8 个字符）。后续用户可以在页面「用户管理」中创建，也可以使用同一 CLI 重置密码。
 
 ## 5. 启动服务
 
@@ -146,6 +149,8 @@ sudo ufw status
 
 - 新建用户或管理员重置密码后，用户首次登录会强制修改密码。
 - 新用户默认没有发起采集权限；管理员在「用户管理」中开启“允许发起采集”。
+- 新用户默认只能查看线索；需要新增或编辑线索时，管理员在「用户管理」中开启“允许维护线索”。采集权限与线索权限相互独立。
+- 无采集权限的账号看不到采集任务、关键词、系统设置及轮次信息；接口返回的轮次名称和采集状态也会自动脱敏。
 - `CODATA_MAX_ACTIVE_JOBS` 控制全局同时运行的采集任务数，默认 2。
 
 ## 8. 备份与升级
@@ -166,9 +171,12 @@ try:
 finally:
     target.close(); source.close()
 PY
-sudo tar -czf /var/backups/codata/env-$(date +%F).tar.gz -C /opt/codata .env
+sudo tar -czf /var/backups/codata/env-$(date +%F).tar.gz -C /opt/codata --ignore-failed-read .env data/runtime.env
+sudo tar -czf /var/backups/codata/attachments-$(date +%F).tar.gz -C /opt/codata/data --ignore-failed-read cooperation_attachments
 sudo chmod 600 /var/backups/codata/*
 ```
+
+合作附件存放在 `data/cooperation_attachments/`，恢复数据库时请同时恢复对应日期的附件包。
 
 恢复步骤（先停服务，确认备份可打开后再替换）：
 

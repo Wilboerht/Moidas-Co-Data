@@ -9,7 +9,20 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from .identity import normalize_identity
+from .cooperation_statuses import (
+    COOPERATION_OPEN_CODES,
+    COOPERATION_STATUS_CODES,
+    COOPERATION_TERMINAL_CODES,
+    DEFAULT_COOPERATION_STATUS,
+    NEW_COOPERATION_STATUS,
+    normalize_cooperation_status,
+)
+from .identity import (
+    handle_from_raw_title,
+    normalize_account_id,
+    normalize_identity,
+    split_platform_identity,
+)
 from .lead_statuses import (
     DEFAULT_LEAD_SOURCE,
     DEFAULT_LEAD_STATUS,
@@ -25,7 +38,9 @@ class JobBusyError(RuntimeError):
     """A round already has a pending or running job."""
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 14
+
+LEAD_IDENTITY_STATUSES = {"unverified", "verified", "mismatch", "not_found"}
 
 
 SCHEMA = """
@@ -115,6 +130,9 @@ CREATE TABLE IF NOT EXISTS creators (
     followed_at TEXT,
     cooperation_status TEXT,
     cooperation_updated_at TEXT,
+    cooperation_count INTEGER NOT NULL DEFAULT 0,
+    cooperation_last_completed_at TEXT,
+    cooperation_case_id INTEGER,
     PRIMARY KEY (platform, user_id)
 );
 
@@ -146,11 +164,100 @@ CREATE TABLE IF NOT EXISTS creator_rounds (
     PRIMARY KEY (round_id, platform, user_id)
 );
 
+CREATE TABLE IF NOT EXISTS cooperation_cases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    started_at TEXT NOT NULL,
+    status_updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    closed_at TEXT,
+    created_by INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (platform, user_id, seq)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cooperation_cases_one_open
+ON cooperation_cases (platform, user_id)
+WHERE status IN ('not_contacted', 'contacted', 'negotiating', 'cooperating');
+CREATE INDEX IF NOT EXISTS idx_cooperation_cases_creator
+ON cooperation_cases (platform, user_id, seq DESC);
+CREATE INDEX IF NOT EXISTS idx_cooperation_cases_status
+ON cooperation_cases (status);
+
+CREATE TABLE IF NOT EXISTS cooperation_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    status_from TEXT,
+    status_to TEXT,
+    note TEXT,
+    metadata TEXT,
+    actor_user_id INTEGER,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cooperation_events_case
+ON cooperation_events (case_id, id);
+
+CREATE TABLE IF NOT EXISTS cooperation_attachments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id INTEGER NOT NULL,
+    event_id INTEGER,
+    original_name TEXT NOT NULL,
+    storage_key TEXT NOT NULL,
+    content_type TEXT NOT NULL DEFAULT '',
+    size_bytes INTEGER NOT NULL DEFAULT 0,
+    sha256 TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT 'other',
+    description TEXT NOT NULL DEFAULT '',
+    uploaded_by INTEGER,
+    created_at TEXT NOT NULL,
+    deleted_at TEXT,
+    deleted_by INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_cooperation_attachments_case
+ON cooperation_attachments (case_id, id);
+CREATE INDEX IF NOT EXISTS idx_cooperation_attachments_event
+ON cooperation_attachments (event_id);
+
+CREATE TABLE IF NOT EXISTS cooperation_works (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id INTEGER NOT NULL,
+    platform TEXT NOT NULL DEFAULT '',
+    url TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    published_at TEXT,
+    note TEXT NOT NULL DEFAULT '',
+    created_by INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    deleted_at TEXT,
+    deleted_by INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_cooperation_works_case
+ON cooperation_works (case_id, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cooperation_works_active_url
+ON cooperation_works (case_id, url)
+WHERE deleted_at IS NULL;
+
 CREATE TABLE IF NOT EXISTS leads (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     platform TEXT NOT NULL DEFAULT 'xhs',
     nickname TEXT,
     account_id TEXT,
+    platform_handle TEXT,
+    identity_status TEXT NOT NULL DEFAULT 'unverified',
+    identity_confidence TEXT NOT NULL DEFAULT '',
+    identity_provider TEXT NOT NULL DEFAULT '',
+    identity_checked_at TEXT,
+    identity_note TEXT NOT NULL DEFAULT '',
     profile_url TEXT,
     raw_title TEXT,
     source TEXT NOT NULL DEFAULT 'manual',
@@ -172,6 +279,22 @@ CREATE TABLE IF NOT EXISTS leads (
     matched_round_id INTEGER,
     matched_at TEXT,
     match_confidence TEXT
+);
+
+CREATE TABLE IF NOT EXISTS lead_identity_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    old_user_id TEXT,
+    new_user_id TEXT,
+    old_handle TEXT,
+    new_handle TEXT,
+    provider TEXT,
+    confidence TEXT,
+    status TEXT NOT NULL,
+    note TEXT,
+    actor_id INTEGER,
+    created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS lead_rounds (
@@ -217,6 +340,7 @@ CREATE INDEX IF NOT EXISTS idx_leads_account ON leads (platform, account_id);
 CREATE INDEX IF NOT EXISTS idx_leads_profile ON leads (platform, profile_url);
 CREATE INDEX IF NOT EXISTS idx_lead_rounds_round ON lead_rounds (round_id, lead_id);
 CREATE INDEX IF NOT EXISTS idx_lead_attempts_lead ON lead_attempts (lead_id, id);
+CREATE INDEX IF NOT EXISTS idx_lead_identity_events_lead ON lead_identity_events (lead_id, id);
 
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -253,6 +377,7 @@ CREATE TABLE IF NOT EXISTS api_calls (
     estimated_cost INTEGER NOT NULL DEFAULT 0,
     attempt INTEGER NOT NULL DEFAULT 1,
     status TEXT NOT NULL DEFAULT 'ok',
+    error TEXT,
     duration_ms INTEGER,
     raw_file TEXT,
     ts TEXT NOT NULL
@@ -279,6 +404,7 @@ CREATE TABLE IF NOT EXISTS users (
     role TEXT NOT NULL DEFAULT 'member',
     disabled INTEGER NOT NULL DEFAULT 0,
     can_collect INTEGER NOT NULL DEFAULT 0,
+    can_edit_leads INTEGER NOT NULL DEFAULT 0,
     must_change_password INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -322,6 +448,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log (ts);
+CREATE INDEX IF NOT EXISTS idx_audit_target ON audit_log (target, id);
 
 CREATE TABLE IF NOT EXISTS creator_round_sources (
     round_id INTEGER NOT NULL,
@@ -463,9 +590,9 @@ SELECT cr.round_id, cr.platform, cr.user_id,
        cr.data_round, cr.tier_label, cr.account_id,
        c.follow_up_user_id AS owner_user_id, c.followed_at AS claimed_at,
        COALESCE(fu.username, '') AS owner_username,
-       COALESCE(c.cooperation_status, 'pending') AS cooperation_status,
-       c.cooperation_updated_at, cr.updated_at,
-       cr.cooperation_platform, cr.raw_title,
+       c.cooperation_status, c.cooperation_updated_at,
+       c.cooperation_count, c.cooperation_last_completed_at, c.cooperation_case_id,
+       cr.updated_at, cr.cooperation_platform, cr.raw_title,
        n.title AS top_title, n.url AS top_url, n.liked AS top_liked,
        r.name AS round_name, {TIER_SQL} AS derived_tier,
        {ENRICHMENT_SQL} AS enrichment_status
@@ -475,9 +602,6 @@ CREATOR_SELECT_ALL_SQL = CREATOR_SELECT_SQL.replace(
     "cr.source_keywords, cr.source_labels,",
     "COALESCE(cr.source_keywords_all, cr.source_keywords) AS source_keywords, "
     "COALESCE(cr.source_labels_all, cr.source_labels) AS source_labels,",
-).replace(
-    "cr.auto_tags, cr.status,",
-    "cr.auto_tags, COALESCE(c.cooperation_status, 'pending') AS status,",
 )
 
 LEAD_FROM_SQL = """
@@ -540,7 +664,11 @@ class Database:
             if state is None:
                 self._has_fts = False
                 self._fts_trigram = False
-                self._migrate_schema()
+                try:
+                    self._migrate_schema()
+                except Exception:
+                    self._conn.close()
+                    raise
                 _SCHEMA_READY[db_key] = (self._has_fts, self._fts_trigram)
             else:
                 self._has_fts, self._fts_trigram = state
@@ -555,8 +683,13 @@ class Database:
 
     def _migrate_schema(self) -> None:
         current = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
-        if current >= SCHEMA_VERSION:
+        if current > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"数据库 schema v{current} 高于当前支持的 v{SCHEMA_VERSION}，请升级应用后再启动"
+            )
+        if current == SCHEMA_VERSION:
             self._detect_fts()
+            self._ensure_current_compat_columns()
             self._ensure_creator_sources()
             return
         has_data = self._conn.execute(
@@ -565,10 +698,245 @@ class Database:
         if has_data:
             self._backup_before_migration(current)
         self._init_db()
+        self._migrate_cooperation_v11(current)
         self._migrate_source_labels()
         self._rebuild_creator_sources()
+        self._migrate_cooperation_cases_v13(current)
+        self._migrate_lead_identity_v14(current)
         self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self._conn.commit()
+
+    def _ensure_current_compat_columns(self) -> None:
+        with self._conn:
+            user_columns = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(users)").fetchall()
+            }
+            if "can_collect" not in user_columns:
+                self._conn.execute(
+                    "ALTER TABLE users ADD COLUMN can_collect INTEGER NOT NULL DEFAULT 0"
+                )
+            if "can_edit_leads" not in user_columns:
+                self._conn.execute(
+                    "ALTER TABLE users ADD COLUMN can_edit_leads INTEGER NOT NULL DEFAULT 0"
+                )
+                self._conn.execute(
+                    "UPDATE users SET can_edit_leads = 1 WHERE can_collect = 1"
+                )
+            if "must_change_password" not in user_columns:
+                self._conn.execute(
+                    "ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0"
+                )
+            creator_columns = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(creators)").fetchall()
+            }
+            if "cooperation_count" not in creator_columns:
+                self._conn.execute(
+                    "ALTER TABLE creators ADD COLUMN cooperation_count "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            if "cooperation_last_completed_at" not in creator_columns:
+                self._conn.execute(
+                    "ALTER TABLE creators ADD COLUMN cooperation_last_completed_at TEXT"
+                )
+            if "cooperation_case_id" not in creator_columns:
+                self._conn.execute(
+                    "ALTER TABLE creators ADD COLUMN cooperation_case_id INTEGER"
+                )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_creators_cooperation_count "
+                "ON creators (cooperation_count)"
+            )
+            self._ensure_lead_identity_columns()
+        self.try_create_lead_unique_indexes()
+
+    def _ensure_lead_identity_columns(self) -> None:
+        columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(leads)").fetchall()
+        }
+        for column, ddl in (
+            ("platform_handle", "TEXT"),
+            ("identity_status", "TEXT NOT NULL DEFAULT 'unverified'"),
+            ("identity_confidence", "TEXT NOT NULL DEFAULT ''"),
+            ("identity_provider", "TEXT NOT NULL DEFAULT ''"),
+            ("identity_checked_at", "TEXT"),
+            ("identity_note", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if column not in columns:
+                self._conn.execute(f"ALTER TABLE leads ADD COLUMN {column} {ddl}")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_leads_handle ON leads (platform, platform_handle)"
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS lead_identity_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lead_id INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                old_user_id TEXT,
+                new_user_id TEXT,
+                old_handle TEXT,
+                new_handle TEXT,
+                provider TEXT,
+                confidence TEXT,
+                status TEXT NOT NULL,
+                note TEXT,
+                actor_id INTEGER,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_lead_identity_events_lead "
+            "ON lead_identity_events (lead_id, id)"
+        )
+
+    def _migrate_lead_identity_v14(self, current: int) -> None:
+        if current >= 14:
+            return
+        with self._conn:
+            self._ensure_lead_identity_columns()
+            rows = self._conn.execute(
+                """
+                SELECT id, platform, account_id, profile_url, raw_title, status,
+                       converted_user_id, converted_at
+                FROM leads
+                """
+            ).fetchall()
+            now = utc_now()
+            updates: list[tuple[Any, ...]] = []
+            for row in rows:
+                platform = str(row["platform"] or "xhs")
+                account = str(row["account_id"] or "").strip()
+                profile = str(row["profile_url"] or "").strip()
+                user_id, handle = split_platform_identity(platform, account, profile)
+                status = str(row["status"] or "")
+                identity_status = "unverified"
+                confidence = ""
+                checked_at = None
+                if status == "converted":
+                    user_id = str(row["converted_user_id"] or user_id or account).strip()
+                    handle = handle or handle_from_raw_title(row["raw_title"] or "")
+                    identity_status = "verified"
+                    confidence = "conversion"
+                    checked_at = row["converted_at"] or now
+                updates.append(
+                    (
+                        user_id,
+                        handle,
+                        identity_status,
+                        confidence,
+                        checked_at,
+                        int(row["id"]),
+                    )
+                )
+            if updates:
+                self._conn.executemany(
+                    """
+                    UPDATE leads
+                    SET account_id = ?, platform_handle = ?, identity_status = ?,
+                        identity_confidence = ?, identity_checked_at = ?
+                    WHERE id = ?
+                    """,
+                    updates,
+                )
+        self.try_create_lead_unique_indexes()
+
+    def _migrate_cooperation_cases_v13(self, current: int) -> None:
+        if current >= 13:
+            return
+        with self._conn:
+            columns = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(creators)").fetchall()
+            }
+            if "cooperation_count" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE creators ADD COLUMN cooperation_count "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            if "cooperation_last_completed_at" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE creators ADD COLUMN cooperation_last_completed_at TEXT"
+                )
+            if "cooperation_case_id" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE creators ADD COLUMN cooperation_case_id INTEGER"
+                )
+            rows = self._conn.execute(
+                "SELECT platform, user_id, cooperation_status, cooperation_updated_at "
+                "FROM creators WHERE COALESCE(cooperation_status, '') != ''"
+            ).fetchall()
+            for row in rows:
+                code = normalize_cooperation_status(
+                    row["cooperation_status"], default=""
+                )
+                if code not in COOPERATION_STATUS_CODES:
+                    continue
+                existing = self._conn.execute(
+                    "SELECT 1 FROM cooperation_cases "
+                    "WHERE platform = ? AND user_id = ? LIMIT 1",
+                    (row["platform"], row["user_id"]),
+                ).fetchone()
+                if existing:
+                    continue
+                now = utc_now()
+                stamp = str(row["cooperation_updated_at"] or now)
+                completed_at = stamp if code == "completed" else None
+                closed_at = (
+                    stamp if code in ("declined", "cancelled") else None
+                )
+                cur = self._conn.execute(
+                    """
+                    INSERT INTO cooperation_cases
+                    (platform, user_id, seq, status, summary, started_at,
+                     status_updated_at, completed_at, closed_at, created_at, updated_at)
+                    VALUES (?, ?, 1, ?, '', ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["platform"],
+                        row["user_id"],
+                        code,
+                        stamp,
+                        stamp,
+                        completed_at,
+                        closed_at,
+                        stamp,
+                        stamp,
+                    ),
+                )
+                case_id = int(cur.lastrowid)
+                self._conn.execute(
+                    """
+                    INSERT INTO cooperation_events
+                    (case_id, event_type, status_from, status_to, note, metadata, created_at)
+                    VALUES (?, 'migrated', '', ?, ?, ?, ?)
+                    """,
+                    (
+                        case_id,
+                        code,
+                        "由旧版合作状态迁移",
+                        json.dumps({"legacy_status": code}, ensure_ascii=False),
+                        stamp,
+                    ),
+                )
+                self._conn.execute(
+                    """
+                    UPDATE creators
+                    SET cooperation_count = 1,
+                        cooperation_last_completed_at = ?,
+                        cooperation_case_id = ?
+                    WHERE platform = ? AND user_id = ?
+                    """,
+                    (
+                        completed_at,
+                        case_id,
+                        row["platform"],
+                        row["user_id"],
+                    ),
+                )
 
     def _migrate_source_labels(self) -> None:
         rows = self._conn.execute(
@@ -636,6 +1004,45 @@ class Database:
                     updates,
                 )
             self.rebuild_search_index()
+
+    def _migrate_cooperation_v11(self, current: int) -> None:
+        if current >= 11:
+            return
+        now = utc_now()
+        with self._conn:
+            if current < 10:
+                # v8/v9 stored the latest review result in cooperation_status.
+                # Reset it and enroll creators that were actually adopted in a round.
+                self._conn.execute(
+                    """
+                    UPDATE creators
+                    SET cooperation_status = NULL, cooperation_updated_at = NULL
+                    WHERE cooperation_status IN ('pending', 'shortlisted', 'adopted', 'rejected')
+                    """
+                )
+                self._conn.execute(
+                    """
+                    UPDATE creators
+                    SET cooperation_status = ?, cooperation_updated_at = ?
+                    WHERE COALESCE(cooperation_status, '') = ''
+                      AND EXISTS (
+                          SELECT 1 FROM creator_rounds cr
+                          WHERE cr.platform = creators.platform
+                            AND cr.user_id = creators.user_id
+                            AND cr.status = 'adopted'
+                      )
+                    """,
+                    (DEFAULT_COOPERATION_STATUS, now),
+                )
+            columns = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(creators)").fetchall()
+            }
+            self._conn.execute("DROP INDEX IF EXISTS idx_creators_adoption_status")
+            if "adoption_updated_at" in columns:
+                self._conn.execute("ALTER TABLE creators DROP COLUMN adoption_updated_at")
+            if "adoption_status" in columns:
+                self._conn.execute("ALTER TABLE creators DROP COLUMN adoption_status")
 
     def _rebuild_creator_sources(self) -> None:
         with self._conn:
@@ -861,32 +1268,29 @@ class Database:
         if "cooperation_status" not in creator_columns:
             self._conn.execute("ALTER TABLE creators ADD COLUMN cooperation_status TEXT")
             self._conn.execute("ALTER TABLE creators ADD COLUMN cooperation_updated_at TEXT")
+        if "cooperation_count" not in creator_columns:
             self._conn.execute(
-                """
-                UPDATE creators SET
-                    cooperation_status = COALESCE(
-                        (
-                            SELECT cr.status FROM creator_rounds cr
-                            WHERE cr.platform = creators.platform
-                              AND cr.user_id = creators.user_id
-                              AND cr.status <> 'pending'
-                            ORDER BY cr.updated_at DESC, cr.round_id DESC
-                            LIMIT 1
-                        ),
-                        'pending'
-                    ),
-                    cooperation_updated_at = (
-                        SELECT cr.updated_at FROM creator_rounds cr
-                        WHERE cr.platform = creators.platform
-                          AND cr.user_id = creators.user_id
-                          AND cr.status <> 'pending'
-                        ORDER BY cr.round_id DESC, cr.updated_at DESC
-                        LIMIT 1
-                    )
-                """
+                "ALTER TABLE creators ADD COLUMN cooperation_count "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+        if "cooperation_last_completed_at" not in creator_columns:
+            self._conn.execute(
+                "ALTER TABLE creators ADD COLUMN cooperation_last_completed_at TEXT"
+            )
+        if "cooperation_case_id" not in creator_columns:
+            self._conn.execute(
+                "ALTER TABLE creators ADD COLUMN cooperation_case_id INTEGER"
             )
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_creators_cooperation_status ON creators (cooperation_status)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_creators_cooperation_owner "
+            "ON creators (cooperation_status, follow_up_user_id)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_creators_cooperation_count "
+            "ON creators (cooperation_count)"
         )
         existing = {
             row["name"]
@@ -1003,6 +1407,8 @@ class Database:
             self._conn.execute(
                 "ALTER TABLE api_calls ADD COLUMN status TEXT NOT NULL DEFAULT 'ok'"
             )
+        if "error" not in api_columns:
+            self._conn.execute("ALTER TABLE api_calls ADD COLUMN error TEXT")
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_api_calls_job ON api_calls (job_id)"
         )
@@ -1015,6 +1421,13 @@ class Database:
         }
         if "can_collect" not in user_columns:
             self._conn.execute("ALTER TABLE users ADD COLUMN can_collect INTEGER NOT NULL DEFAULT 0")
+        if "can_edit_leads" not in user_columns:
+            self._conn.execute(
+                "ALTER TABLE users ADD COLUMN can_edit_leads INTEGER NOT NULL DEFAULT 0"
+            )
+            self._conn.execute(
+                "UPDATE users SET can_edit_leads = 1 WHERE can_collect = 1"
+            )
         if "must_change_password" not in user_columns:
             self._conn.execute(
                 "ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0"
@@ -1146,6 +1559,7 @@ class Database:
         estimated_cost: int | None = None,
         attempt: int = 1,
         status: str = "ok",
+        error: str | None = None,
         commit: bool = True,
     ) -> None:
         with self._write(commit):
@@ -1153,9 +1567,9 @@ class Database:
                 """
                 INSERT INTO api_calls
                 (round_id, job_id, platform, provider, kind, path, params, code, cost,
-                 cost_native, cost_currency, estimated_cost, attempt, status,
+                 cost_native, cost_currency, estimated_cost, attempt, status, error,
                  duration_ms, raw_file, ts)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     round_id,
@@ -1172,6 +1586,7 @@ class Database:
                     int(estimated_cost if estimated_cost is not None else cost),
                     max(1, int(attempt or 1)),
                     status,
+                    (error or None) and str(error)[:1000],
                     duration_ms,
                     str(raw_file) if raw_file else None,
                     utc_now(),
@@ -1469,14 +1884,16 @@ class Database:
         ).fetchall()
         return {str(row["word"]) for row in rows}
 
-    def get_round_keywords(self, round_id: int) -> list[dict[str, Any]]:
+    def get_round_keywords(
+        self, round_id: int, *, include_disabled: bool = False
+    ) -> list[dict[str, Any]]:
         rows = self._conn.execute(
-            """
-            SELECT k.word, k.category, COALESCE(rk.pages, r.pages) AS pages
+            f"""
+            SELECT k.id, k.word, k.category, k.enabled, COALESCE(rk.pages, r.pages) AS pages
             FROM round_keywords rk
             JOIN keywords k ON k.id = rk.keyword_id
             JOIN rounds r ON r.id = rk.round_id
-            WHERE rk.round_id = ? AND k.enabled = 1
+            WHERE rk.round_id = ? {"AND k.enabled = 1" if not include_disabled else ""}
             ORDER BY k.id
             """,
             (round_id,),
@@ -1504,13 +1921,6 @@ class Database:
             for item in self._conn.execute(
                 "SELECT DISTINCT raw_file FROM api_calls "
                 "WHERE round_id = ? AND raw_file IS NOT NULL AND raw_file != ''",
-                (round_id,),
-            ).fetchall()
-        ]
-        affected_creators = [
-            (item["platform"], item["user_id"])
-            for item in self._conn.execute(
-                "SELECT DISTINCT platform, user_id FROM creator_rounds WHERE round_id = ?",
                 (round_id,),
             ).fetchall()
         ]
@@ -1548,8 +1958,6 @@ class Database:
                 )
             cur = self._conn.execute("DELETE FROM rounds WHERE id = ?", (round_id,))
             counts["rounds"] = max(0, cur.rowcount)
-            for platform, user_id in affected_creators:
-                self._sync_cooperation_status(platform, user_id)
             cur = self._conn.execute(
                 """
                 DELETE FROM creators
@@ -1561,6 +1969,10 @@ class Database:
                     SELECT 1 FROM leads l
                     WHERE l.converted_platform = creators.platform
                       AND l.converted_user_id = creators.user_id
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM cooperation_cases cc
+                    WHERE cc.platform = creators.platform AND cc.user_id = creators.user_id
                 )
                 """
             )
@@ -1616,6 +2028,8 @@ class Database:
                 "AND NOT EXISTS (SELECT 1 FROM leads l "
                 "WHERE l.converted_platform = creators.platform "
                 "AND l.converted_user_id = creators.user_id) "
+                "AND NOT EXISTS (SELECT 1 FROM cooperation_cases cc "
+                "WHERE cc.platform = creators.platform AND cc.user_id = creators.user_id) "
                 "AND (creators.fetched_at IS NULL OR ? = 0)",
                 (1 if keep_enriched else 0,),
             )
@@ -1710,9 +2124,9 @@ class Database:
 
     # ---- notes / creators ----
 
-    def upsert_note(self, note: dict[str, Any]) -> None:
+    def upsert_note(self, note: dict[str, Any], *, commit: bool = True) -> None:
         now = utc_now()
-        with self._conn:
+        with self._write(commit):
             self._conn.execute(
                 """
                 INSERT INTO notes
@@ -1725,10 +2139,10 @@ class Database:
                     desc = COALESCE(NULLIF(excluded.desc, ''), notes.desc),
                     note_type = COALESCE(NULLIF(excluded.note_type, ''), notes.note_type),
                     published_at = COALESCE(excluded.published_at, notes.published_at),
-                    liked = COALESCE(NULLIF(excluded.liked, 0), notes.liked),
-                    collected = COALESCE(NULLIF(excluded.collected, 0), notes.collected),
-                    comments = COALESCE(NULLIF(excluded.comments, 0), notes.comments),
-                    shares = COALESCE(NULLIF(excluded.shares, 0), notes.shares),
+                    liked = COALESCE(excluded.liked, notes.liked),
+                    collected = COALESCE(excluded.collected, notes.collected),
+                    comments = COALESCE(excluded.comments, notes.comments),
+                    shares = COALESCE(excluded.shares, notes.shares),
                     url = COALESCE(NULLIF(excluded.url, ''), notes.url),
                     hashtags = COALESCE(NULLIF(excluded.hashtags, ''), notes.hashtags),
                     raw_json = excluded.raw_json,
@@ -1762,8 +2176,9 @@ class Database:
         keyword: str,
         page: int | None,
         rank: int | None,
+        commit: bool = True,
     ) -> None:
-        with self._conn:
+        with self._write(commit):
             self._conn.execute(
                 """
                 INSERT OR IGNORE INTO note_hits (round_id, platform, note_id, keyword, page, rank)
@@ -1772,10 +2187,12 @@ class Database:
                 (round_id, platform, note_id, keyword, page, rank),
             )
 
-    def upsert_creator_basic(self, creator: dict[str, Any]) -> None:
+    def upsert_creator_basic(
+        self, creator: dict[str, Any], *, commit: bool = True
+    ) -> None:
         if not creator.get("user_id"):
             return
-        with self._conn:
+        with self._write(commit):
             self._conn.execute(
                 """
                 INSERT INTO creators
@@ -1857,30 +2274,1164 @@ class Database:
         ).fetchone()
         return dict(row) if row else None
 
-    def _sync_cooperation_status(self, platform: str, user_id: str) -> None:
-        row = self._conn.execute(
-            """
-            SELECT status, updated_at FROM creator_rounds
-            WHERE platform = ? AND user_id = ? AND status <> 'pending'
-            ORDER BY updated_at DESC, round_id DESC LIMIT 1
-            """,
+    @staticmethod
+    def _normalize_cooperation_timestamp(value: Any) -> str | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            for fmt in (
+                "%Y-%m-%d %H:%M:%S",
+                "%Y/%m/%d %H:%M:%S",
+                "%Y-%m-%d",
+                "%Y/%m/%d",
+            ):
+                try:
+                    parsed = datetime.strptime(text, fmt)
+                    break
+                except ValueError:
+                    continue
+            else:
+                return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+
+    def _creator_exists(self, platform: str, user_id: str) -> bool:
+        if self._conn.execute(
+            "SELECT 1 FROM creators WHERE platform = ? AND user_id = ? LIMIT 1",
             (platform, user_id),
-        ).fetchone()
-        if row is None:
-            row = self._conn.execute(
-                """
-                SELECT status, updated_at FROM creator_rounds
-                WHERE platform = ? AND user_id = ?
-                ORDER BY round_id DESC, updated_at DESC LIMIT 1
-                """,
+        ).fetchone():
+            return True
+        if self._conn.execute(
+            "SELECT 1 FROM creator_rounds WHERE platform = ? AND user_id = ? LIMIT 1",
+            (platform, user_id),
+        ).fetchone():
+            return True
+        return bool(
+            self._conn.execute(
+                "SELECT 1 FROM leads WHERE converted_platform = ? AND converted_user_id = ? LIMIT 1",
                 (platform, user_id),
             ).fetchone()
-        if row is not None:
+        )
+
+    def _ensure_creator_stub(self, platform: str, user_id: str) -> None:
+        self._conn.execute(
+            "INSERT INTO creators (platform, user_id) VALUES (?, ?) "
+            "ON CONFLICT(platform, user_id) DO NOTHING",
+            (platform, user_id),
+        )
+
+    def _cooperation_summary_row_locked(
+        self, platform: str, user_id: str
+    ) -> dict[str, Any] | None:
+        return self._conn.execute(
+            "SELECT cooperation_status, cooperation_updated_at, cooperation_count, "
+            "cooperation_last_completed_at, cooperation_case_id "
+            "FROM creators WHERE platform = ? AND user_id = ?",
+            (platform, user_id),
+        ).fetchone()
+
+    def _latest_cooperation_case_locked(
+        self, platform: str, user_id: str
+    ) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM cooperation_cases "
+            "WHERE platform = ? AND user_id = ? ORDER BY seq DESC LIMIT 1",
+            (platform, user_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def _open_cooperation_case_locked(
+        self, platform: str, user_id: str
+    ) -> dict[str, Any] | None:
+        placeholders = ",".join("?" * len(COOPERATION_OPEN_CODES))
+        row = self._conn.execute(
+            f"SELECT * FROM cooperation_cases WHERE platform = ? AND user_id = ? "
+            f"AND status IN ({placeholders}) ORDER BY seq DESC LIMIT 1",
+            (platform, user_id, *COOPERATION_OPEN_CODES),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def _sync_cooperation_summary_locked(
+        self, platform: str, user_id: str
+    ) -> dict[str, Any]:
+        self._ensure_creator_stub(platform, user_id)
+        latest = self._latest_cooperation_case_locked(platform, user_id)
+        count_row = self._conn.execute(
+            "SELECT COUNT(*) AS n, MAX(completed_at) AS completed "
+            "FROM cooperation_cases WHERE platform = ? AND user_id = ?",
+            (platform, user_id),
+        ).fetchone()
+        count = int(count_row["n"] or 0) if count_row else 0
+        completed = count_row["completed"] if count_row else None
+        if latest:
             self._conn.execute(
-                "UPDATE creators SET cooperation_status = ?, cooperation_updated_at = ? "
-                "WHERE platform = ? AND user_id = ?",
-                (row["status"], row["updated_at"], platform, user_id),
+                "UPDATE creators SET cooperation_status = ?, cooperation_updated_at = ?, "
+                "cooperation_count = ?, cooperation_last_completed_at = ?, "
+                "cooperation_case_id = ? WHERE platform = ? AND user_id = ?",
+                (
+                    latest["status"],
+                    latest["updated_at"],
+                    count,
+                    completed,
+                    latest["id"],
+                    platform,
+                    user_id,
+                ),
             )
+        else:
+            self._conn.execute(
+                "UPDATE creators SET cooperation_status = NULL, cooperation_updated_at = NULL, "
+                "cooperation_count = 0, cooperation_last_completed_at = NULL, "
+                "cooperation_case_id = NULL WHERE platform = ? AND user_id = ?",
+                (platform, user_id),
+            )
+        return {
+            "cooperation_status": latest["status"] if latest else "",
+            "cooperation_updated_at": latest["updated_at"] if latest else "",
+            "cooperation_count": count,
+            "cooperation_last_completed_at": completed or "",
+            "cooperation_case_id": latest["id"] if latest else None,
+        }
+
+    def _add_cooperation_event_locked(
+        self,
+        case_id: int,
+        event_type: str,
+        *,
+        status_from: str | None = None,
+        status_to: str | None = None,
+        note: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        actor_user_id: int | None = None,
+        now: str | None = None,
+    ) -> int:
+        stamp = now or utc_now()
+        cur = self._conn.execute(
+            "INSERT INTO cooperation_events "
+            "(case_id, event_type, status_from, status_to, note, metadata, actor_user_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                case_id,
+                event_type,
+                status_from,
+                status_to,
+                note,
+                json.dumps(metadata or {}, ensure_ascii=False),
+                actor_user_id,
+                stamp,
+            ),
+        )
+        self._conn.execute(
+            "UPDATE cooperation_cases SET updated_at = ? WHERE id = ?",
+            (stamp, case_id),
+        )
+        return int(cur.lastrowid)
+
+    def _claim_creator_locked(
+        self, platform: str, user_id: str, claim_user_id: int | None, now: str
+    ) -> bool:
+        if claim_user_id is None:
+            return False
+        cur = self._conn.execute(
+            "UPDATE creators SET follow_up_user_id = ?, followed_at = ? "
+            "WHERE platform = ? AND user_id = ? AND follow_up_user_id IS NULL",
+            (int(claim_user_id), now, platform, user_id),
+        )
+        return cur.rowcount > 0
+
+    def _insert_cooperation_case_locked(
+        self,
+        platform: str,
+        user_id: str,
+        status: str,
+        *,
+        note: str | None = None,
+        created_by: int | None = None,
+        allow_terminal: bool = False,
+    ) -> dict[str, Any]:
+        self._ensure_creator_stub(platform, user_id)
+        code = normalize_cooperation_status(status, default="")
+        if code not in COOPERATION_STATUS_CODES:
+            raise ValueError("无效的合作状态")
+        if not allow_terminal and code not in COOPERATION_OPEN_CODES:
+            raise ValueError("新合作必须从未联系、已联系、洽谈中或合作中开始")
+        if self._open_cooperation_case_locked(platform, user_id):
+            raise ValueError("该达人已有进行中的合作")
+        seq_row = self._conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM cooperation_cases "
+            "WHERE platform = ? AND user_id = ?",
+            (platform, user_id),
+        ).fetchone()
+        seq = int(seq_row["next_seq"] or 1)
+        now = utc_now()
+        completed_at = now if code == "completed" else None
+        closed_at = now if code in ("declined", "cancelled") else None
+        cur = self._conn.execute(
+            "INSERT INTO cooperation_cases "
+            "(platform, user_id, seq, status, summary, started_at, status_updated_at, "
+            "completed_at, closed_at, created_by, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?)",
+            (
+                platform,
+                user_id,
+                seq,
+                code,
+                now,
+                now,
+                completed_at,
+                closed_at,
+                created_by,
+                now,
+                now,
+            ),
+        )
+        case_id = int(cur.lastrowid)
+        self._add_cooperation_event_locked(
+            case_id,
+            "created",
+            status_to=code,
+            note=note or "开始合作跟进",
+            metadata={"seq": seq, "auto": created_by is None},
+            actor_user_id=created_by,
+            now=now,
+        )
+        self._sync_cooperation_summary_locked(platform, user_id)
+        return {
+            "case_id": case_id,
+            "seq": seq,
+            "status": code,
+            "created": True,
+        }
+
+    def _ensure_cooperation_enrolled_locked(
+        self, platform: str, user_id: str
+    ) -> dict[str, Any]:
+        self._ensure_creator_stub(platform, user_id)
+        existing = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM cooperation_cases WHERE platform = ? AND user_id = ?",
+            (platform, user_id),
+        ).fetchone()
+        if int(existing["n"] or 0) > 0:
+            summary = self._cooperation_summary_row_locked(platform, user_id)
+            return {
+                "enrolled": False,
+                "previous_status": summary["cooperation_status"] if summary else "",
+                "status": summary["cooperation_status"] if summary else "",
+                "cooperation_updated_at": "",
+                "case_id": summary["cooperation_case_id"] if summary else None,
+            }
+        created = self._insert_cooperation_case_locked(
+            platform,
+            user_id,
+            DEFAULT_COOPERATION_STATUS,
+            note="采用后自动进入合作跟进",
+        )
+        return {
+            "enrolled": True,
+            "previous_status": "",
+            "status": created["status"],
+            "cooperation_updated_at": utc_now(),
+            "case_id": created["case_id"],
+        }
+
+    def _cooperation_case_locked(self, case_id: int) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM cooperation_cases WHERE id = ?", (int(case_id),)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def _update_cooperation_case_status_locked(
+        self,
+        case_id: int,
+        status: str,
+        *,
+        note: str | None = None,
+        expected_updated_at: str | None = None,
+        actor_user_id: int | None = None,
+        claim_user_id: int | None = None,
+        allow_terminal_correction: bool = False,
+    ) -> dict[str, Any]:
+        case = self._cooperation_case_locked(case_id)
+        if not case:
+            raise ValueError("合作记录不存在")
+        code = normalize_cooperation_status(status, default="")
+        if code not in COOPERATION_STATUS_CODES:
+            raise ValueError("无效的合作状态")
+        if expected_updated_at is not None and case["updated_at"] != expected_updated_at:
+            raise ValueError("合作记录已被其他人更新，请刷新后重试")
+        current = case["status"]
+        if current in COOPERATION_TERMINAL_CODES and code != current:
+            if not allow_terminal_correction:
+                raise ValueError("已结束的合作不能直接修改状态，请开启新一轮合作")
+        placeholders = ",".join("?" * len(COOPERATION_OPEN_CODES))
+        other_open = self._conn.execute(
+            f"SELECT id FROM cooperation_cases WHERE platform = ? AND user_id = ? "
+            f"AND status IN ({placeholders}) AND id != ? LIMIT 1",
+            (case["platform"], case["user_id"], *COOPERATION_OPEN_CODES, int(case_id)),
+        ).fetchone()
+        if code in COOPERATION_OPEN_CODES and other_open:
+            raise ValueError("该达人已有其他进行中的合作")
+        now = utc_now()
+        if current == code:
+            if note and str(note).strip():
+                self._add_cooperation_event_locked(
+                    case_id,
+                    "note_added",
+                    note=str(note).strip(),
+                    actor_user_id=actor_user_id,
+                    now=now,
+                )
+                self._sync_cooperation_summary_locked(
+                    case["platform"], case["user_id"]
+                )
+                return {
+                    "changed": False,
+                    "note_added": True,
+                    "previous_status": current,
+                    "status": code,
+                    "cooperation_updated_at": now,
+                    "case_id": int(case_id),
+                    "claimed": False,
+                }
+            return {
+                "changed": False,
+                "note_added": False,
+                "previous_status": current,
+                "status": code,
+                "cooperation_updated_at": case["updated_at"],
+                "case_id": int(case_id),
+                "claimed": False,
+            }
+        completed_at = case["completed_at"]
+        closed_at = case["closed_at"]
+        if code == "completed":
+            completed_at = now
+            closed_at = None
+        elif code in ("declined", "cancelled"):
+            closed_at = now
+            completed_at = None
+        elif allow_terminal_correction:
+            completed_at = None
+            closed_at = None
+        self._conn.execute(
+            "UPDATE cooperation_cases SET status = ?, status_updated_at = ?, "
+            "completed_at = ?, closed_at = ?, updated_at = ? WHERE id = ?",
+            (code, now, completed_at, closed_at, now, int(case_id)),
+        )
+        self._add_cooperation_event_locked(
+            case_id,
+            "status_corrected" if allow_terminal_correction else "status_changed",
+            status_from=current,
+            status_to=code,
+            note=str(note).strip() if note and str(note).strip() else None,
+            actor_user_id=actor_user_id,
+            now=now,
+        )
+        claimed = self._claim_creator_locked(
+            case["platform"], case["user_id"], claim_user_id, now
+        )
+        self._sync_cooperation_summary_locked(case["platform"], case["user_id"])
+        return {
+            "changed": True,
+            "note_added": bool(note and str(note).strip()),
+            "previous_status": current,
+            "status": code,
+            "cooperation_updated_at": now,
+            "case_id": int(case_id),
+            "claimed": claimed,
+        }
+
+    def _cooperation_eligible(self, platform: str, user_id: str) -> bool:
+        return bool(
+            self._conn.execute(
+                "SELECT 1 FROM creator_rounds "
+                "WHERE platform = ? AND user_id = ? AND status = 'adopted' LIMIT 1",
+                (platform, user_id),
+            ).fetchone()
+        )
+
+    def _require_cooperation_eligible(self, platform: str, user_id: str) -> None:
+        if not self._cooperation_eligible(platform, user_id):
+            raise ValueError("只有已采用达人可写合作状态")
+
+    def _update_cooperation_locked(
+        self,
+        platform: str,
+        user_id: str,
+        status: str | None,
+        expected_status: str | None = None,
+        expected_updated_at: str | None = None,
+        claim_user_id: int | None = None,
+        allow_adoption: bool = False,
+    ) -> dict[str, Any]:
+        self._ensure_creator_stub(platform, user_id)
+        if not self._creator_exists(platform, user_id):
+            raise ValueError("达人不存在")
+        if not allow_adoption:
+            self._require_cooperation_eligible(platform, user_id)
+        code = normalize_cooperation_status(status, default="")
+        if not code:
+            raise ValueError("合作状态不能为空，请使用已取消结束合作")
+        if code not in COOPERATION_STATUS_CODES:
+            raise ValueError("无效的合作状态")
+        summary = self._cooperation_summary_row_locked(platform, user_id)
+        current = summary["cooperation_status"] if summary else ""
+        current_updated = summary["cooperation_updated_at"] if summary else ""
+        if expected_status is not None:
+            expected = normalize_cooperation_status(expected_status, default="")
+            if str(expected_status).strip() and expected not in COOPERATION_STATUS_CODES:
+                raise ValueError("无效的期望合作状态")
+            if (current or "") != expected:
+                raise ValueError("合作状态已被其他人更新，请刷新后重试")
+        if expected_updated_at is not None and (current_updated or "") != expected_updated_at:
+            raise ValueError("合作状态已被其他人更新，请刷新后重试")
+        open_case = self._open_cooperation_case_locked(platform, user_id)
+        if open_case:
+            result = self._update_cooperation_case_status_locked(
+                int(open_case["id"]),
+                code,
+                expected_updated_at=expected_updated_at,
+                actor_user_id=claim_user_id,
+                claim_user_id=claim_user_id,
+            )
+            result["previous_status"] = current or ""
+            result["status"] = code
+            return result
+        count = int(summary["cooperation_count"] or 0) if summary else 0
+        if count > 0:
+            raise ValueError("当前没有进行中的合作，请开启新一轮合作")
+        if code not in COOPERATION_OPEN_CODES:
+            raise ValueError("新合作必须从进行中状态开始")
+        created = self._insert_cooperation_case_locked(
+            platform, user_id, code, created_by=claim_user_id
+        )
+        now = utc_now()
+        claimed = self._claim_creator_locked(platform, user_id, claim_user_id, now)
+        return {
+            "changed": True,
+            "previous_status": "",
+            "status": code,
+            "cooperation_updated_at": now,
+            "case_id": created["case_id"],
+            "claimed": claimed,
+        }
+
+    def update_cooperation(
+        self,
+        platform: str,
+        user_id: str,
+        status: str | None,
+        expected_status: str | None = None,
+        expected_updated_at: str | None = None,
+        claim_user_id: int | None = None,
+    ) -> dict[str, Any]:
+        with self._conn:
+            return self._update_cooperation_locked(
+                platform,
+                user_id,
+                status,
+                expected_status=expected_status,
+                expected_updated_at=expected_updated_at,
+                claim_user_id=claim_user_id,
+            )
+
+    def bulk_update_cooperation(
+        self,
+        items: Iterable[Any],
+        status: str | None,
+        claim_user_id: int | None = None,
+    ) -> dict[str, Any]:
+        code = normalize_cooperation_status(status, default="")
+        if code not in COOPERATION_OPEN_CODES:
+            raise ValueError("批量只能更新进行中的合作状态")
+        item_list = [
+            item if isinstance(item, dict) else {"platform": item[0], "user_id": item[1]}
+            for item in items
+        ]
+        changes: list[dict[str, Any]] = []
+        conflicts: list[dict[str, Any]] = []
+        with self._conn:
+            for item in item_list:
+                platform = str(item["platform"])
+                user_id = str(item["user_id"])
+                summary = self._cooperation_summary_row_locked(platform, user_id)
+                if summary is None:
+                    conflicts.append({
+                        "platform": platform,
+                        "user_id": user_id,
+                        "reason": "missing",
+                        "cooperation_status": "",
+                        "cooperation_updated_at": "",
+                    })
+                    continue
+                open_case = self._open_cooperation_case_locked(platform, user_id)
+                if not open_case and int(summary["cooperation_count"] or 0) > 0:
+                    conflicts.append({
+                        "platform": platform,
+                        "user_id": user_id,
+                        "reason": "no_open_case",
+                        "cooperation_status": summary["cooperation_status"] or "",
+                        "cooperation_updated_at": summary["cooperation_updated_at"] or "",
+                    })
+                    continue
+                if not open_case and not self._cooperation_eligible(platform, user_id):
+                    conflicts.append({
+                        "platform": platform,
+                        "user_id": user_id,
+                        "reason": "not_adopted",
+                        "cooperation_status": "",
+                        "cooperation_updated_at": "",
+                    })
+                    continue
+                if not open_case:
+                    try:
+                        created = self._insert_cooperation_case_locked(
+                            platform, user_id, code, created_by=claim_user_id
+                        )
+                    except ValueError as exc:
+                        conflicts.append({
+                            "platform": platform,
+                            "user_id": user_id,
+                            "reason": "no_open_case",
+                            "cooperation_status": "",
+                            "cooperation_updated_at": "",
+                            "message": str(exc),
+                        })
+                        continue
+                    now = utc_now()
+                    claimed = self._claim_creator_locked(
+                        platform, user_id, claim_user_id, now
+                    )
+                    changes.append({
+                        "platform": platform,
+                        "user_id": user_id,
+                        "previous_status": "",
+                        "status": code,
+                        "cooperation_updated_at": now,
+                        "case_id": created["case_id"],
+                        "claimed": claimed,
+                    })
+                    continue
+                current = summary["cooperation_status"] or ""
+                current_updated = summary["cooperation_updated_at"] or ""
+                conflict_reason = ""
+                if item.get("expected_status") is not None:
+                    expected = normalize_cooperation_status(
+                        item["expected_status"], default=""
+                    )
+                    if (
+                        str(item["expected_status"]).strip()
+                        and expected not in COOPERATION_STATUS_CODES
+                    ):
+                        raise ValueError("无效的期望合作状态")
+                    if current != expected:
+                        conflict_reason = "cooperation_status"
+                if not conflict_reason and item.get("expected_updated_at") is not None:
+                    if current_updated != item["expected_updated_at"]:
+                        conflict_reason = "cooperation_updated_at"
+                if conflict_reason:
+                    conflicts.append({
+                        "platform": platform,
+                        "user_id": user_id,
+                        "reason": conflict_reason,
+                        "cooperation_status": current,
+                        "cooperation_updated_at": current_updated,
+                    })
+                    continue
+                result = self._update_cooperation_case_status_locked(
+                    int(open_case["id"]),
+                    code,
+                    expected_updated_at=item.get("expected_updated_at"),
+                    claim_user_id=claim_user_id,
+                )
+                if result["changed"]:
+                    changes.append({
+                        "platform": platform,
+                        "user_id": user_id,
+                        "previous_status": result["previous_status"],
+                        "status": result["status"],
+                        "cooperation_updated_at": result["cooperation_updated_at"],
+                        "case_id": result["case_id"],
+                        "claimed": result["claimed"],
+                    })
+        return {
+            "changed": len(changes),
+            "conflicts": conflicts,
+            "changes": changes,
+        }
+
+    def create_cooperation_case(
+        self,
+        platform: str,
+        user_id: str,
+        status: str | None = None,
+        *,
+        note: str | None = None,
+        created_by: int | None = None,
+    ) -> dict[str, Any]:
+        with self._conn:
+            self._ensure_creator_stub(platform, user_id)
+            if not self._creator_exists(platform, user_id):
+                raise ValueError("达人不存在")
+            if not self._cooperation_eligible(platform, user_id):
+                raise ValueError("只有已采用达人可开始合作")
+            summary = self._cooperation_summary_row_locked(platform, user_id)
+            count = int(summary["cooperation_count"] or 0) if summary else 0
+            code = normalize_cooperation_status(status, default="")
+            if not code:
+                code = NEW_COOPERATION_STATUS if count > 0 else DEFAULT_COOPERATION_STATUS
+            if code not in COOPERATION_OPEN_CODES:
+                raise ValueError("新合作必须从进行中状态开始")
+            created = self._insert_cooperation_case_locked(
+                platform, user_id, code, note=note, created_by=created_by
+            )
+            claimed = self._claim_creator_locked(
+                platform, user_id, created_by, utc_now()
+            )
+            created["claimed"] = claimed
+            created["summary"] = self._sync_cooperation_summary_locked(
+                platform, user_id
+            )
+            return created
+
+    def update_cooperation_case_status(
+        self,
+        case_id: int,
+        status: str,
+        *,
+        note: str | None = None,
+        expected_updated_at: str | None = None,
+        actor_user_id: int | None = None,
+        claim_user_id: int | None = None,
+    ) -> dict[str, Any]:
+        with self._conn:
+            result = self._update_cooperation_case_status_locked(
+                case_id,
+                status,
+                note=note,
+                expected_updated_at=expected_updated_at,
+                actor_user_id=actor_user_id,
+                claim_user_id=claim_user_id,
+            )
+            case = self._cooperation_case_locked(case_id)
+            if case:
+                result["summary"] = self._sync_cooperation_summary_locked(
+                    case["platform"], case["user_id"]
+                )
+            return result
+
+    def complete_cooperation_case(
+        self,
+        case_id: int,
+        *,
+        note: str | None = None,
+        works: Iterable[dict[str, Any]] | None = None,
+        expected_updated_at: str | None = None,
+        actor_user_id: int | None = None,
+    ) -> dict[str, Any]:
+        with self._conn:
+            case = self._cooperation_case_locked(case_id)
+            if not case:
+                raise ValueError("合作记录不存在")
+            if case["status"] in COOPERATION_TERMINAL_CODES:
+                raise ValueError("该合作已经结束")
+            if expected_updated_at is not None and case["updated_at"] != expected_updated_at:
+                raise ValueError("合作记录已被其他人更新，请刷新后重试")
+            now = utc_now()
+            work_ids: list[int] = []
+            for work in works or []:
+                cur = self._conn.execute(
+                    "INSERT INTO cooperation_works "
+                    "(case_id, platform, url, title, published_at, note, created_by, "
+                    "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        int(case_id),
+                        str(work.get("platform") or ""),
+                        str(work["url"]),
+                        str(work.get("title") or ""),
+                        work.get("published_at") or None,
+                        str(work.get("note") or ""),
+                        actor_user_id,
+                        now,
+                        now,
+                    ),
+                )
+                work_id = int(cur.lastrowid)
+                work_ids.append(work_id)
+                self._add_cooperation_event_locked(
+                    case_id,
+                    "work_added",
+                    status_from=case["status"],
+                    status_to=case["status"],
+                    metadata={"work_id": work_id, "url": work["url"]},
+                    actor_user_id=actor_user_id,
+                    now=now,
+                )
+            result = self._update_cooperation_case_status_locked(
+                case_id,
+                "completed",
+                note=note,
+                expected_updated_at=None,
+                actor_user_id=actor_user_id,
+                claim_user_id=actor_user_id,
+            )
+            result["work_ids"] = work_ids
+            result["summary"] = self._sync_cooperation_summary_locked(
+                case["platform"], case["user_id"]
+            )
+            return result
+
+    def correct_cooperation_status(
+        self,
+        case_id: int,
+        status: str,
+        *,
+        note: str,
+        actor_user_id: int | None = None,
+    ) -> dict[str, Any]:
+        if not str(note or "").strip():
+            raise ValueError("更正合作状态必须填写原因")
+        with self._conn:
+            result = self._update_cooperation_case_status_locked(
+                case_id,
+                status,
+                note=note,
+                actor_user_id=actor_user_id,
+                allow_terminal_correction=True,
+            )
+            case = self._cooperation_case_locked(case_id)
+            result["summary"] = self._sync_cooperation_summary_locked(
+                case["platform"], case["user_id"]
+            )
+            return result
+
+    def update_cooperation_case_summary(
+        self,
+        case_id: int,
+        summary: str,
+        *,
+        expected_updated_at: str | None = None,
+        actor_user_id: int | None = None,
+    ) -> dict[str, Any]:
+        with self._conn:
+            case = self._cooperation_case_locked(case_id)
+            if not case:
+                raise ValueError("合作记录不存在")
+            if expected_updated_at is not None and case["updated_at"] != expected_updated_at:
+                raise ValueError("合作记录已被其他人更新，请刷新后重试")
+            value = str(summary or "").strip()
+            if value == str(case["summary"] or ""):
+                return {"changed": False, "case_id": int(case_id)}
+            now = utc_now()
+            self._conn.execute(
+                "UPDATE cooperation_cases SET summary = ?, updated_at = ? WHERE id = ?",
+                (value, now, int(case_id)),
+            )
+            self._add_cooperation_event_locked(
+                case_id,
+                "summary_updated",
+                note=value or "清空合作摘要",
+                metadata={"previous": case["summary"] or "", "summary": value},
+                actor_user_id=actor_user_id,
+                now=now,
+            )
+            self._sync_cooperation_summary_locked(case["platform"], case["user_id"])
+            return {"changed": True, "case_id": int(case_id), "summary": value}
+
+    def add_cooperation_note(
+        self,
+        case_id: int,
+        note: str,
+        *,
+        actor_user_id: int | None = None,
+    ) -> dict[str, Any]:
+        value = str(note or "").strip()
+        if not value:
+            raise ValueError("备注不能为空")
+        with self._conn:
+            case = self._cooperation_case_locked(case_id)
+            if not case:
+                raise ValueError("合作记录不存在")
+            now = utc_now()
+            event_id = self._add_cooperation_event_locked(
+                case_id,
+                "note_added",
+                note=value,
+                actor_user_id=actor_user_id,
+                now=now,
+            )
+            self._sync_cooperation_summary_locked(case["platform"], case["user_id"])
+            return {"event_id": event_id, "case_id": int(case_id)}
+
+    def cooperation_cases(
+        self, platform: str, user_id: str
+    ) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """
+            SELECT cc.*,
+                   (SELECT COUNT(*) FROM cooperation_events ce WHERE ce.case_id = cc.id)
+                       AS event_count,
+                   (SELECT COUNT(*) FROM cooperation_attachments ca
+                    WHERE ca.case_id = cc.id AND ca.deleted_at IS NULL)
+                       AS attachment_count,
+                   (SELECT COUNT(*) FROM cooperation_works cw
+                    WHERE cw.case_id = cc.id AND cw.deleted_at IS NULL)
+                       AS work_count
+            FROM cooperation_cases cc
+            WHERE cc.platform = ? AND cc.user_id = ?
+            ORDER BY cc.seq DESC
+            """,
+            (platform, user_id),
+        ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["active"] = item["status"] in COOPERATION_OPEN_CODES
+            result.append(item)
+        return result
+
+    def cooperation_summary(self, platform: str, user_id: str) -> dict[str, Any]:
+        row = self._cooperation_summary_row_locked(platform, user_id)
+        if not row:
+            return {
+                "cooperation_status": "",
+                "cooperation_updated_at": "",
+                "cooperation_count": 0,
+                "cooperation_last_completed_at": "",
+                "cooperation_case_id": None,
+            }
+        return {
+            "cooperation_status": row["cooperation_status"] or "",
+            "cooperation_updated_at": row["cooperation_updated_at"] or "",
+            "cooperation_count": int(row["cooperation_count"] or 0),
+            "cooperation_last_completed_at": row["cooperation_last_completed_at"] or "",
+            "cooperation_case_id": row["cooperation_case_id"],
+        }
+
+    def cooperation_case_detail(self, case_id: int) -> dict[str, Any] | None:
+        case = self._cooperation_case_locked(case_id)
+        if not case:
+            return None
+        events = [
+            dict(row)
+            for row in self._conn.execute(
+                """
+                SELECT e.*, COALESCE(u.username, '') AS actor_username
+                FROM cooperation_events e
+                LEFT JOIN users u ON u.id = e.actor_user_id
+                WHERE e.case_id = ? ORDER BY e.id ASC
+                """,
+                (int(case_id),),
+            ).fetchall()
+        ]
+        for event in events:
+            try:
+                event["metadata"] = json.loads(event.get("metadata") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                event["metadata"] = {}
+        attachments = [
+            dict(row)
+            for row in self._conn.execute(
+                """
+                SELECT a.*, COALESCE(u.username, '') AS uploaded_by_username
+                FROM cooperation_attachments a
+                LEFT JOIN users u ON u.id = a.uploaded_by
+                WHERE a.case_id = ? AND a.deleted_at IS NULL
+                ORDER BY a.id DESC
+                """,
+                (int(case_id),),
+            ).fetchall()
+        ]
+        works = [
+            dict(row)
+            for row in self._conn.execute(
+                """
+                SELECT w.*, COALESCE(u.username, '') AS created_by_username
+                FROM cooperation_works w
+                LEFT JOIN users u ON u.id = w.created_by
+                WHERE w.case_id = ? AND w.deleted_at IS NULL
+                ORDER BY w.id ASC
+                """,
+                (int(case_id),),
+            ).fetchall()
+        ]
+        return {
+            "case": case,
+            "events": events,
+            "attachments": attachments,
+            "works": works,
+            "summary": self.cooperation_summary(
+                case["platform"], case["user_id"]
+            ),
+        }
+
+    def add_cooperation_attachment(
+        self,
+        case_id: int,
+        *,
+        original_name: str,
+        storage_key: str,
+        content_type: str,
+        size_bytes: int,
+        sha256: str,
+        category: str,
+        description: str,
+        uploaded_by: int | None,
+    ) -> dict[str, Any]:
+        with self._conn:
+            case = self._cooperation_case_locked(case_id)
+            if not case:
+                raise ValueError("合作记录不存在")
+            now = utc_now()
+            event_id = self._add_cooperation_event_locked(
+                case_id,
+                "attachment_added",
+                note=description or None,
+                metadata={
+                    "name": original_name,
+                    "category": category,
+                    "size": int(size_bytes),
+                    "sha256": sha256,
+                },
+                actor_user_id=uploaded_by,
+                now=now,
+            )
+            cur = self._conn.execute(
+                "INSERT INTO cooperation_attachments "
+                "(case_id, event_id, original_name, storage_key, content_type, "
+                "size_bytes, sha256, category, description, uploaded_by, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    int(case_id),
+                    event_id,
+                    original_name,
+                    storage_key,
+                    content_type,
+                    int(size_bytes),
+                    sha256,
+                    category,
+                    description,
+                    uploaded_by,
+                    now,
+                ),
+            )
+            self._sync_cooperation_summary_locked(case["platform"], case["user_id"])
+            return {
+                "id": int(cur.lastrowid),
+                "case_id": int(case_id),
+                "event_id": event_id,
+                "original_name": original_name,
+                "storage_key": storage_key,
+                "content_type": content_type,
+                "size_bytes": int(size_bytes),
+                "sha256": sha256,
+                "category": category,
+                "description": description,
+                "uploaded_by": uploaded_by,
+                "created_at": now,
+            }
+
+    def get_cooperation_attachment(self, attachment_id: int) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM cooperation_attachments WHERE id = ?",
+            (int(attachment_id),),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def delete_cooperation_attachment(
+        self, attachment_id: int, *, actor_user_id: int | None
+    ) -> dict[str, Any]:
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT * FROM cooperation_attachments WHERE id = ?",
+                (int(attachment_id),),
+            ).fetchone()
+            if not row:
+                raise ValueError("附件不存在")
+            if row["deleted_at"]:
+                return {"changed": False, "case_id": int(row["case_id"])}
+            now = utc_now()
+            self._conn.execute(
+                "UPDATE cooperation_attachments SET deleted_at = ?, deleted_by = ? "
+                "WHERE id = ?",
+                (now, actor_user_id, int(attachment_id)),
+            )
+            case = self._cooperation_case_locked(int(row["case_id"]))
+            self._add_cooperation_event_locked(
+                int(row["case_id"]),
+                "attachment_removed",
+                metadata={"attachment_id": int(attachment_id), "name": row["original_name"]},
+                actor_user_id=actor_user_id,
+                now=now,
+            )
+            if case:
+                self._sync_cooperation_summary_locked(case["platform"], case["user_id"])
+            return {"changed": True, "case_id": int(row["case_id"])}
+
+    def add_cooperation_work(
+        self,
+        case_id: int,
+        work: dict[str, Any],
+        *,
+        actor_user_id: int | None,
+    ) -> dict[str, Any]:
+        with self._conn:
+            case = self._cooperation_case_locked(case_id)
+            if not case:
+                raise ValueError("合作记录不存在")
+            now = utc_now()
+            cur = self._conn.execute(
+                "INSERT INTO cooperation_works "
+                "(case_id, platform, url, title, published_at, note, created_by, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    int(case_id),
+                    str(work.get("platform") or ""),
+                    str(work["url"]),
+                    str(work.get("title") or ""),
+                    work.get("published_at") or None,
+                    str(work.get("note") or ""),
+                    actor_user_id,
+                    now,
+                    now,
+                ),
+            )
+            work_id = int(cur.lastrowid)
+            self._add_cooperation_event_locked(
+                case_id,
+                "work_added",
+                metadata={"work_id": work_id, "url": work["url"]},
+                actor_user_id=actor_user_id,
+                now=now,
+            )
+            self._sync_cooperation_summary_locked(case["platform"], case["user_id"])
+            return {"id": work_id, "case_id": int(case_id), "created_at": now}
+
+    def get_cooperation_work(self, work_id: int) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM cooperation_works WHERE id = ? AND deleted_at IS NULL",
+            (int(work_id),),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_cooperation_work(
+        self,
+        work_id: int,
+        work: dict[str, Any],
+        *,
+        actor_user_id: int | None,
+    ) -> dict[str, Any]:
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT * FROM cooperation_works WHERE id = ? AND deleted_at IS NULL",
+                (int(work_id),),
+            ).fetchone()
+            if not row:
+                raise ValueError("作品不存在")
+            case = self._cooperation_case_locked(int(row["case_id"]))
+            if not case:
+                raise ValueError("合作记录不存在")
+            now = utc_now()
+            self._conn.execute(
+                "UPDATE cooperation_works SET platform = ?, url = ?, title = ?, "
+                "published_at = ?, note = ?, updated_at = ? WHERE id = ?",
+                (
+                    str(work.get("platform") or ""),
+                    str(work["url"]),
+                    str(work.get("title") or ""),
+                    work.get("published_at") or None,
+                    str(work.get("note") or ""),
+                    now,
+                    int(work_id),
+                ),
+            )
+            self._add_cooperation_event_locked(
+                int(row["case_id"]),
+                "work_updated",
+                metadata={
+                    "work_id": int(work_id),
+                    "before": {
+                        "url": row["url"],
+                        "title": row["title"],
+                        "published_at": row["published_at"],
+                    },
+                    "after": {
+                        "url": str(work["url"]),
+                        "title": str(work.get("title") or ""),
+                        "published_at": work.get("published_at") or None,
+                    },
+                },
+                actor_user_id=actor_user_id,
+                now=now,
+            )
+            self._sync_cooperation_summary_locked(case["platform"], case["user_id"])
+            return {"id": int(work_id), "case_id": int(row["case_id"]), "updated_at": now}
+
+    def delete_cooperation_work(
+        self, work_id: int, *, actor_user_id: int | None
+    ) -> dict[str, Any]:
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT * FROM cooperation_works WHERE id = ? AND deleted_at IS NULL",
+                (int(work_id),),
+            ).fetchone()
+            if not row:
+                return {"changed": False}
+            now = utc_now()
+            self._conn.execute(
+                "UPDATE cooperation_works SET deleted_at = ?, deleted_by = ? WHERE id = ?",
+                (now, actor_user_id, int(work_id)),
+            )
+            case = self._cooperation_case_locked(int(row["case_id"]))
+            self._add_cooperation_event_locked(
+                int(row["case_id"]),
+                "work_removed",
+                metadata={"work_id": int(work_id), "url": row["url"]},
+                actor_user_id=actor_user_id,
+                now=now,
+            )
+            if case:
+                self._sync_cooperation_summary_locked(case["platform"], case["user_id"])
+            return {"changed": True, "case_id": int(row["case_id"])}
+
+    def cooperation_history(
+        self, platform: str, user_id: str, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        case = self._latest_cooperation_case_locked(platform, user_id)
+        if not case:
+            return []
+        rows = self._conn.execute(
+            """
+            SELECT e.*, COALESCE(u.username, '') AS actor_username
+            FROM cooperation_events e
+            LEFT JOIN users u ON u.id = e.actor_user_id
+            WHERE e.case_id = ? ORDER BY e.id DESC LIMIT ?
+            """,
+            (int(case["id"]), max(1, min(100, int(limit)))),
+        ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                metadata = json.loads(row["metadata"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                metadata = {}
+            result.append({
+                "id": int(row["id"]),
+                "case_id": int(row["case_id"]),
+                "ts": row["created_at"],
+                "from_status": str(row["status_from"] or ""),
+                "to_status": str(row["status_to"] or ""),
+                "event_type": str(row["event_type"] or ""),
+                "note": str(row["note"] or ""),
+                "auto": bool(metadata.get("auto")),
+                "batch": False,
+                "actor_username": row["actor_username"] or "",
+            })
+        return result
 
     def creator_is_fresh(self, platform: str, user_id: str, cache_days: int) -> bool:
         row = self._conn.execute(
@@ -2187,14 +3738,28 @@ class Database:
                         now,
                     ),
                 )
-        for entry in stats:
-            self._sync_cooperation_status(entry["platform"], entry["user_id"])
         self.rebuild_search_index(round_id)
         return len(stats)
 
     def import_creator_rows(self, round_id: int, items: list[dict[str, Any]]) -> int:
         """Bulk import creators/notes/round rows in one transaction (Excel imports)."""
         now = utc_now()
+        identities = {
+            (
+                str(item["round"].get("platform", "xhs")),
+                str(item["round"]["user_id"]),
+            )
+            for item in items
+        }
+        previous_adopted: dict[tuple[str, str], bool] = {}
+        for platform, user_id in identities:
+            previous_adopted[(platform, user_id)] = bool(
+                self._conn.execute(
+                    "SELECT 1 FROM creator_rounds "
+                    "WHERE platform = ? AND user_id = ? AND status = 'adopted' LIMIT 1",
+                    (platform, user_id),
+                ).fetchone()
+            )
         with self._conn:
             for item in items:
                 creator = item["creator"]
@@ -2346,11 +3911,80 @@ class Database:
                         now,
                     ),
                 )
-        for identity in {
-            (str(item["round"].get("platform", "xhs")), str(item["round"]["user_id"]))
-            for item in items
-        }:
-            self._sync_cooperation_status(*identity)
+        explicit_cooperation: dict[tuple[str, str], tuple[str, str | None]] = {}
+        for item in items:
+            row = item["round"]
+            identity = (str(row.get("platform", "xhs")), str(row["user_id"]))
+            code = normalize_cooperation_status(item.get("cooperation_status"), default="")
+            if code:
+                imported_at = self._normalize_cooperation_timestamp(
+                    item.get("cooperation_updated_at")
+                )
+                explicit_cooperation[identity] = (code, imported_at)
+        with self._conn:
+            for identity in identities:
+                platform, user_id = identity
+                if identity in explicit_cooperation and self._cooperation_eligible(
+                    platform, user_id
+                ):
+                    status, imported_at = explicit_cooperation[identity]
+                    existing_case = self._open_cooperation_case_locked(platform, user_id)
+                    if existing_case:
+                        try:
+                            self._update_cooperation_case_status_locked(
+                                int(existing_case["id"]),
+                                status,
+                                note="Excel 导入合作状态",
+                            )
+                        except ValueError:
+                            pass
+                    else:
+                        summary = self._cooperation_summary_row_locked(
+                            platform, user_id
+                        )
+                        if int((summary["cooperation_count"] if summary else 0) or 0) == 0:
+                            self._insert_cooperation_case_locked(
+                                platform,
+                                user_id,
+                                status,
+                                note="Excel 导入合作状态",
+                                allow_terminal=True,
+                            )
+                    if imported_at:
+                        latest_case = self._latest_cooperation_case_locked(
+                            platform, user_id
+                        )
+                        if latest_case:
+                            completed_at = (
+                                imported_at if status == "completed" else latest_case["completed_at"]
+                            )
+                            closed_at = (
+                                imported_at
+                                if status in ("declined", "cancelled")
+                                else latest_case["closed_at"]
+                            )
+                            self._conn.execute(
+                                "UPDATE cooperation_cases SET status_updated_at = ?, "
+                                "updated_at = ?, completed_at = ?, closed_at = ? WHERE id = ?",
+                                (
+                                    imported_at,
+                                    imported_at,
+                                    completed_at,
+                                    closed_at,
+                                    int(latest_case["id"]),
+                                ),
+                            )
+                            self._sync_cooperation_summary_locked(platform, user_id)
+                    continue
+                if previous_adopted.get(identity):
+                    continue
+                adopted = self._conn.execute(
+                    "SELECT 1 FROM creator_rounds "
+                    "WHERE platform = ? AND user_id = ? AND status = 'adopted' LIMIT 1",
+                    (platform, user_id),
+                ).fetchone()
+                if adopted:
+                    self._ensure_cooperation_enrolled_locked(platform, user_id)
         self.rebuild_search_index(round_id)
         return len(items)
 
@@ -2371,32 +4005,10 @@ class Database:
         claim_user_id: int | None = None,
     ) -> None:
         updates: dict[str, Any] = {}
-        if cooperation_status is not None:
-            where = "platform = ? AND user_id = ?"
-            values: list[Any] = [
-                normalize_status(cooperation_status),
-                utc_now(),
-                platform,
-                user_id,
-            ]
-            if expected_cooperation_status is not None:
-                where += " AND cooperation_status = ?"
-                values.append(normalize_status(expected_cooperation_status, default=""))
-            if expected_cooperation_updated_at is not None:
-                where += " AND cooperation_updated_at = ?"
-                values.append(expected_cooperation_updated_at)
-            with self._conn:
-                cur = self._conn.execute(
-                    f"UPDATE creators SET cooperation_status = ?, cooperation_updated_at = ? WHERE {where}",
-                    values,
-                )
-                if (
-                    expected_cooperation_status is not None
-                    or expected_cooperation_updated_at is not None
-                ) and cur.rowcount == 0:
-                    raise ValueError("合作状态已被其他人更新，请刷新后重试")
+        new_status: str | None = None
         if status is not None:
-            updates["status"] = normalize_status(status)
+            new_status = normalize_status(status)
+            updates["status"] = new_status
         if match_direction is not None:
             updates["match_direction"] = match_direction
         if tags_manual is not None:
@@ -2404,41 +4016,70 @@ class Database:
         if remark is not None:
             updates["remark"] = remark
         updates = {key: value for key, value in updates.items() if key in REVIEW_FIELDS}
-        if not updates:
+        if not updates and cooperation_status is None:
             return
-        updates["updated_at"] = utc_now()
-        sets = ", ".join(f"{key} = ?" for key in updates)
-        values: list[Any] = [*updates.values(), round_id, platform, user_id]
+        sets = ""
+        values: list[Any] = []
         where = "round_id = ? AND platform = ? AND user_id = ?"
-        if expected_updated_at is not None:
-            where += " AND updated_at = ?"
-            values.append(expected_updated_at)
-        if expected_status is not None:
-            expected = normalize_status(expected_status, default="")
-            if not expected:
-                raise ValueError("无效的期望状态")
-            where += " AND status = ?"
-            values.append(expected)
+        if updates:
+            updates["updated_at"] = utc_now()
+            sets = ", ".join(f"{key} = ?" for key in updates)
+            values = [*updates.values(), round_id, platform, user_id]
+            if expected_updated_at is not None:
+                where += " AND updated_at = ?"
+                values.append(expected_updated_at)
+            if expected_status is not None:
+                expected = normalize_status(expected_status, default="")
+                if not expected:
+                    raise ValueError("无效的期望状态")
+                where += " AND status = ?"
+                values.append(expected)
+        if cooperation_status is not None and not str(cooperation_status or "").strip():
+            raise ValueError("合作状态不能为空，请使用已取消结束合作")
         with self._conn:
-            cur = self._conn.execute(
-                f"UPDATE creator_rounds SET {sets} WHERE {where}",
-                values,
-            )
-            if (expected_updated_at is not None or expected_status is not None) and cur.rowcount == 0:
-                raise ValueError("数据已被其他人更新，请刷新后重试")
-            if claim_user_id is not None:
-                self._conn.execute(
-                    "INSERT INTO creators (platform, user_id) VALUES (?, ?) "
-                    "ON CONFLICT(platform, user_id) DO NOTHING",
-                    (platform, user_id),
+            if cooperation_status is not None:
+                self._update_cooperation_locked(
+                    platform,
+                    user_id,
+                    cooperation_status,
+                    expected_status=expected_cooperation_status,
+                    expected_updated_at=expected_cooperation_updated_at,
+                    claim_user_id=claim_user_id,
+                    allow_adoption=new_status == "adopted",
                 )
-                self._conn.execute(
-                    "UPDATE creators SET follow_up_user_id = ?, followed_at = ? "
-                    "WHERE platform = ? AND user_id = ? AND follow_up_user_id IS NULL",
-                    (claim_user_id, utc_now(), platform, user_id),
+            if updates:
+                current_status: str | None = None
+                if status is not None:
+                    current = self._conn.execute(
+                        "SELECT status FROM creator_rounds "
+                        "WHERE round_id = ? AND platform = ? AND user_id = ?",
+                        (round_id, platform, user_id),
+                    ).fetchone()
+                    current_status = current["status"] if current else None
+                cur = self._conn.execute(
+                    f"UPDATE creator_rounds SET {sets} WHERE {where}",
+                    values,
                 )
-        if status is not None:
-            self._sync_cooperation_status(platform, user_id)
+                if (expected_updated_at is not None or expected_status is not None) and cur.rowcount == 0:
+                    raise ValueError("数据已被其他人更新，请刷新后重试")
+                if claim_user_id is not None:
+                    self._conn.execute(
+                        "INSERT INTO creators (platform, user_id) VALUES (?, ?) "
+                        "ON CONFLICT(platform, user_id) DO NOTHING",
+                        (platform, user_id),
+                    )
+                    self._conn.execute(
+                        "UPDATE creators SET follow_up_user_id = ?, followed_at = ? "
+                        "WHERE platform = ? AND user_id = ? AND follow_up_user_id IS NULL",
+                        (claim_user_id, utc_now(), platform, user_id),
+                    )
+                if status is not None:
+                    if (
+                        new_status == "adopted"
+                        and current_status != "adopted"
+                        and cooperation_status is None
+                    ):
+                        self._ensure_cooperation_enrolled_locked(platform, user_id)
         if tags_manual is not None:
             self._refresh_search_row(round_id, platform, user_id)
 
@@ -2456,8 +4097,19 @@ class Database:
         owner_user_id: int | None = None,
     ) -> dict[str, Any]:
         updates: dict[str, Any] = {}
+        new_status = normalize_status(status) if status is not None else None
+        new_cooperation = (
+            normalize_cooperation_status(cooperation_status, default="")
+            if cooperation_status is not None
+            else None
+        )
+        if cooperation_status is not None:
+            if not new_cooperation:
+                raise ValueError("合作状态不能为空，请使用已取消结束合作")
+            if new_cooperation not in COOPERATION_OPEN_CODES:
+                raise ValueError("批量只能更新进行中的合作状态")
         if status is not None:
-            updates["status"] = normalize_status(status)
+            updates["status"] = new_status
         if match_direction is not None:
             updates["match_direction"] = match_direction
         if tags_manual is not None:
@@ -2466,7 +4118,12 @@ class Database:
             updates["remark"] = remark
         updates = {key: value for key, value in updates.items() if key in REVIEW_FIELDS}
         if not updates and cooperation_status is None and not set_owner:
-            return {"changed": 0, "conflicts": []}
+            return {
+                "changed": 0,
+                "conflicts": [],
+                "enrolled": [],
+                "cooperation_changes": [],
+            }
         if updates:
             updates["updated_at"] = utc_now()
         sets = ", ".join(f"{key} = ?" for key in updates)
@@ -2477,6 +4134,8 @@ class Database:
         ]
         changed = 0
         conflicts: list[dict[str, Any]] = []
+        enrolled: list[dict[str, str]] = []
+        cooperation_changes: list[dict[str, Any]] = []
         with self._conn:
             for item in item_list:
                 platform = str(item["platform"])
@@ -2487,8 +4146,8 @@ class Database:
                     (round_id, platform, user_id),
                 ).fetchone()
                 creator = self._conn.execute(
-                    "SELECT cooperation_status, cooperation_updated_at FROM creators "
-                    "WHERE platform = ? AND user_id = ?",
+                    "SELECT cooperation_status, cooperation_updated_at, cooperation_count "
+                    "FROM creators WHERE platform = ? AND user_id = ?",
                     (platform, user_id),
                 ).fetchone()
                 conflict_reason = ""
@@ -2507,20 +4166,33 @@ class Database:
                 ):
                     conflict_reason = "status"
                 if cooperation_status is not None and not conflict_reason:
-                    current_cooperation = (creator["cooperation_status"] if creator else None) or "pending"
+                    current_cooperation = (creator["cooperation_status"] if creator else None) or ""
                     current_cooperation_updated = creator["cooperation_updated_at"] if creator else None
                     if (
                         item.get("expected_cooperation_status") is not None
-                        and current_cooperation != normalize_status(
+                        and current_cooperation != normalize_cooperation_status(
                             item["expected_cooperation_status"], default=""
                         )
                     ):
                         conflict_reason = "cooperation_status"
                     elif (
                         item.get("expected_cooperation_updated_at") is not None
-                        and current_cooperation_updated != item["expected_cooperation_updated_at"]
+                        and (current_cooperation_updated or "")
+                        != item["expected_cooperation_updated_at"]
                     ):
                         conflict_reason = "cooperation_updated_at"
+                    if not conflict_reason:
+                        open_case = self._open_cooperation_case_locked(platform, user_id)
+                        if not open_case and int(
+                            (creator["cooperation_count"] if creator else 0) or 0
+                        ) > 0:
+                            conflict_reason = "no_open_case"
+                        elif (
+                            not open_case
+                            and new_status != "adopted"
+                            and not self._cooperation_eligible(platform, user_id)
+                        ):
+                            conflict_reason = "not_adopted"
                 if conflict_reason:
                     conflicts.append({
                         "platform": platform,
@@ -2528,7 +4200,7 @@ class Database:
                         "reason": conflict_reason,
                         "status": current["status"] if current else None,
                         "updated_at": current["updated_at"] if current else None,
-                        "cooperation_status": (creator["cooperation_status"] if creator else None) or "pending",
+                        "cooperation_status": (creator["cooperation_status"] if creator else None) or "",
                         "cooperation_updated_at": creator["cooperation_updated_at"] if creator else None,
                     })
                     continue
@@ -2540,14 +4212,49 @@ class Database:
                     )
                     item_changed = item_changed or cur.rowcount > 0
                     if status is not None:
-                        self._sync_cooperation_status(platform, user_id)
+                        previous_status = current["status"] if current else None
+                        if (
+                            new_status == "adopted"
+                            and previous_status != "adopted"
+                            and cooperation_status is None
+                        ):
+                            enrollment = self._ensure_cooperation_enrolled_locked(
+                                platform, user_id
+                            )
+                            if enrollment.get("enrolled"):
+                                enrolled.append({
+                                    "platform": platform,
+                                    "user_id": user_id,
+                                })
+                                item_changed = True
                 if cooperation_status is not None:
-                    cur = self._conn.execute(
-                        "UPDATE creators SET cooperation_status = ?, cooperation_updated_at = ? "
-                        "WHERE platform = ? AND user_id = ?",
-                        (normalize_status(cooperation_status), utc_now(), platform, user_id),
+                    previous_status = current_cooperation
+                    change = self._update_cooperation_locked(
+                        platform,
+                        user_id,
+                        new_cooperation,
+                        expected_status=(
+                            item.get("expected_cooperation_status")
+                            if item.get("expected_cooperation_status") is not None
+                            else None
+                        ),
+                        expected_updated_at=(
+                            item.get("expected_cooperation_updated_at")
+                            if item.get("expected_cooperation_updated_at") is not None
+                            else None
+                        ),
+                        claim_user_id=claim_user_id,
                     )
-                    item_changed = item_changed or cur.rowcount > 0
+                    if change.get("changed"):
+                        cooperation_changes.append({
+                            "platform": platform,
+                            "user_id": user_id,
+                            "previous_status": previous_status,
+                            "status": change.get("status") or "",
+                            "cooperation_updated_at": change.get("cooperation_updated_at") or "",
+                            "case_id": change.get("case_id"),
+                        })
+                        item_changed = True
                 if set_owner:
                     self._conn.execute(
                         "INSERT INTO creators (platform, user_id) VALUES (?, ?) "
@@ -2583,11 +4290,16 @@ class Database:
         if tags_manual is not None:
             for item in item_list:
                 self._refresh_search_row(round_id, item["platform"], item["user_id"])
-        return {"changed": changed, "conflicts": conflicts}
+        return {
+            "changed": changed,
+            "conflicts": conflicts,
+            "enrolled": enrolled,
+            "cooperation_changes": cooperation_changes,
+        }
 
     def creator_owner_options(self) -> list[dict[str, Any]]:
         rows = self._conn.execute(
-            "SELECT id, username, role, can_collect FROM users "
+            "SELECT id, username, role, can_collect, can_edit_leads FROM users "
             "WHERE disabled = 0 ORDER BY username COLLATE NOCASE"
         ).fetchall()
         return [dict(row) for row in rows]
@@ -2800,9 +4512,9 @@ class Database:
                    cr.data_round, cr.tier_label, cr.account_id,
                    c.follow_up_user_id AS owner_user_id, c.followed_at AS claimed_at,
                    COALESCE(u.username, '') AS owner_username,
-                   COALESCE(c.cooperation_status, 'pending') AS cooperation_status,
-                   c.cooperation_updated_at, cr.updated_at,
-                   cr.cooperation_platform, cr.raw_title,
+                   c.cooperation_status, c.cooperation_updated_at,
+                   c.cooperation_count, c.cooperation_last_completed_at, c.cooperation_case_id,
+                   cr.updated_at, cr.cooperation_platform, cr.raw_title,
                    n.title AS top_title, n.url AS top_url, n.liked AS top_liked,
                    r.name AS round_name, {ENRICHMENT_SQL} AS enrichment_status
             FROM creator_rounds cr
@@ -2829,6 +4541,8 @@ class Database:
         source_mode: str = "any",
         labels: Iterable[str] | None = None,
         owner: str | None = None,
+        cooperation: Iterable[str] | None = None,
+        cooperation_stale_days: int | None = None,
         min_fans: int | None = None,
         max_fans: int | None = None,
         only_unenriched: bool = False,
@@ -2903,9 +4617,42 @@ class Database:
                 params.extend(source_params)
         status_values = [value for value in (statuses or []) if value]
         if status_values:
-            status_sql = "COALESCE(c.cooperation_status, 'pending')" if round_id is None else "cr.status"
+            status_sql = "cr.status"
             conditions.append(f"{status_sql} IN ({','.join('?' * len(status_values))})")
             params.extend(status_values)
+        cooperation_values: list[str] = []
+        for value in cooperation or []:
+            if not value:
+                continue
+            if str(value) == "none":
+                cooperation_values.append("none")
+                continue
+            code = normalize_cooperation_status(value, default="")
+            if code in COOPERATION_STATUS_CODES:
+                cooperation_values.append(code)
+        if cooperation_values:
+            parts: list[str] = []
+            codes = [value for value in cooperation_values if value != "none"]
+            if codes:
+                parts.append(
+                    f"c.cooperation_status IN ({','.join('?' * len(codes))})"
+                )
+                params.extend(codes)
+            if "none" in cooperation_values:
+                parts.append("COALESCE(c.cooperation_status, '') = ''")
+            conditions.append("(" + " OR ".join(parts) + ")")
+        if cooperation_stale_days is not None:
+            days = max(1, min(365, int(cooperation_stale_days)))
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(days=days)
+            ).isoformat(timespec="milliseconds")
+            placeholders = ",".join("?" * len(COOPERATION_OPEN_CODES))
+            conditions.append(
+                f"c.cooperation_status IN ({placeholders}) "
+                "AND c.cooperation_updated_at IS NOT NULL "
+                "AND c.cooperation_updated_at < ?"
+            )
+            params.extend([*COOPERATION_OPEN_CODES, cutoff])
         tier_values = [value for value in (tiers or []) if value]
         if tier_values:
             conditions.append(f"({TIER_SQL}) IN ({','.join('?' * len(tier_values))})")
@@ -3033,6 +4780,8 @@ class Database:
         source_mode: str = "any",
         labels: Iterable[str] | None = None,
         owner: str | None = None,
+        cooperation: Iterable[str] | None = None,
+        cooperation_stale_days: int | None = None,
         min_fans: int | None = None,
         max_fans: int | None = None,
         only_unenriched: bool = False,
@@ -3056,6 +4805,8 @@ class Database:
             source_mode=source_mode,
             labels=labels,
             owner=owner,
+            cooperation=cooperation,
+            cooperation_stale_days=cooperation_stale_days,
             min_fans=min_fans,
             max_fans=max_fans,
             only_unenriched=only_unenriched,
@@ -3081,6 +4832,10 @@ class Database:
             "nickname": f"c.nickname {direction}",
             "data_round": f"({DATA_ROUND_SQL}) {direction}",
             "updated_at": f"cr.updated_at {direction}",
+            "cooperation_updated_at": (
+                f"(c.cooperation_updated_at IS NULL) ASC, "
+                f"c.cooperation_updated_at {direction}"
+            ),
         }
         sort_clause = sort_map.get(sort, sort_map["fans"])
         page = max(1, int(page))
@@ -3116,10 +4871,16 @@ class Database:
         params: list[Any] = [*base_params]
         if platform:
             params.append(platform)
-        status_sql = "COALESCE(c.cooperation_status, 'pending')" if round_id is None else "cr.status"
+        status_sql = "cr.status"
         status_rows = self._conn.execute(
             f"SELECT {status_sql} AS value, COUNT(*) AS count {from_sql} "
             f"WHERE {base_condition}{platform_condition} GROUP BY value ORDER BY count DESC",
+            params,
+        ).fetchall()
+        cooperation_rows = self._conn.execute(
+            "SELECT c.cooperation_status AS value, COUNT(*) AS count "
+            f"{from_sql} WHERE {base_condition}{platform_condition} "
+            "GROUP BY c.cooperation_status ORDER BY count DESC",
             params,
         ).fetchall()
         tier_rows = self._conn.execute(
@@ -3163,6 +4924,13 @@ class Database:
         return {
             "platforms": rows_to_list(platform_rows),
             "statuses": rows_to_list(status_rows),
+            "cooperation_statuses": [
+                {
+                    "value": "none" if row["value"] in (None, "") else str(row["value"]),
+                    "count": int(row["count"]),
+                }
+                for row in cooperation_rows
+            ],
             "tiers": rows_to_list(tier_rows),
             "directions": rows_to_list(direction_rows),
             "sources": rows_to_list(source_rows),
@@ -3252,10 +5020,11 @@ class Database:
             like = f"%{escaped}%"
             conditions.append(
                 "(l.nickname LIKE ? ESCAPE '\\' OR l.raw_title LIKE ? ESCAPE '\\' "
-                "OR l.account_id LIKE ? ESCAPE '\\' OR l.profile_url LIKE ? ESCAPE '\\' "
+                "OR l.account_id LIKE ? ESCAPE '\\' OR l.platform_handle LIKE ? ESCAPE '\\' "
+                "OR l.profile_url LIKE ? ESCAPE '\\' "
                 "OR l.legacy_user_id LIKE ? ESCAPE '\\')"
             )
-            params.extend([like] * 5)
+            params.extend([like] * 6)
         status_values = [
             normalize_lead_status(value, default="")
             for value in (statuses or [])
@@ -3296,7 +5065,10 @@ class Database:
         ).fetchone()["n"]
         rows = self._conn.execute(
             f"""
-            SELECT l.id, l.platform, l.nickname, l.account_id, l.profile_url, l.raw_title,
+            SELECT l.id, l.platform, l.nickname, l.account_id, l.platform_handle,
+                   l.identity_status, l.identity_confidence, l.identity_provider,
+                   l.identity_checked_at, l.identity_note,
+                   l.profile_url, l.raw_title,
                    l.source, l.source_round_id, l.owner_user_id, l.status, l.legacy_user_id,
                    l.created_by, l.created_at, l.updated_at,
                    l.converted_platform, l.converted_user_id, l.converted_at,
@@ -3356,42 +5128,64 @@ class Database:
 
     def normalize_lead_identities(self) -> int:
         rows = self._conn.execute(
-            "SELECT id, platform, account_id, profile_url FROM leads"
+            "SELECT id, platform, account_id, platform_handle, profile_url FROM leads"
         ).fetchall()
-        updates: list[tuple[str, str, int]] = []
+        updates: list[tuple[str, str, str, int]] = []
         for row in rows:
+            platform = str(row["platform"] or "xhs")
             account, profile = normalize_identity(
-                row["platform"], row["account_id"], row["profile_url"]
+                platform, row["account_id"], row["profile_url"]
             )
-            if account != (row["account_id"] or "") or profile != (row["profile_url"] or ""):
-                updates.append((account, profile, int(row["id"])))
+            handle = normalize_account_id(platform, row["platform_handle"] or "")
+            if (
+                account != (row["account_id"] or "")
+                or handle != (row["platform_handle"] or "")
+                or profile != (row["profile_url"] or "")
+            ):
+                updates.append((account, handle, profile, int(row["id"])))
         if updates:
             with self._conn:
                 self._conn.executemany(
-                    "UPDATE leads SET account_id = ?, profile_url = ? WHERE id = ?",
+                    "UPDATE leads SET account_id = ?, platform_handle = ?, profile_url = ? "
+                    "WHERE id = ?",
                     updates,
                 )
         return len(updates)
 
     def try_create_lead_unique_indexes(self) -> dict[str, bool]:
         result: dict[str, bool] = {}
+        columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(leads)").fetchall()
+        }
         statements = {
             "account": (
                 "CREATE UNIQUE INDEX uq_leads_identity_account "
                 "ON leads (platform, account_id) "
                 "WHERE account_id IS NOT NULL AND account_id <> '' "
-                "AND status NOT IN ('duplicate', 'discarded')"
+                "AND status NOT IN ('duplicate', 'discarded')",
+                "account_id",
+            ),
+            "handle": (
+                "CREATE UNIQUE INDEX uq_leads_identity_handle "
+                "ON leads (platform, platform_handle) "
+                "WHERE platform_handle IS NOT NULL AND platform_handle <> '' "
+                "AND status NOT IN ('duplicate', 'discarded')",
+                "platform_handle",
             ),
             "profile": (
                 "CREATE UNIQUE INDEX uq_leads_identity_profile "
                 "ON leads (platform, profile_url) "
                 "WHERE profile_url IS NOT NULL AND profile_url <> '' "
-                "AND status NOT IN ('duplicate', 'discarded')"
+                "AND status NOT IN ('duplicate', 'discarded')",
+                "profile_url",
             ),
         }
-        for key, sql in statements.items():
+        for key, (sql, column) in statements.items():
+            if column not in columns:
+                result[key] = False
+                continue
             name = f"uq_leads_identity_{key}"
-            column = "account_id" if key == "account" else "profile_url"
             existing = self._conn.execute(
                 "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
                 (name,),
@@ -3425,10 +5219,14 @@ class Database:
         account_id: str = "",
         profile_url: str = "",
         *,
+        platform_handle: str = "",
         exclude_id: int | None = None,
     ) -> dict[str, Any] | None:
         account, profile = normalize_identity(platform, account_id, profile_url)
-        if not account and not profile:
+        handle = normalize_account_id(
+            str(platform or "xhs").strip().lower(), platform_handle
+        )
+        if not account and not profile and not handle:
             return None
         conditions = ["platform = ?"]
         params: list[Any] = [str(platform or "xhs").strip().lower()]
@@ -3436,6 +5234,9 @@ class Database:
         if account:
             identity.append("account_id = ?")
             params.append(account)
+        if handle:
+            identity.append("platform_handle = ?")
+            params.append(handle)
         if profile:
             identity.append("profile_url = ?")
             params.append(profile)
@@ -3465,6 +5266,7 @@ class Database:
         platform: str,
         nickname: str = "",
         account_id: str = "",
+        platform_handle: str = "",
         profile_url: str = "",
         raw_title: str = "",
         source: str = DEFAULT_LEAD_SOURCE,
@@ -3481,6 +5283,7 @@ class Database:
             platform=platform,
             nickname=nickname,
             account_id=account_id,
+            platform_handle=platform_handle,
             profile_url=profile_url,
             raw_title=raw_title,
             source=source,
@@ -3501,6 +5304,7 @@ class Database:
         platform: str,
         nickname: str = "",
         account_id: str = "",
+        platform_handle: str = "",
         profile_url: str = "",
         raw_title: str = "",
         source: str = DEFAULT_LEAD_SOURCE,
@@ -3515,7 +5319,10 @@ class Database:
     ) -> tuple[int, bool, bool]:
         code = str(platform or "xhs").strip().lower()
         account, profile = normalize_identity(code, account_id, profile_url)
-        existing = self.find_lead_by_identity(code, account, profile)
+        handle = normalize_account_id(code, platform_handle)
+        existing = self.find_lead_by_identity(
+            code, account, profile, platform_handle=handle
+        )
         if existing:
             lead_id = int(existing["id"])
             if normalize_lead_status(existing.get("status")) in ("discarded", "duplicate"):
@@ -3535,19 +5342,23 @@ class Database:
                     with self._conn:
                         self._conn.execute(
                             """
-                            UPDATE leads SET nickname = ?, account_id = ?, profile_url = ?,
-                                raw_title = ?, source = ?, source_round_id = ?,
+                            UPDATE leads SET nickname = ?, account_id = ?, platform_handle = ?,
+                                profile_url = ?, raw_title = ?, source = ?, source_round_id = ?,
                                 owner_user_id = ?, status = 'unverified', legacy_user_id = ?,
                                 raw_json = ?, matched_platform = NULL, matched_user_id = NULL,
                                 matched_round_id = NULL, matched_at = NULL,
                                 match_confidence = NULL, conversion_lock = NULL,
                                 conversion_locked_at = NULL, converted_platform = NULL,
-                                converted_user_id = NULL, converted_at = NULL, updated_at = ?
+                                converted_user_id = NULL, converted_at = NULL,
+                                identity_status = 'unverified', identity_confidence = '',
+                                identity_provider = '', identity_checked_at = NULL,
+                                identity_note = '', updated_at = ?
                             WHERE id = ?
                             """,
                             (
                                 nickname or existing.get("nickname") or "",
                                 account or existing.get("account_id") or "",
+                                handle or existing.get("platform_handle") or "",
                                 profile or existing.get("profile_url") or "",
                                 raw_title or existing.get("raw_title") or "",
                                 normalize_lead_source(source),
@@ -3617,15 +5428,16 @@ class Database:
                 cur = self._conn.execute(
                     """
                     INSERT INTO leads
-                    (platform, nickname, account_id, profile_url, raw_title, source,
+                    (platform, nickname, account_id, platform_handle, profile_url, raw_title, source,
                      source_round_id, owner_user_id, status, legacy_user_id, raw_json,
-                     created_by, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     identity_status, created_by, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         code,
                         nickname or "",
                         account,
+                        handle,
                         profile,
                         raw_title or "",
                         normalize_lead_source(source),
@@ -3634,6 +5446,7 @@ class Database:
                         normalize_lead_status(status),
                         legacy_user_id or "",
                         raw_text,
+                        "verified" if normalize_lead_status(status) == "converted" else "unverified",
                         created_by,
                         now,
                         now,
@@ -3659,7 +5472,9 @@ class Database:
                         ),
                     )
         except sqlite3.IntegrityError:
-            existing = self.find_lead_by_identity(code, account, profile)
+            existing = self.find_lead_by_identity(
+                code, account, profile, platform_handle=handle
+            )
             if existing:
                 return int(existing["id"]), False, False
             raise
@@ -3670,6 +5485,7 @@ class Database:
             "platform",
             "nickname",
             "account_id",
+            "platform_handle",
             "profile_url",
             "raw_title",
             "source",
@@ -3691,20 +5507,41 @@ class Database:
                 raise ValueError("请使用线索转换接口")
         if "source" in updates:
             updates["source"] = normalize_lead_source(updates["source"])
-        if {"platform", "account_id", "profile_url"} & set(updates):
+        identity_changed = False
+        if {"platform", "account_id", "platform_handle", "profile_url"} & set(updates):
             platform = str(updates.get("platform", current.get("platform") or "xhs")).strip().lower()
             account, profile = normalize_identity(
                 platform,
                 updates.get("account_id", current.get("account_id") or ""),
                 updates.get("profile_url", current.get("profile_url") or ""),
             )
+            handle = normalize_account_id(
+                platform,
+                updates.get("platform_handle", current.get("platform_handle") or ""),
+            )
             updates["account_id"] = account
             updates["profile_url"] = profile
+            updates["platform_handle"] = handle
+            identity_changed = (
+                account != (current.get("account_id") or "")
+                or handle != (current.get("platform_handle") or "")
+                or profile != (current.get("profile_url") or "")
+            )
             duplicate = self.find_lead_by_identity(
-                platform, account, profile, exclude_id=lead_id
+                platform,
+                account,
+                profile,
+                platform_handle=handle,
+                exclude_id=lead_id,
             )
             if duplicate:
                 raise ValueError(f"该账号已存在线索 #{duplicate['id']}，请直接编辑原线索")
+        if identity_changed:
+            updates["identity_status"] = "unverified"
+            updates["identity_confidence"] = ""
+            updates["identity_provider"] = ""
+            updates["identity_checked_at"] = None
+            updates["identity_note"] = ""
         if (
             "status" in updates
             and updates["status"] in ("unverified", "verifying")
@@ -3714,6 +5551,7 @@ class Database:
                 str(current.get("platform") or "xhs"),
                 current.get("account_id") or "",
                 current.get("profile_url") or "",
+                platform_handle=current.get("platform_handle") or "",
                 exclude_id=lead_id,
             )
             if duplicate:
@@ -3795,6 +5633,164 @@ class Database:
                 ),
             )
 
+    def add_lead_identity_event(
+        self,
+        lead_id: int,
+        event_type: str,
+        status: str,
+        *,
+        old_user_id: str = "",
+        new_user_id: str = "",
+        old_handle: str = "",
+        new_handle: str = "",
+        provider: str = "",
+        confidence: str = "",
+        note: str = "",
+        actor_id: int | None = None,
+        commit: bool = True,
+    ) -> None:
+        with self._write(commit):
+            self._conn.execute(
+                """
+                INSERT INTO lead_identity_events
+                (lead_id, event_type, old_user_id, new_user_id, old_handle,
+                 new_handle, provider, confidence, status, note, actor_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    lead_id,
+                    event_type,
+                    old_user_id or "",
+                    new_user_id or "",
+                    old_handle or "",
+                    new_handle or "",
+                    provider or "",
+                    confidence or "",
+                    status,
+                    note or "",
+                    actor_id,
+                    utc_now(),
+                ),
+            )
+
+    def lead_identity_events(
+        self, lead_id: int, limit: int = 30
+    ) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM lead_identity_events WHERE lead_id = ? "
+            "ORDER BY id DESC LIMIT ?",
+            (lead_id, max(1, int(limit))),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def apply_lead_verification(
+        self,
+        lead_id: int,
+        *,
+        user_id: str,
+        handle: str,
+        identity_status: str,
+        confidence: str,
+        provider: str,
+        note: str = "",
+        profile_url: str = "",
+        event_type: str = "",
+        actor_id: int | None = None,
+        commit: bool = True,
+    ) -> bool:
+        if identity_status not in LEAD_IDENTITY_STATUSES:
+            raise ValueError("无效的身份校验状态")
+        now = utc_now()
+        with self._write(commit):
+            row = self._conn.execute(
+                "SELECT platform, account_id, platform_handle, profile_url, status "
+                "FROM leads WHERE id = ?",
+                (lead_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError("线索不存在")
+            if row["status"] == "converted":
+                raise ValueError("已转达人的线索不可修改")
+            platform = str(row["platform"] or "xhs")
+            account = normalize_account_id(platform, user_id or "") or ""
+            normalized_handle = normalize_account_id(platform, handle or "") or ""
+            _, normalized_profile = normalize_identity(
+                platform, "", profile_url or ""
+            )
+            old_user = str(row["account_id"] or "")
+            old_handle = str(row["platform_handle"] or "")
+            old_profile = str(row["profile_url"] or "")
+            conflict_conditions: list[str] = []
+            conflict_params: list[Any] = [platform]
+            if account and account != old_user:
+                conflict_conditions.append("account_id = ?")
+                conflict_params.append(account)
+            if normalized_handle and normalized_handle != old_handle:
+                conflict_conditions.append("platform_handle = ?")
+                conflict_params.append(normalized_handle)
+            if normalized_profile and normalized_profile != old_profile:
+                conflict_conditions.append("profile_url = ?")
+                conflict_params.append(normalized_profile)
+            if conflict_conditions:
+                conflict = self._conn.execute(
+                    f"""
+                    SELECT id FROM leads
+                    WHERE platform = ? AND ({' OR '.join(conflict_conditions)})
+                      AND id <> ? AND status NOT IN ('duplicate', 'discarded')
+                    LIMIT 1
+                    """,
+                    [*conflict_params, lead_id],
+                ).fetchone()
+                if conflict:
+                    raise ValueError(
+                        f"该账号已存在线索 #{conflict['id']}，无法写入校验结果"
+                    )
+            self._conn.execute(
+                """
+                UPDATE leads
+                SET account_id = ?, platform_handle = ?, identity_status = ?,
+                    identity_confidence = ?, identity_provider = ?, identity_checked_at = ?,
+                    identity_note = ?, profile_url = COALESCE(NULLIF(?, ''), profile_url),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    account,
+                    normalized_handle,
+                    identity_status,
+                    confidence or "",
+                    provider or "",
+                    now,
+                    note or "",
+                    normalized_profile,
+                    now,
+                    lead_id,
+                ),
+            )
+            self._conn.execute(
+                """
+                INSERT INTO lead_identity_events
+                (lead_id, event_type, old_user_id, new_user_id, old_handle,
+                 new_handle, provider, confidence, status, note, actor_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    lead_id,
+                    event_type or f"verify_{identity_status}",
+                    old_user,
+                    account,
+                    old_handle,
+                    normalized_handle,
+                    provider or "",
+                    confidence or "",
+                    identity_status,
+                    note or "",
+                    actor_id,
+                    now,
+                ),
+            )
+        return True
+
     def apply_lead_matches(
         self, matches: list[dict[str, Any]], *, actor_id: int | None = None
     ) -> dict[str, int]:
@@ -3830,11 +5826,24 @@ class Database:
                 creator_nickname = str(match.get("nickname") or "").strip()
                 creator_profile = str(match.get("profile_url") or "").strip()
                 creator_raw = match.get("raw_json")
-                account, profile = normalize_identity(
+                _, resolved_handle = split_platform_identity(
                     platform,
                     match_account,
                     creator_profile,
                 )
+                creator_handle = normalize_account_id(
+                    platform, str(match.get("handle") or "")
+                )
+                if str(user_id).startswith("import:"):
+                    account_id = resolved_handle or match_account
+                    handle = resolved_handle or creator_handle or match_account
+                else:
+                    account_id = user_id
+                    handle = (
+                        resolved_handle
+                        or creator_handle
+                        or (row["platform_handle"] or "")
+                    )
                 nickname = row["nickname"] or ""
                 raw_json = row["raw_json"] or ""
                 if overwrite and creator_nickname:
@@ -3843,20 +5852,24 @@ class Database:
                     raw_json = creator_raw
                 changed = nickname != (row["nickname"] or "") or raw_json != (row["raw_json"] or "")
                 current_profile = row["profile_url"] or ""
-                if overwrite and profile:
-                    profile_url = profile
+                if overwrite and creator_profile:
+                    profile_url = creator_profile
                 elif not current_profile:
-                    profile_url = profile
+                    profile_url = creator_profile
                 else:
                     profile_url = current_profile
-                account_id = (
-                    match_account
-                    if overwrite
-                    else (row["account_id"] or account or match_account)
-                )
                 if account_id != (row["account_id"] or ""):
                     changed = True
+                if handle != (row["platform_handle"] or ""):
+                    changed = True
                 if profile_url != current_profile:
+                    changed = True
+                previous_identity = str(row["identity_status"] or "unverified")
+                identity_confidence = str(match.get("confidence") or "matched")
+                if (
+                    previous_identity != "verified"
+                    or (row["identity_confidence"] or "") != identity_confidence
+                ):
                     changed = True
                 matched_round_id = match.get("round_id")
                 if (
@@ -3871,6 +5884,9 @@ class Database:
                 if account_id and account_id != (row["account_id"] or ""):
                     conflict_conditions.append("account_id = ?")
                     conflict_params.append(account_id)
+                if handle and handle != (row["platform_handle"] or ""):
+                    conflict_conditions.append("platform_handle = ?")
+                    conflict_params.append(handle)
                 if profile_url and profile_url != (row["profile_url"] or ""):
                     conflict_conditions.append("profile_url = ?")
                     conflict_params.append(profile_url)
@@ -3879,7 +5895,7 @@ class Database:
                         f"""
                         SELECT id FROM leads
                         WHERE platform = ? AND ({' OR '.join(conflict_conditions)})
-                          AND id <> ?
+                          AND id <> ? AND status NOT IN ('duplicate', 'discarded')
                         LIMIT 1
                         """,
                         [*conflict_params, lead_id],
@@ -3889,15 +5905,18 @@ class Database:
                         continue
                 cur = self._conn.execute(
                     """
-                    UPDATE leads SET nickname = ?, account_id = ?, profile_url = ?,
-                        raw_json = ?, matched_platform = ?, matched_user_id = ?,
+                    UPDATE leads SET nickname = ?, account_id = ?, platform_handle = ?,
+                        profile_url = ?, raw_json = ?, matched_platform = ?, matched_user_id = ?,
                         matched_round_id = ?, matched_at = ?, match_confidence = ?,
-                        updated_at = ?
+                        identity_status = 'verified', identity_confidence = ?,
+                        identity_provider = 'match', identity_checked_at = ?,
+                        identity_note = '本地达人匹配', updated_at = ?
                     WHERE id = ? AND status IN ('unverified', 'verifying')
                     """,
                     (
                         nickname,
                         account_id,
+                        handle,
                         profile_url,
                         raw_json,
                         platform,
@@ -3905,6 +5924,8 @@ class Database:
                         matched_round_id,
                         now,
                         match.get("confidence") or "",
+                        identity_confidence,
+                        now,
                         now if changed else (row["updated_at"] or now),
                         lead_id,
                     ),
@@ -4101,10 +6122,12 @@ class Database:
                 parents[max(root_a, root_b)] = min(root_a, root_b)
 
         account_seen: dict[tuple[str, str], int] = {}
+        handle_seen: dict[tuple[str, str], int] = {}
         profile_seen: dict[tuple[str, str], int] = {}
         for index, row in enumerate(rows):
             platform = str(row.get("platform") or "xhs")
             account = str(row.get("account_id") or "")
+            handle = str(row.get("platform_handle") or "")
             profile = str(row.get("profile_url") or "")
             if account:
                 key = (platform, account)
@@ -4112,6 +6135,12 @@ class Database:
                     union(index, account_seen[key])
                 else:
                     account_seen[key] = index
+            if handle:
+                key = (platform, handle)
+                if key in handle_seen:
+                    union(index, handle_seen[key])
+                else:
+                    handle_seen[key] = index
             if profile:
                 key = (platform, profile)
                 if key in profile_seen:
@@ -4149,7 +6178,13 @@ class Database:
                 report["duplicates"] += len(duplicates)
                 conflicts = [
                     field
-                    for field in ("nickname", "account_id", "profile_url", "owner_user_id")
+                    for field in (
+                        "nickname",
+                        "account_id",
+                        "platform_handle",
+                        "profile_url",
+                        "owner_user_id",
+                    )
                     if primary.get(field)
                     and any(
                         item.get(field)
@@ -4349,15 +6384,17 @@ class Database:
 
         return {
             "account_index": "uq_leads_identity_account" in indexes,
+            "handle_index": "uq_leads_identity_handle" in indexes,
             "profile_index": "uq_leads_identity_profile" in indexes,
             "duplicate_account_groups": duplicate_groups("account_id"),
+            "duplicate_handle_groups": duplicate_groups("platform_handle"),
             "duplicate_profile_groups": duplicate_groups("profile_url"),
         }
 
     def lead_owner_options(self) -> list[dict[str, Any]]:
         rows = self._conn.execute(
-            "SELECT id, username, role, can_collect FROM users "
-            "WHERE disabled = 0 AND (role = 'admin' OR can_collect = 1) "
+            "SELECT id, username, role, can_collect, can_edit_leads FROM users "
+            "WHERE disabled = 0 AND (role = 'admin' OR can_edit_leads = 1) "
             "ORDER BY username COLLATE NOCASE"
         ).fetchall()
         return [dict(row) for row in rows]
@@ -4386,6 +6423,13 @@ class Database:
         if not self.get_round(round_id):
             raise ValueError(f"轮次不存在: {round_id}")
         now = utc_now()
+        normalized_status = normalize_status(status)
+        previous = self._conn.execute(
+            "SELECT status FROM creator_rounds "
+            "WHERE round_id = ? AND platform = ? AND user_id = ?",
+            (round_id, platform, user_id),
+        ).fetchone()
+        previous_status = previous["status"] if previous else None
         with self._write(commit):
             cur = self._conn.execute(
                 """
@@ -4421,7 +6465,7 @@ class Database:
                     int(sample_comments or 0),
                     int(sample_interactions or 0),
                     top_note_id or "",
-                    normalize_status(status),
+                    normalized_status,
                     data_round or "",
                     account_id or user_id,
                     raw_title or "",
@@ -4444,7 +6488,14 @@ class Database:
                     "WHERE platform = ? AND user_id = ?",
                     (owner_user_id, now, platform, user_id),
                 )
-        self._sync_cooperation_status(platform, user_id)
+            if normalized_status == "adopted" and previous_status != "adopted":
+                stored = self._conn.execute(
+                    "SELECT status FROM creator_rounds "
+                    "WHERE round_id = ? AND platform = ? AND user_id = ?",
+                    (round_id, platform, user_id),
+                ).fetchone()
+                if stored and stored["status"] == "adopted":
+                    self._ensure_cooperation_enrolled_locked(platform, user_id)
         if commit and self._has_fts:
             self.rebuild_search_index(round_id)
         return inserted
@@ -4479,7 +6530,13 @@ class Database:
             )
 
     def mark_lead_converted(
-        self, lead_id: int, platform: str, user_id: str, *, commit: bool = True
+        self,
+        lead_id: int,
+        platform: str,
+        user_id: str,
+        *,
+        conversion_token: str | None = None,
+        commit: bool = True,
     ) -> None:
         now = utc_now()
         with self._write(commit):
@@ -4491,8 +6548,9 @@ class Database:
                     matched_platform = NULL, matched_user_id = NULL,
                     matched_round_id = NULL, matched_at = NULL, match_confidence = NULL
                 WHERE id = ? AND status IN ('unverified', 'verifying')
+                  AND (? IS NULL OR conversion_lock = ?)
                 """,
-                (platform, user_id, now, now, lead_id),
+                (platform, user_id, now, now, lead_id, conversion_token, conversion_token),
             )
             if cur.rowcount == 0:
                 raise ValueError("线索状态已变化，无法完成转换")
@@ -4565,8 +6623,8 @@ class Database:
             SELECT
                 COUNT(*) AS creators,
                 SUM(CASE WHEN {ENRICHMENT_SQL} = 'complete' THEN 1 ELSE 0 END) AS enriched,
-                SUM(CASE WHEN COALESCE(c.cooperation_status, 'pending') = 'pending' THEN 1 ELSE 0 END) AS pending,
-                SUM(CASE WHEN c.cooperation_status = 'adopted' THEN 1 ELSE 0 END) AS adopted
+                SUM(CASE WHEN cr.status = 'pending' THEN 1 ELSE 0 END) AS pending,
+                SUM(CASE WHEN cr.status = 'adopted' THEN 1 ELSE 0 END) AS adopted
             FROM latest cr
             LEFT JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id
             WHERE cr.rn = 1
@@ -4574,10 +6632,12 @@ class Database:
         ).fetchone()
         return {key: int(row[key] or 0) for key in ("creators", "enriched", "pending", "adopted")}
 
-    def dashboard_breakdown(self, round_id: int | None = None) -> dict[str, Any]:
+    def dashboard_breakdown(
+        self, round_id: int | None = None, stale_days: int = 7
+    ) -> dict[str, Any]:
         if round_id is None:
-            query = f"""
-            WITH latest AS (
+            from_sql = """
+            FROM (
                 SELECT cr.*,
                        ROW_NUMBER() OVER (
                            PARTITION BY cr.platform, cr.user_id
@@ -4586,30 +6646,32 @@ class Database:
                 FROM creator_rounds cr
                 JOIN rounds active_round ON active_round.id = cr.round_id
                 WHERE active_round.archived_at IS NULL
-            )
-            SELECT COALESCE(c.cooperation_status, 'pending') AS status,
-                   {TIER_SQL} AS label,
-                   COUNT(*) AS n,
-                   SUM(CASE WHEN {ENRICHMENT_SQL} = 'complete' THEN 1 ELSE 0 END) AS enriched
-            FROM latest cr
+            ) cr
             LEFT JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id
-            WHERE cr.rn = 1
-            GROUP BY status, label
             """
+            where = "cr.rn = 1"
             params: tuple[Any, ...] = ()
+            status_sql = "cr.status"
         else:
-            query = f"""
-            SELECT cr.status AS status,
-                   {TIER_SQL} AS label,
-                   COUNT(*) AS n,
-                   SUM(CASE WHEN {ENRICHMENT_SQL} = 'complete' THEN 1 ELSE 0 END) AS enriched
+            from_sql = """
             FROM creator_rounds cr
             LEFT JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id
-            WHERE cr.round_id = ?
-            GROUP BY status, label
             """
+            where = "cr.round_id = ?"
             params = (round_id,)
-        rows = self._conn.execute(query, params).fetchall()
+            status_sql = "cr.status"
+        rows = self._conn.execute(
+            f"""
+            SELECT {status_sql} AS status_value,
+                   {TIER_SQL} AS label_value,
+                   COUNT(*) AS n,
+                   SUM(CASE WHEN {ENRICHMENT_SQL} = 'complete' THEN 1 ELSE 0 END) AS enriched
+            {from_sql}
+            WHERE {where}
+            GROUP BY status_value, label_value
+            """,
+            params,
+        ).fetchall()
         metrics = {"creators": 0, "enriched": 0, "pending": 0, "adopted": 0}
         status_counts: dict[str, int] = {}
         tier_counts = {label: 0 for label in TIER_LABELS}
@@ -4618,18 +6680,96 @@ class Database:
             count = int(row["n"] or 0)
             metrics["creators"] += count
             metrics["enriched"] += int(row["enriched"] or 0)
-            status = str(row["status"] or "")
+            status = str(row["status_value"] or "")
             status_counts[status] = status_counts.get(status, 0) + count
             if status == "pending":
                 metrics["pending"] += count
             elif status == "adopted":
                 metrics["adopted"] += count
-            label = str(row["label"] or "未补全")
+            label = str(row["label_value"] or "未补全")
             tier_counts[label] = tier_counts.get(label, 0) + count
+
+        cooperation_rows = self._conn.execute(
+            f"""
+            SELECT c.cooperation_status AS cooperation_status_value,
+                   COUNT(*) AS n
+            {from_sql}
+            WHERE {where}
+            GROUP BY c.cooperation_status
+            """,
+            params,
+        ).fetchall()
+        cooperation_counts = {
+            str(row["cooperation_status_value"] or "none"): int(row["n"] or 0)
+            for row in cooperation_rows
+        }
+        days = max(1, min(365, int(stale_days)))
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=days)
+        ).isoformat(timespec="milliseconds")
+        placeholders = ",".join("?" * len(COOPERATION_OPEN_CODES))
+        stale_row = self._conn.execute(
+            f"""
+            SELECT COUNT(*) AS n
+            {from_sql}
+            WHERE {where}
+              AND c.cooperation_status IN ({placeholders})
+              AND c.cooperation_updated_at IS NOT NULL
+              AND c.cooperation_updated_at < ?
+            """,
+            [*params, *COOPERATION_OPEN_CODES, cutoff],
+        ).fetchone()
+        case_stats = self._conn.execute(
+            f"""
+            WITH scoped AS (
+                SELECT DISTINCT cr.platform, cr.user_id
+                {from_sql}
+                WHERE {where}
+            )
+            SELECT COUNT(cc.id) AS total_cases,
+                   COALESCE(SUM(CASE WHEN cc.status = 'completed' THEN 1 ELSE 0 END), 0)
+                       AS completed_cases,
+                   (
+                       SELECT COUNT(*) FROM (
+                           SELECT s.platform, s.user_id, COUNT(*) AS n
+                           FROM cooperation_cases cc2
+                           JOIN scoped s
+                             ON s.platform = cc2.platform AND s.user_id = cc2.user_id
+                           GROUP BY s.platform, s.user_id
+                           HAVING n > 1
+                       )
+                   ) AS repeat_creators
+            FROM cooperation_cases cc
+            JOIN scoped s ON s.platform = cc.platform AND s.user_id = cc.user_id
+            """,
+            params,
+        ).fetchone()
+        cooperation_metrics = {
+            "enrolled": sum(
+                count
+                for status, count in cooperation_counts.items()
+                if status != "none"
+            ),
+            "open": sum(
+                cooperation_counts.get(code, 0)
+                for code in COOPERATION_OPEN_CODES
+            ),
+            "stale": int(stale_row["n"] or 0),
+            "cooperating": cooperation_counts.get("cooperating", 0),
+            "completed": cooperation_counts.get("completed", 0),
+            "declined": cooperation_counts.get("declined", 0),
+            "cancelled": cooperation_counts.get("cancelled", 0),
+            "total_cases": int(case_stats["total_cases"] or 0) if case_stats else 0,
+            "completed_cases": int(case_stats["completed_cases"] or 0) if case_stats else 0,
+            "repeat_creators": int(case_stats["repeat_creators"] or 0) if case_stats else 0,
+        }
         return {
             "metrics": metrics,
             "status_counts": status_counts,
             "tier_counts": tier_counts,
+            "cooperation_counts": cooperation_counts,
+            "cooperation_metrics": cooperation_metrics,
+            "cooperation_stale_days": days,
         }
 
     def action_queue(
@@ -4730,26 +6870,50 @@ class Database:
             },
         }
 
-    def activity_calendar(self, days: int = 365, tz_offset: int = 480) -> dict[str, Any]:
+    def activity_calendar(
+        self,
+        days: int = 365,
+        tz_offset: int = 480,
+        round_id: int | None = None,
+    ) -> dict[str, Any]:
         days = max(30, min(730, int(days)))
         tz_offset = max(-720, min(840, int(tz_offset)))
         end = (datetime.now(timezone.utc) + timedelta(minutes=tz_offset)).date()
         start = end - timedelta(days=days - 1)
         modifier = f"{tz_offset:+d} minutes"
         cutoff = f"-{days + 5} days"
+        collected_join = (
+            "JOIN creator_rounds cr ON cr.platform = creators.platform "
+            "AND cr.user_id = creators.user_id"
+            if round_id is not None
+            else ""
+        )
+        collected_round = "AND cr.round_id = ?" if round_id is not None else ""
+        collected_params: list[Any] = [modifier, cutoff]
+        if round_id is not None:
+            collected_params.append(int(round_id))
         collected_rows = self._conn.execute(
-            """
-            SELECT date(datetime(substr(created_at, 1, 19), ?)) AS day,
+            f"""
+            SELECT date(datetime(substr(creators.created_at, 1, 19), ?)) AS day,
                    COUNT(*) AS n
-            FROM creators
-            WHERE created_at IS NOT NULL AND created_at <> ''
-              AND substr(created_at, 1, 19) >= datetime('now', ?)
+            FROM creators {collected_join}
+            WHERE creators.created_at IS NOT NULL AND creators.created_at <> ''
+              AND substr(creators.created_at, 1, 19) >= datetime('now', ?)
+              {collected_round}
             GROUP BY day
             """,
-            (modifier, cutoff),
+            collected_params,
         ).fetchall()
+        processed_round = ""
+        processed_params: list[Any] = [modifier, cutoff]
+        if round_id is not None:
+            processed_round = (
+                "AND ((action = 'creator.review_updated' AND target LIKE ?) "
+                "OR (action = 'creator.review_bulk_updated' AND target = ?))"
+            )
+            processed_params.extend([f"{int(round_id)}:%", str(int(round_id))])
         processed_rows = self._conn.execute(
-            """
+            f"""
             SELECT date(datetime(substr(ts, 1, 19), ?)) AS day,
                    SUM(CASE
                        WHEN action = 'creator.review_updated' THEN 1
@@ -4760,9 +6924,17 @@ class Database:
             FROM audit_log
             WHERE action IN ('creator.review_updated', 'creator.review_bulk_updated')
               AND substr(ts, 1, 19) >= datetime('now', ?)
+              AND datetime(ts) > COALESCE(
+                  (
+                      SELECT datetime(MAX(ts)) FROM audit_log
+                      WHERE action = 'data.review_reset'
+                  ),
+                  '0001-01-01'
+              )
+              {processed_round}
             GROUP BY day
             """,
-            (modifier, cutoff),
+            processed_params,
         ).fetchall()
         collected = {
             str(row["day"]): int(row["n"] or 0)
@@ -5164,6 +7336,7 @@ class Database:
         auth_source: str = "password",
         external_id: str | None = None,
         can_collect: bool = False,
+        can_edit_leads: bool = False,
         must_change_password: bool = False,
     ) -> int:
         now = utc_now()
@@ -5173,8 +7346,8 @@ class Database:
                     """
                     INSERT INTO users
                     (username, password_hash, auth_source, external_id, role, disabled,
-                     can_collect, must_change_password, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                     can_collect, can_edit_leads, must_change_password, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
                     """,
                     (
                         username,
@@ -5183,6 +7356,7 @@ class Database:
                         external_id,
                         role,
                         1 if can_collect else 0,
+                        1 if can_edit_leads else 0,
                         1 if must_change_password else 0,
                         now,
                         now,
@@ -5206,8 +7380,8 @@ class Database:
     def list_users(self) -> list[dict[str, Any]]:
         rows = self._conn.execute(
             """
-            SELECT id, username, role, disabled, can_collect, must_change_password,
-                   auth_source, created_at, updated_at, last_login_at
+            SELECT id, username, role, disabled, can_collect, can_edit_leads,
+                   must_change_password, auth_source, created_at, updated_at, last_login_at
             FROM users ORDER BY id ASC
             """
         ).fetchall()
@@ -5229,6 +7403,7 @@ class Database:
         disabled: bool | None = None,
         password_hash: str | None = None,
         can_collect: bool | None = None,
+        can_edit_leads: bool | None = None,
         must_change_password: bool | None = None,
     ) -> None:
         updates: dict[str, Any] = {"updated_at": utc_now()}
@@ -5240,6 +7415,8 @@ class Database:
             updates["password_hash"] = password_hash
         if can_collect is not None:
             updates["can_collect"] = 1 if can_collect else 0
+        if can_edit_leads is not None:
+            updates["can_edit_leads"] = 1 if can_edit_leads else 0
         if must_change_password is not None:
             updates["must_change_password"] = 1 if must_change_password else 0
         sets = ", ".join(f"{key} = ?" for key in updates)
@@ -5252,6 +7429,7 @@ class Database:
         role: str | None = None,
         disabled: bool | None = None,
         can_collect: bool | None = None,
+        can_edit_leads: bool | None = None,
     ) -> None:
         try:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -5276,6 +7454,8 @@ class Database:
                 updates["disabled"] = 1 if disabled else 0
             if can_collect is not None:
                 updates["can_collect"] = 1 if can_collect else 0
+            if can_edit_leads is not None:
+                updates["can_edit_leads"] = 1 if can_edit_leads else 0
             sets = ", ".join(f"{key} = ?" for key in updates)
             self._conn.execute(
                 f"UPDATE users SET {sets} WHERE id = ?",
@@ -5319,6 +7499,41 @@ class Database:
             "sessions_overflow": max(0, overflow),
             "audit_log": max(0, audits),
         }
+
+    def prune_raw_and_calls(
+        self, raw_retention_days: int = 365, api_call_retention_days: int = 365
+    ) -> dict[str, int]:
+        calls = 0
+        if api_call_retention_days > 0:
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(days=api_call_retention_days)
+            ).isoformat(timespec="milliseconds")
+            with self._conn:
+                calls = max(
+                    0,
+                    self._conn.execute(
+                        "DELETE FROM api_calls WHERE ts < ?", (cutoff,)
+                    ).rowcount,
+                )
+        raw = 0
+        if raw_retention_days > 0:
+            referenced = {
+                str(Path(row["raw_file"]).resolve())
+                for row in self._conn.execute(
+                    "SELECT DISTINCT raw_file FROM api_calls "
+                    "WHERE raw_file IS NOT NULL AND raw_file != ''"
+                ).fetchall()
+            }
+            cutoff = datetime.now().timestamp() - raw_retention_days * 86400
+            for path in self.raw_dir.glob("*.json"):
+                try:
+                    if str(path.resolve()) in referenced or path.stat().st_mtime >= cutoff:
+                        continue
+                    path.unlink()
+                    raw += 1
+                except OSError:
+                    continue
+        return {"api_calls": calls, "raw_files": raw}
 
     def update_last_login(self, user_id: int) -> None:
         with self._conn:
@@ -5382,7 +7597,7 @@ class Database:
                     (utc_now(), token_hash),
                 )
         user = self._conn.execute(
-            "SELECT id, username, role, disabled, can_collect, must_change_password, "
+            "SELECT id, username, role, disabled, can_collect, can_edit_leads, must_change_password, "
             "auth_source, created_at, updated_at, last_login_at "
             "FROM users WHERE id = ? AND disabled = 0",
             (row["user_id"],),

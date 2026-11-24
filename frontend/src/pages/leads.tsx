@@ -1,14 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronLeft, ChevronRight, Download, Link2, LoaderCircle, Plus, RotateCcw, RotateCw, Search } from "lucide-react";
+import { ChevronLeft, ChevronRight, Download, Link2, LoaderCircle, Plus, RotateCcw, RotateCw, Search, UserPlus } from "lucide-react";
 import { useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, downloadFile } from "@/shared/api";
+import { api, ApiError, downloadFile } from "@/shared/api";
 import { canonicalSearch } from "@/shared/query-string";
 import { fmtDateTime, fmtNumber } from "@/shared/format";
 import { useAuth } from "@/shared/auth-context";
 import { useRound } from "@/shared/round-context";
-import type { LeadOwner, LeadQuery } from "@/shared/types";
+import type { Lead, LeadOwner, LeadQuery } from "@/shared/types";
 import { EmptyState, ErrorState, Page, PageHeader, Section } from "@/components/page";
 import { LeadStatusBadge } from "@/components/lead-status-badge";
 import { MultiSelect } from "@/components/multi-select";
@@ -52,6 +52,19 @@ import {
   TableRow,
 } from "@/components/ui/table";
 
+const IDENTITY_CONFIDENCE_LABELS: Record<string, string> = {
+  account_id: "用户 ID 一致",
+  platform_handle: "平台账号一致",
+  profile_url: "主页一致",
+  nickname: "仅昵称一致",
+  manual_mismatch: "人工确认",
+  matched: "本地匹配",
+  local: "本地达人",
+  none: "无匹配",
+  round_account_id: "轮次账号",
+  auto: "自动匹配",
+};
+
 function useDebounced<T>(value: T, delay = 300) {
   const [next, setNext] = useState(value);
   useEffect(() => {
@@ -65,12 +78,15 @@ const DEFAULT_STATUS_FILTER = ["unverified", "verifying"];
 
 export function LeadsPage() {
   const { user } = useAuth();
+  const canCollect = user?.role === "admin" || Boolean(user?.can_collect);
+  const canEditLeads = user?.role === "admin" || Boolean(user?.can_edit_leads);
   const { meta, rounds } = useRound();
   const queryClient = useQueryClient();
   const [params, setParams] = useSearchParams();
   const [search, setSearch] = useState(params.get("search") ?? "");
   const debouncedSearch = useDebounced(search);
   const [roundFilter, setRoundFilter] = useState<number | null>(() => {
+    if (!canCollect) return null;
     const value = Number(params.get("round"));
     return Number.isFinite(value) && value > 0 ? value : null;
   });
@@ -99,7 +115,6 @@ export function LeadsPage() {
   });
   const [createOpen, setCreateOpen] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
-  const canCollect = user?.role === "admin" || Boolean(user?.can_collect);
   const leadStatuses = meta?.lead_statuses ?? [];
   const leadSources = meta?.lead_sources ?? [];
   const platforms = meta?.platforms ?? [];
@@ -111,7 +126,7 @@ export function LeadsPage() {
     if (serialized === lastUrlRef.current) return;
     lastUrlRef.current = serialized;
     syncingFromUrlRef.current = true;
-    const nextRound = Number(params.get("round"));
+    const nextRound = canCollect ? Number(params.get("round")) : NaN;
     setRoundFilter(Number.isFinite(nextRound) && nextRound > 0 ? nextRound : null);
     setPlatform(params.get("platform") ?? "");
     const status = params.get("status");
@@ -125,7 +140,11 @@ export function LeadsPage() {
     setSearch(params.get("search") ?? "");
     const nextLead = Number(params.get("lead"));
     setSelectedLeadId(Number.isFinite(nextLead) && nextLead > 0 ? nextLead : null);
-  }, [params]);
+  }, [params, canCollect]);
+
+  useEffect(() => {
+    if (!canCollect) setRoundFilter(null);
+  }, [canCollect]);
 
   const currentParams = new URLSearchParams();
   if (roundFilter !== null) currentParams.set("round", String(roundFilter));
@@ -199,6 +218,13 @@ export function LeadsPage() {
   const owners: LeadOwner[] = ownersQuery.data ?? [];
   const assignableOwners = user?.role === "admin" ? owners : owners.filter((item) => item.id === user?.id);
   const total = leadsQuery.data?.total ?? 0;
+  const hasQuickConvertAction =
+    canCollect &&
+    (leadsQuery.data?.items ?? []).some(
+      (lead) =>
+        lead.status !== "converted" &&
+        Boolean(lead.account_id.trim() || lead.profile_url.trim()),
+    );
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   useEffect(() => {
     if (leadsQuery.data && page > totalPages) setPage(totalPages);
@@ -206,8 +232,12 @@ export function LeadsPage() {
   const empty = !leadsQuery.isLoading && !leadsQuery.error && (leadsQuery.data?.items ?? []).length === 0;
   const health = healthQuery.data;
   const duplicateGroups =
-    (health?.duplicate_account_groups ?? 0) + (health?.duplicate_profile_groups ?? 0);
-  const indexMissing = health ? !health.account_index || !health.profile_index : false;
+    (health?.duplicate_account_groups ?? 0) +
+    (health?.duplicate_handle_groups ?? 0) +
+    (health?.duplicate_profile_groups ?? 0);
+  const indexMissing = health
+    ? !health.account_index || !health.handle_index || !health.profile_index
+    : false;
   const showIdentityWarning = Boolean(health && (duplicateGroups > 0 || indexMissing));
 
   const refresh = async () => {
@@ -224,6 +254,67 @@ export function LeadsPage() {
     ]) {
       await queryClient.invalidateQueries({ queryKey: key });
     }
+  };
+
+  const quickConvertMutation = useMutation({
+    mutationFn: (lead: Lead) =>
+      api.convertLead(lead.id, {
+        account_id: lead.account_id || "",
+        platform_handle: lead.platform_handle || "",
+        profile_url: lead.profile_url || "",
+        fetch: true,
+      }),
+    onSuccess: async (_result, lead) => {
+      toast.success(`已将「${lead.nickname || `线索 #${lead.id}`}」转为达人并补全资料`);
+      await refresh();
+    },
+    onError: (error, lead) => {
+      if (error instanceof ApiError && error.status === 409) {
+        setSelectedLeadId(lead.id);
+        toast.warning("账号校验不一致，请在线索详情中确认后再转换");
+        return;
+      }
+      toast.error(error instanceof Error ? error.message : "转为达人失败");
+    },
+  });
+  const convertingLeadId = quickConvertMutation.isPending
+    ? quickConvertMutation.variables?.id
+    : null;
+
+  const quickConvertState = (lead: Lead) => {
+    const visible = Boolean(
+      canCollect &&
+        (lead.account_id.trim() ||
+          lead.platform_handle.trim() ||
+          lead.profile_url.trim()) &&
+        lead.status !== "converted",
+    );
+    if (!visible) return { visible, disabled: true, reason: "" };
+    if (lead.status !== "unverified" && lead.status !== "verifying") {
+      return {
+        visible,
+        disabled: true,
+        reason: "仅待核实或核实中的线索可以转为达人",
+      };
+    }
+    if (
+      user?.role !== "admin" &&
+      lead.owner_user_id != null &&
+      lead.owner_user_id !== user?.id
+    ) {
+      return { visible, disabled: true, reason: "只能转换自己负责的线索" };
+    }
+    if (lead.source_round_id == null && lead.matched_round_id == null) {
+      return { visible, disabled: true, reason: "线索没有关联采集轮次" };
+    }
+    if (!lead.account_id.trim() && lead.identity_status !== "verified") {
+      return {
+        visible,
+        disabled: true,
+        reason: "请先打开线索校验账号，确认后再转换",
+      };
+    }
+    return { visible, disabled: false, reason: "自动选择最便宜服务商，转为达人并补全资料" };
   };
 
   const runExport = (format: "csv" | "xlsx") => {
@@ -263,7 +354,7 @@ export function LeadsPage() {
         description={`共 ${fmtNumber(total)} 条线索 · 待核实和待补全线索都从这里进入`}
         actions={
           <>
-            {canCollect ? (
+            {canEditLeads ? (
               <>
                 <Button onClick={() => setCreateOpen(true)}>
                   <Plus /> 新增线索
@@ -336,23 +427,25 @@ export function LeadsPage() {
               </SelectContent>
             </Select>
           </div>
-          <div className="space-y-2">
-            <Label htmlFor="lead-round">轮次</Label>
-            <Select
-              value={roundFilter === null ? "all" : String(roundFilter)}
-              onValueChange={(value) => setRoundFilter(value === "all" ? null : Number(value))}
-            >
-              <SelectTrigger id="lead-round" className="w-full">
-                <SelectValue placeholder="全部轮次" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">全部轮次</SelectItem>
-                {rounds.map((round) => (
-                  <SelectItem key={round.id} value={String(round.id)}>{round.name}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
+          {canCollect ? (
+            <div className="space-y-2">
+              <Label htmlFor="lead-round">轮次</Label>
+              <Select
+                value={roundFilter === null ? "all" : String(roundFilter)}
+                onValueChange={(value) => setRoundFilter(value === "all" ? null : Number(value))}
+              >
+                <SelectTrigger id="lead-round" className="w-full">
+                  <SelectValue placeholder="全部轮次" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">全部轮次</SelectItem>
+                  {rounds.map((round) => (
+                    <SelectItem key={round.id} value={String(round.id)}>{round.name}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          ) : null}
           <div className="space-y-2">
             <Label>线索状态</Label>
             <MultiSelect
@@ -422,7 +515,14 @@ export function LeadsPage() {
             <ErrorState message={leadsQuery.error instanceof Error ? leadsQuery.error.message : "加载线索失败"} />
           </div>
         ) : empty ? (
-          <EmptyState title="没有线索" description="可以从导入、手动录入或客户链接开始收集线索。" />
+          <EmptyState
+            title="没有线索"
+            description={
+              canEditLeads
+                ? "可以从导入、手动录入或客户链接开始收集线索。"
+                : "管理员录入线索后会显示在这里。"
+            }
+          />
         ) : (
           <Table>
             <TableHeader>
@@ -433,6 +533,7 @@ export function LeadsPage() {
                 <TableHead>来源</TableHead>
                 <TableHead>负责人</TableHead>
                 <TableHead>状态</TableHead>
+                {hasQuickConvertAction ? <TableHead>操作</TableHead> : null}
                 <TableHead>更新时间</TableHead>
               </TableRow>
             </TableHeader>
@@ -444,6 +545,13 @@ export function LeadsPage() {
                   className="cursor-pointer hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   onClick={() => setSelectedLeadId(lead.id)}
                   onKeyDown={(event) => {
+                    if (
+                      (event.target as HTMLElement).closest(
+                        "button, a, input, select, textarea",
+                      )
+                    ) {
+                      return;
+                    }
                     if (event.key === "Enter" || event.key === " ") {
                       event.preventDefault();
                       setSelectedLeadId(lead.id);
@@ -458,24 +566,41 @@ export function LeadsPage() {
                     {lead.matched_user_id && lead.status !== "converted" ? (
                       <div
                         className="mt-1 inline-flex max-w-[240px] items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-[11px] font-normal text-muted-foreground"
-                        title={`已关联达人 ${lead.matched_user_id}${lead.matched_round_name ? ` · ${lead.matched_round_name}` : ""}`}
+                        title={`已关联达人 ${lead.matched_user_id}${canCollect && lead.matched_round_name ? ` · ${lead.matched_round_name}` : ""}`}
                       >
                         <Link2 className="size-3 shrink-0" aria-hidden="true" />
                         <span className="truncate">
-                          已关联达人{lead.matched_round_name ? ` · ${lead.matched_round_name}` : ""}
+                          已关联达人{canCollect && lead.matched_round_name ? ` · ${lead.matched_round_name}` : ""}
                         </span>
                       </div>
                     ) : null}
                   </TableCell>
                   <TableCell className="text-muted-foreground">{lead.platform_label || lead.platform}</TableCell>
                   <TableCell className="max-w-[220px] truncate font-mono text-xs text-muted-foreground">
-                    {lead.account_id || lead.profile_url || "—"}
+                    <div className="truncate">
+                      {lead.platform_handle || lead.account_id || lead.profile_url || "—"}
+                    </div>
+                    <div className="truncate text-[11px] font-sans">
+                      {lead.identity_status_label}
+                      {lead.identity_confidence
+                        ? ` · ${IDENTITY_CONFIDENCE_LABELS[lead.identity_confidence] ?? lead.identity_confidence}`
+                        : ""}
+                    </div>
                   </TableCell>
                   <TableCell className="text-muted-foreground">
-                    {lead.source_label}{lead.source_round_name ? ` · ${lead.source_round_name}` : ""}
+                    {lead.source_label}{canCollect && lead.source_round_name ? ` · ${lead.source_round_name}` : ""}
                   </TableCell>
                   <TableCell className="text-muted-foreground">{lead.owner_username || "未分配"}</TableCell>
                   <TableCell><LeadStatusBadge status={lead.status} label={lead.status_label} /></TableCell>
+                  {hasQuickConvertAction ? (
+                    <TableCell>
+                      <LeadQuickConvertButton
+                        {...quickConvertState(lead)}
+                        converting={convertingLeadId === lead.id}
+                        onClick={() => quickConvertMutation.mutate(lead)}
+                      />
+                    </TableCell>
+                  ) : null}
                   <TableCell className="text-muted-foreground">{lead.updated_at ? fmtDateTime(lead.updated_at) : "—"}</TableCell>
                 </TableRow>
               ))}
@@ -490,6 +615,7 @@ export function LeadsPage() {
           statuses={leadStatuses}
           owners={assignableOwners}
           canCollect={canCollect}
+          canEditLeads={canEditLeads}
           onClose={() => setSelectedLeadId(null)}
         />
       ) : null}
@@ -498,7 +624,7 @@ export function LeadsPage() {
         open={bulkOpen}
         onClose={() => setBulkOpen(false)}
         platforms={platforms}
-        rounds={rounds}
+        rounds={canCollect ? rounds : []}
         sources={leadSources}
         onCreated={refresh}
         defaultPlatform={platform || "xhs"}
@@ -508,7 +634,7 @@ export function LeadsPage() {
         open={createOpen}
         onClose={() => setCreateOpen(false)}
         platforms={platforms}
-        rounds={rounds}
+        rounds={canCollect ? rounds : []}
         owners={assignableOwners}
         sources={leadSources}
         defaultPlatform={platform || "xhs"}
@@ -519,6 +645,38 @@ export function LeadsPage() {
         }}
       />
     </Page>
+  );
+}
+
+function LeadQuickConvertButton({
+  visible,
+  disabled,
+  reason,
+  converting,
+  onClick,
+}: {
+  visible: boolean;
+  disabled: boolean;
+  reason: string;
+  converting: boolean;
+  onClick: () => void;
+}) {
+  if (!visible) return null;
+  return (
+    <Button
+      size="sm"
+      variant="outline"
+      className="h-7 px-2 text-xs"
+      disabled={disabled || converting}
+      title={converting ? "正在转换并补全资料" : reason}
+      onClick={(event) => {
+        event.stopPropagation();
+        onClick();
+      }}
+    >
+      {converting ? <LoaderCircle className="animate-spin" /> : <UserPlus />}
+      {converting ? "转换中" : "转为达人"}
+    </Button>
   );
 }
 
@@ -544,6 +702,7 @@ function CreateLeadDialog({
   const [platform, setPlatform] = useState(defaultPlatform);
   const [nickname, setNickname] = useState("");
   const [accountId, setAccountId] = useState("");
+  const [platformHandle, setPlatformHandle] = useState("");
   const [profileUrl, setProfileUrl] = useState("");
   const [rawTitle, setRawTitle] = useState("");
   const [source, setSource] = useState("manual");
@@ -556,6 +715,7 @@ function CreateLeadDialog({
     setPlatform(defaultPlatform);
     setNickname("");
     setAccountId("");
+    setPlatformHandle("");
     setProfileUrl("");
     setRawTitle("");
     setSource("manual");
@@ -564,10 +724,13 @@ function CreateLeadDialog({
     setCloseConfirmOpen(false);
   }, [open, defaultPlatform]);
 
-  const canSubmit = Boolean(nickname.trim() || accountId.trim() || profileUrl.trim());
+  const canSubmit = Boolean(
+    nickname.trim() || accountId.trim() || platformHandle.trim() || profileUrl.trim(),
+  );
   const dirty = Boolean(
     nickname.trim() ||
     accountId.trim() ||
+    platformHandle.trim() ||
     profileUrl.trim() ||
     rawTitle.trim() ||
     platform !== "xhs" ||
@@ -582,6 +745,7 @@ function CreateLeadDialog({
         platform,
         nickname,
         account_id: accountId,
+        platform_handle: platformHandle,
         profile_url: profileUrl,
         raw_title: rawTitle,
         source,
@@ -623,7 +787,7 @@ function CreateLeadDialog({
           <DialogHeader className="space-y-1.5 border-b px-5 pt-5 pr-12 pb-3">
             <DialogTitle>新增线索</DialogTitle>
             <DialogDescription>
-              没有真实账号 ID 也可以先存为线索，之后在详情里核实并转入达人库。
+              没有平台账号或用户 ID 也可以先存为线索，之后在详情里校验并转入达人库。
             </DialogDescription>
           </DialogHeader>
           <div className="min-h-0 overflow-y-auto px-5 py-4">
@@ -655,13 +819,24 @@ function CreateLeadDialog({
                 />
               </div>
               <div className="space-y-2">
-                <Label htmlFor="create-lead-account">真实账号 ID</Label>
+                <Label htmlFor="create-lead-handle">平台账号</Label>
+                <Input
+                  id="create-lead-handle"
+                  value={platformHandle}
+                  disabled={mutation.isPending}
+                  onChange={(event) => setPlatformHandle(event.target.value)}
+                  placeholder="小红书号 / 微博号 / 抖音号等"
+                  autoComplete="off"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="create-lead-account">平台用户 ID</Label>
                 <Input
                   id="create-lead-account"
                   value={accountId}
                   disabled={mutation.isPending}
                   onChange={(event) => setAccountId(event.target.value)}
-                  placeholder="填写后可用于转换"
+                  placeholder="可选，采集接口内部 ID"
                   autoComplete="off"
                 />
               </div>
@@ -672,7 +847,7 @@ function CreateLeadDialog({
                   value={profileUrl}
                   disabled={mutation.isPending}
                   onChange={(event) => setProfileUrl(event.target.value)}
-                  placeholder="https://..."
+                  placeholder="https://…"
                   autoComplete="off"
                 />
               </div>
@@ -685,16 +860,18 @@ function CreateLeadDialog({
                   </SelectContent>
                 </Select>
               </div>
-              <div className="space-y-2">
-                <Label htmlFor="create-lead-round">来源轮次</Label>
-                <Select value={roundId} onValueChange={setRoundId} disabled={mutation.isPending}>
-                  <SelectTrigger id="create-lead-round" className="w-full"><SelectValue placeholder="不关联" /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="none">不关联轮次</SelectItem>
-                    {rounds.map((round) => <SelectItem key={round.id} value={String(round.id)}>{round.name}</SelectItem>)}
-                  </SelectContent>
-                </Select>
-              </div>
+              {rounds.length > 0 ? (
+                <div className="space-y-2">
+                  <Label htmlFor="create-lead-round">来源轮次</Label>
+                  <Select value={roundId} onValueChange={setRoundId} disabled={mutation.isPending}>
+                    <SelectTrigger id="create-lead-round" className="w-full"><SelectValue placeholder="不关联" /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="none">不关联轮次</SelectItem>
+                      {rounds.map((round) => <SelectItem key={round.id} value={String(round.id)}>{round.name}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
+                </div>
+              ) : null}
               <div className="space-y-2">
                 <Label htmlFor="create-lead-owner">负责人</Label>
                 <Select value={ownerId} onValueChange={setOwnerId} disabled={mutation.isPending}>

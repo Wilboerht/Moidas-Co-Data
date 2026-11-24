@@ -15,13 +15,20 @@ import {
 import { toast } from "sonner";
 import { api, downloadFile, exportUrl } from "@/shared/api";
 import { canonicalSearch } from "@/shared/query-string";
-import { fmtNumber, safeHttpUrl, shorten } from "@/shared/format";
+import { fmtDateTime, fmtNumber, safeHttpUrl, shorten } from "@/shared/format";
 import { useAuth } from "@/shared/auth-context";
 import { useRound } from "@/shared/round-context";
-import type { BatchUpdatePayload, Creator, CreatorQuery } from "@/shared/types";
+import type {
+  BatchUpdatePayload,
+  CooperationStatusDef,
+  Creator,
+  CreatorQuery,
+} from "@/shared/types";
 import { EmptyState, ErrorState, Page, PageHeader, Section } from "@/components/page";
 import { MultiSelect } from "@/components/multi-select";
+import { SearchableSelect } from "@/components/searchable-select";
 import { CreatorSheet } from "@/components/creator-sheet";
+import { CooperationStatusBadge } from "@/components/cooperation-status-badge";
 import { StatusBadge } from "@/components/status-badge";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -79,8 +86,9 @@ const ALL_COLUMNS = [
   ["fans", "粉丝数"],
   ["fans_wan", "粉丝（万）"],
   ["fans_tier", "粉丝层级"],
-  ["status", "筛选状态"],
-  ["round_status", "最新轮次审核"],
+  ["status", "采用状态"],
+  ["cooperation_status", "合作状态"],
+  ["cooperation_updated_at", "合作更新"],
   ["match_direction", "匹配方向"],
   ["top_title", "代表作"],
   ["posted", "笔记数"],
@@ -107,6 +115,7 @@ const CORE_COLUMNS = new Set([
   "fans",
   "fans_tier",
   "status",
+  "cooperation_status",
   "match_direction",
   "top_title",
   "posted",
@@ -126,7 +135,12 @@ const SORT_OPTIONS = [
   { value: "sample_likes", label: "样本点赞" },
   { value: "sample_average", label: "样本篇均互动" },
   { value: "nickname", label: "昵称" },
+  { value: "cooperation_updated_at", label: "合作更新时间" },
 ];
+
+const OPEN_COOPERATION_CODES = ["not_contacted", "contacted", "negotiating", "cooperating"];
+const TERMINAL_COOPERATION_CODES = new Set(["completed", "declined", "cancelled"]);
+const DEFAULT_STALE_DAYS = "7";
 
 const NUMERIC_COLUMNS = new Set(["fans", "posted", "liked", "interaction", "sample_notes", "sample_likes", "sample_interactions"]);
 const WIDE_COLUMNS = new Set(["top_title", "raw_title", "match_direction", "remark", "tags", "source_keywords"]);
@@ -161,15 +175,37 @@ export function editedValue(mode: EditMode, value: string): string | null {
   return mode === "set" ? value : null;
 }
 
+export function batchCooperationTargets<T extends Pick<Creator, "status"> & { cooperation_count?: number }>(
+  items: T[],
+  roundFilter: number | null,
+  reviewStatus: string,
+): T[] {
+  return items.filter((item) => {
+    const effectiveStatus = roundFilter !== null && reviewStatus !== "none"
+      ? reviewStatus
+      : item.status;
+    return effectiveStatus === "adopted" || (item.cooperation_count ?? 0) > 0;
+  });
+}
+
+function sanitizeStaleDays(value: string): string {
+  const digits = value.replace(/[^\d]/g, "").replace(/^0+/, "");
+  if (!digits) return "";
+  return String(Math.min(365, Math.max(1, Number(digits))));
+}
+
 export function CreatorsPage() {
   const { user } = useAuth();
+  const canCollect = user?.role === "admin" || Boolean(user?.can_collect);
   const { meta, rounds, round, refreshRounds, loading, error: bootstrapError } = useRound();
   const queryClient = useQueryClient();
   const [params, setParams] = useSearchParams();
   const statuses = meta?.statuses ?? [];
+  const cooperationStatuses = meta?.cooperation_statuses ?? [];
   const platformLabels = new Map((meta?.platforms ?? []).map((item) => [item.code, item.label]));
 
   const [roundFilter, setRoundFilter] = useState<number | null>(() => {
+    if (!canCollect) return null;
     const value = params.get("round");
     const parsed = value ? Number(value) : NaN;
     return value && value !== "all" && Number.isFinite(parsed) ? parsed : null;
@@ -192,6 +228,12 @@ export function CreatorsPage() {
   const [search, setSearch] = useState(params.get("search") ?? "");
   const debouncedSearch = useDebounced(search);
   const [statusFilter, setStatusFilter] = useState<string[]>(params.get("status")?.split(",").filter(Boolean) ?? []);
+  const [cooperationFilter, setCooperationFilter] = useState<string[]>(
+    params.get("cooperation")?.split(",").filter(Boolean) ?? [],
+  );
+  const [cooperationStaleDays, setCooperationStaleDays] = useState(() =>
+    sanitizeStaleDays(params.get("cooperation_stale_days") ?? ""),
+  );
   const [tierFilter, setTierFilter] = useState<string[]>(params.get("tier")?.split(",").filter(Boolean) ?? []);
   const [directionFilter, setDirectionFilter] = useState<string[]>(params.get("direction")?.split(",").filter(Boolean) ?? []);
   const [sourceFilter, setSourceFilter] = useState<string[]>(params.get("source")?.split(",").filter(Boolean) ?? []);
@@ -210,7 +252,12 @@ export function CreatorsPage() {
   const [visibleColumns, setVisibleColumns] = useState<Record<string, boolean>>(readVisibility);
   const [selected, setSelected] = useState<Record<string, Creator>>({});
   const [batchOpen, setBatchOpen] = useState(false);
-  const [batchStatus, setBatchStatus] = useState("none");
+  const [batchReviewStatus, setBatchReviewStatus] = useState("none");
+  const [batchCooperationStatus, setBatchCooperationStatus] = useState("keep");
+  const [pendingCooperation, setPendingCooperation] = useState<{
+    item: CreatorRow;
+    status: string;
+  } | null>(null);
   const [batchDirection, setBatchDirection] = useState("");
   const [batchDirectionMode, setBatchDirectionMode] = useState<"keep" | "set" | "clear">("keep");
   const [batchRemark, setBatchRemark] = useState("");
@@ -235,7 +282,10 @@ export function CreatorsPage() {
     syncingFromUrlRef.current = true;
     const roundValue = params.get("round");
     const parsedRound = roundValue ? Number(roundValue) : NaN;
-    const nextRound = roundValue && roundValue !== "all" && Number.isFinite(parsedRound) ? parsedRound : null;
+    const nextRound =
+      canCollect && roundValue && roundValue !== "all" && Number.isFinite(parsedRound)
+        ? parsedRound
+        : null;
     setRoundFilter(nextRound);
     setPlatform(params.get("platform") ?? (nextRound === null ? "" : rounds.find((item) => item.id === nextRound)?.platform ?? "xhs"));
     const nextPage = Number(params.get("page") ?? 1);
@@ -244,6 +294,10 @@ export function CreatorsPage() {
     setPageSize(Number.isFinite(nextPageSize) ? Math.min(200, Math.max(25, Math.floor(nextPageSize))) : 50);
     setSearch(params.get("search") ?? "");
     setStatusFilter(params.get("status")?.split(",").filter(Boolean) ?? []);
+    setCooperationFilter(params.get("cooperation")?.split(",").filter(Boolean) ?? []);
+    setCooperationStaleDays(
+      sanitizeStaleDays(params.get("cooperation_stale_days") ?? ""),
+    );
     setTierFilter(params.get("tier")?.split(",").filter(Boolean) ?? []);
     setDirectionFilter(params.get("direction")?.split(",").filter(Boolean) ?? []);
     setSourceFilter(params.get("source")?.split(",").filter(Boolean) ?? []);
@@ -256,7 +310,11 @@ export function CreatorsPage() {
     setNeedsAction(params.get("needs_action") === "true");
     setSort(params.get("sort") ?? "fans");
     setOrder(params.get("order") === "asc" ? "asc" : "desc");
-  }, [params, rounds]);
+  }, [params, rounds, canCollect]);
+
+  useEffect(() => {
+    if (!canCollect) setRoundFilter(null);
+  }, [canCollect]);
 
   const facetsQuery = useQuery({
     queryKey: ["facets", roundFilter, platform],
@@ -293,6 +351,10 @@ export function CreatorsPage() {
   if (pageSize !== 50) currentParams.set("page_size", String(pageSize));
   if (debouncedSearch) currentParams.set("search", debouncedSearch);
   if (statusFilter.length) currentParams.set("status", statusFilter.join(","));
+  if (cooperationFilter.length) currentParams.set("cooperation", cooperationFilter.join(","));
+  if (cooperationStaleDays) {
+    currentParams.set("cooperation_stale_days", cooperationStaleDays);
+  }
   if (tierFilter.length) currentParams.set("tier", tierFilter.join(","));
   if (directionFilter.length) currentParams.set("direction", directionFilter.join(","));
   if (sourceFilter.length) currentParams.set("source", sourceFilter.join(","));
@@ -315,7 +377,7 @@ export function CreatorsPage() {
     if (canonicalSearch(currentParams) === lastUrlRef.current) return;
     setPage(1);
     setSelected({});
-  }, [roundFilter, platform, debouncedSearch, statusFilter, tierFilter, directionFilter, sourceFilter, sourceMode, labelFilter, ownerFilter, minFans, maxFans, onlyUnenriched, needsAction]);
+  }, [roundFilter, platform, debouncedSearch, statusFilter, cooperationFilter, cooperationStaleDays, tierFilter, directionFilter, sourceFilter, sourceMode, labelFilter, ownerFilter, minFans, maxFans, onlyUnenriched, needsAction]);
 
   useEffect(() => {
     if (syncingFromUrlRef.current) {
@@ -327,8 +389,9 @@ export function CreatorsPage() {
     lastUrlRef.current = serialized;
     setParams(currentParams, { replace: true });
   }, [
-    roundFilter, platform, page, pageSize, debouncedSearch, statusFilter, tierFilter,
-    directionFilter, sourceFilter, sourceMode, labelFilter, ownerFilter, minFans, maxFans, onlyUnenriched, needsAction, sort, order,
+    roundFilter, platform, page, pageSize, debouncedSearch, statusFilter, cooperationFilter,
+    cooperationStaleDays, tierFilter, directionFilter, sourceFilter, sourceMode, labelFilter,
+    ownerFilter, minFans, maxFans, onlyUnenriched, needsAction, sort, order,
     detailKey, detailRoundParam, params, setParams,
   ]);
 
@@ -336,16 +399,30 @@ export function CreatorsPage() {
     if (sourceFilter.length < 2) setSourceMode("any");
   }, [sourceFilter.length]);
 
+  useEffect(() => {
+    if (!batchOpen) {
+      setBatchReviewStatus("none");
+      setBatchCooperationStatus("keep");
+    }
+  }, [batchOpen]);
+
+  useEffect(() => {
+    setBatchReviewStatus("none");
+  }, [roundFilter]);
+
   const creatorQuery: CreatorQuery = useMemo(
     () => ({
       platform, page, page_size: pageSize, search: debouncedSearch,
       statuses: statusFilter, tiers: tierFilter, directions: directionFilter, sources: sourceFilter,
       source_mode: sourceMode,
       labels: labelFilter,
-      owner: ownerFilter, min_fans: minFans, max_fans: maxFans,
+      owner: ownerFilter,
+      cooperation: cooperationFilter,
+      cooperation_stale_days: cooperationStaleDays,
+      min_fans: minFans, max_fans: maxFans,
       only_unenriched: onlyUnenriched, needs_action: needsAction, sort, order,
     }),
-    [platform, page, pageSize, debouncedSearch, statusFilter, tierFilter, directionFilter, sourceFilter, sourceMode, labelFilter, ownerFilter, minFans, maxFans, onlyUnenriched, needsAction, sort, order],
+    [platform, page, pageSize, debouncedSearch, statusFilter, cooperationFilter, cooperationStaleDays, tierFilter, directionFilter, sourceFilter, sourceMode, labelFilter, ownerFilter, minFans, maxFans, onlyUnenriched, needsAction, sort, order],
   );
 
   const creatorsQuery = useQuery({
@@ -356,68 +433,116 @@ export function CreatorsPage() {
 
   const batchMutation = useMutation({
     mutationFn: async () => {
+      const selectedItems = Object.values(selected);
       const groups = new Map<number, BatchUpdatePayload["items"]>();
-      for (const item of Object.values(selected)) {
-        const targetRound = item.round_id ?? roundFilter ?? rounds[0]?.id;
-        if (targetRound == null) continue;
-        const rows = groups.get(targetRound) ?? [];
-        rows.push({
-          platform: item.platform,
-          user_id: item.user_id,
-          expected_updated_at: item.updated_at || undefined,
-          expected_status: item.round_status,
-          expected_cooperation_status: item.cooperation_status,
-          expected_cooperation_updated_at: item.cooperation_updated_at || undefined,
-        });
-        groups.set(targetRound, rows);
+      const hasReviewChange =
+        (roundFilter !== null && batchReviewStatus !== "none") ||
+        batchDirectionMode !== "keep" ||
+        batchRemarkMode !== "keep" ||
+        batchTagsMode !== "keep" ||
+        (user?.role === "admin" && batchOwner !== "keep");
+      if (hasReviewChange) {
+        for (const item of selectedItems) {
+          const targetRound = item.round_id ?? roundFilter ?? rounds[0]?.id;
+          if (targetRound == null) continue;
+          const rows = groups.get(targetRound) ?? [];
+          rows.push({
+            platform: item.platform,
+            user_id: item.user_id,
+            expected_updated_at: item.updated_at || undefined,
+            expected_status: item.round_status,
+          });
+          groups.set(targetRound, rows);
+        }
       }
-      const results = await Promise.all(
-        [...groups.entries()].flatMap(([targetRound, items]) =>
-          chunk(items).map(async (part) => {
-            try {
-              return await api.batchUpdate(targetRound, {
-                items: part,
-                status: roundFilter !== null && batchStatus !== "none" ? batchStatus : null,
-                cooperation_status: roundFilter === null && batchStatus !== "none" ? batchStatus : null,
-                match_direction: editedValue(batchDirectionMode, batchDirection),
-                tags_manual: editedValue(batchTagsMode, batchTags),
-                remark: editedValue(batchRemarkMode, batchRemark),
-                set_owner: user?.role === "admin" && batchOwner !== "keep",
-                owner_user_id:
-                  batchOwner === "unassigned"
-                    ? null
-                    : batchOwner !== "keep"
-                      ? Number(batchOwner)
-                      : undefined,
-              });
-            } catch (error) {
-              return {
-                changed: 0,
-                conflicts: [],
-                error: error instanceof Error ? error.message : "批量更新失败",
-              };
-            }
-          }),
-        ),
+      const reviewResults = hasReviewChange
+        ? await Promise.all(
+            [...groups.entries()].flatMap(([targetRound, items]) =>
+              chunk(items).map(async (part) => {
+                try {
+                  return await api.batchUpdate(targetRound, {
+                    items: part,
+                    status:
+                      roundFilter !== null && batchReviewStatus !== "none"
+                        ? batchReviewStatus
+                        : null,
+                    match_direction: editedValue(batchDirectionMode, batchDirection),
+                    tags_manual: editedValue(batchTagsMode, batchTags),
+                    remark: editedValue(batchRemarkMode, batchRemark),
+                    set_owner: user?.role === "admin" && batchOwner !== "keep",
+                    owner_user_id:
+                      batchOwner === "unassigned"
+                        ? null
+                        : batchOwner !== "keep"
+                          ? Number(batchOwner)
+                          : undefined,
+                  });
+                } catch (error) {
+                  return {
+                    changed: 0,
+                    conflicts: [],
+                    error: error instanceof Error ? error.message : "批量更新失败",
+                  };
+                }
+              }),
+            ),
+          )
+        : [];
+      const cooperationItems = batchCooperationTargets(
+        selectedItems, roundFilter, batchReviewStatus,
       );
+      const cooperationResults =
+        batchCooperationStatus !== "keep"
+          ? await Promise.all(
+              chunk(cooperationItems).map(async (part) => {
+                try {
+                  return await api.batchUpdateCooperation({
+                    status: batchCooperationStatus,
+                    items: part.map((item) => ({
+                      platform: item.platform,
+                      user_id: item.user_id,
+                      expected_status: item.cooperation_status || "",
+                      expected_updated_at: item.cooperation_updated_at || undefined,
+                    })),
+                  });
+                } catch (error) {
+                  return {
+                    changed: 0,
+                    conflicts: [],
+                    claimed: 0,
+                    error: error instanceof Error ? error.message : "合作状态更新失败",
+                  };
+                }
+              }),
+            )
+          : [];
+      const results = [...reviewResults, ...cooperationResults];
       return {
         changed: results.reduce((sum, item) => sum + item.changed, 0),
+        reviewChanged: reviewResults.reduce((sum, item) => sum + item.changed, 0),
+        cooperationChanged: cooperationResults.reduce((sum, item) => sum + item.changed, 0),
+        cooperationSkipped: selectedItems.length - cooperationItems.length,
         conflicts: results.flatMap((item) => item.conflicts),
         errors: results.flatMap((item) => "error" in item && item.error ? [item.error] : []),
       };
     },
     onSuccess: async (result) => {
       const issues = result.conflicts.length + result.errors.length;
+      const skippedHint =
+        batchCooperationStatus !== "keep" && result.cooperationSkipped > 0
+          ? `，${result.cooperationSkipped} 位非采用达人未修改合作状态`
+          : "";
       if (issues > 0) {
         toast.warning(
-          `已更新 ${result.changed} 位达人；${result.conflicts.length} 位版本冲突，${result.errors.length} 组请求失败`,
+          `已完成 ${result.changed} 项更新；${result.conflicts.length} 位版本冲突，${result.errors.length} 组请求失败${skippedHint}`,
         );
       } else {
-        toast.success(`已更新 ${result.changed} 位达人`);
+        toast.success(`已完成 ${result.changed} 项更新${skippedHint}`);
         setSelected({});
         setBatchOpen(false);
       }
-      setBatchStatus("none");
+      setBatchReviewStatus("none");
+      setBatchCooperationStatus("keep");
       setBatchDirection("");
       setBatchDirectionMode("keep");
       setBatchRemark("");
@@ -434,23 +559,15 @@ export function CreatorsPage() {
     onError: (error) => toast.error(error instanceof Error ? error.message : "批量更新失败"),
   });
 
-  const statusMutation = useMutation({
+  const reviewStatusMutation = useMutation({
     mutationFn: async ({ item, status }: { item: CreatorRow; status: string }) => {
       const targetRound = item.round_id ?? roundFilter ?? rounds[0]?.id;
       if (targetRound == null) throw new Error("无法确定该达人所属轮次");
-      return api.updateCreator(targetRound, item.platform, item.user_id,
-        roundFilter === null
-          ? {
-              cooperation_status: status,
-              expected_cooperation_status: item.cooperation_status,
-              expected_cooperation_updated_at: item.cooperation_updated_at || undefined,
-            }
-          : {
-              status,
-              expected_status: item.status,
-              expected_updated_at: item.updated_at || undefined,
-            },
-      );
+      return api.updateCreator(targetRound, item.platform, item.user_id, {
+        status,
+        expected_status: item.status,
+        expected_updated_at: item.updated_at || undefined,
+      });
     },
     onSuccess: async (_updated, variables) => {
       const label = statuses.find((item) => item.code === variables.status)?.label ?? variables.status;
@@ -462,6 +579,34 @@ export function CreatorsPage() {
     },
     onError: async (error) => {
       toast.error(error instanceof Error ? error.message : "状态更新失败");
+      await queryClient.invalidateQueries({ queryKey: ["creators"] });
+      await queryClient.invalidateQueries({ queryKey: ["facets"] });
+    },
+  });
+
+  const cooperationMutation = useMutation({
+    mutationFn: async ({ item, status }: { item: CreatorRow; status: string }) =>
+      api.updateCooperation(item.platform, item.user_id, {
+        status,
+        expected_status: item.cooperation_status || "",
+        expected_updated_at: item.cooperation_updated_at || undefined,
+      }),
+    onSuccess: async (updated, variables) => {
+      const label =
+        cooperationStatuses.find((item) => item.code === variables.status)?.label ||
+        updated.cooperation_status_label ||
+        "未进入";
+      toast.success(
+        `已将「${variables.item.nickname || variables.item.key}」合作状态改为${label}`,
+      );
+      await queryClient.invalidateQueries({ queryKey: ["creators"] });
+      await queryClient.invalidateQueries({ queryKey: ["facets"] });
+      await queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+      await queryClient.invalidateQueries({ queryKey: ["activity"] });
+      await queryClient.invalidateQueries({ queryKey: ["creator"] });
+    },
+    onError: async (error) => {
+      toast.error(error instanceof Error ? error.message : "合作状态更新失败");
       await queryClient.invalidateQueries({ queryKey: ["creators"] });
       await queryClient.invalidateQueries({ queryKey: ["facets"] });
     },
@@ -511,6 +656,8 @@ export function CreatorsPage() {
   const clearFilters = () => {
     setSearch("");
     setStatusFilter([]);
+    setCooperationFilter([]);
+    setCooperationStaleDays("");
     setTierFilter([]);
     setDirectionFilter([]);
     setSourceFilter([]);
@@ -521,6 +668,26 @@ export function CreatorsPage() {
     setMaxFans("");
     setOnlyUnenriched(false);
     setNeedsAction(false);
+  };
+
+  const applyPreset = (preset: "adopted-uncontacted" | "my-follow-up" | "stale") => {
+    if (preset === "adopted-uncontacted") {
+      setStatusFilter(["adopted"]);
+      setCooperationFilter(["not_contacted"]);
+      setCooperationStaleDays("");
+      return;
+    }
+    if (preset === "my-follow-up") {
+      setStatusFilter([]);
+      setCooperationFilter(OPEN_COOPERATION_CODES);
+      setCooperationStaleDays("");
+      if (user) setOwnerFilter(String(user.id));
+      return;
+    }
+    setStatusFilter([]);
+    setCooperationFilter(OPEN_COOPERATION_CODES);
+    setCooperationStaleDays(DEFAULT_STALE_DAYS);
+    if (user) setOwnerFilter(String(user.id));
   };
 
   const currentRound = rounds.find((item) => item.id === roundFilter);
@@ -543,7 +710,8 @@ export function CreatorsPage() {
   const items = (creatorsQuery.data?.items ?? []) as CreatorRow[];
   const selectedCount = Object.values(selected).length;
   const batchHasChanges =
-    batchStatus !== "none" ||
+    (roundFilter !== null && batchReviewStatus !== "none") ||
+    batchCooperationStatus !== "keep" ||
     batchDirectionMode === "clear" ||
     (batchDirectionMode === "set" && Boolean(batchDirection.trim())) ||
     batchRemarkMode === "clear" ||
@@ -561,12 +729,37 @@ export function CreatorsPage() {
   };
   const advancedFilterCount =
     directionFilter.length + sourceFilter.length +
+    (cooperationStaleDays ? 1 : 0) +
     (minFans ? 1 : 0) + (maxFans ? 1 : 0) + (onlyUnenriched ? 1 : 0) + (needsAction ? 1 : 0);
   const activeFilters =
-    statusFilter.length + tierFilter.length + advancedFilterCount +
+    statusFilter.length + cooperationFilter.length + tierFilter.length + advancedFilterCount +
     (debouncedSearch ? 1 : 0) + (ownerFilter ? 1 : 0) + labelFilter.length;
   const platformTabs = facetsQuery.data?.platforms ?? [];
-  const visibleKeys = ALL_COLUMNS.filter(([key]) => key === "nickname" || visibleColumns[key] !== false).map(([key]) => key);
+  const cooperationLabelMap = new Map(
+    cooperationStatuses.map((item) => [item.code, item.label]),
+  );
+  const cooperationFacetCounts = new Map(
+    (facetsQuery.data?.cooperation_statuses ?? []).map((item) => [item.value, item.count]),
+  );
+  const cooperationOptions = cooperationStatuses.map((item) => ({
+    value: item.code,
+    label: cooperationFacetCounts.has(item.code)
+      ? `${item.label} (${cooperationFacetCounts.get(item.code)})`
+      : item.label,
+  }));
+  const noneCooperationCount = cooperationFacetCounts.get("none") ?? 0;
+  if (noneCooperationCount > 0 || cooperationFilter.includes("none")) {
+    cooperationOptions.push({
+      value: "none",
+      label: `未进入 (${noneCooperationCount})`,
+    });
+  }
+  const toggleColumns = canCollect
+    ? TOGGLE_COLUMNS
+    : TOGGLE_COLUMNS.filter(([key]) => key !== "data_round");
+  const visibleKeys = ALL_COLUMNS
+    .filter(([key]) => (canCollect || key !== "data_round") && (key === "nickname" || visibleColumns[key] !== false))
+    .map(([key]) => key);
   const pageAllSelected = items.length > 0 && items.every((item) => Boolean(selected[item.key]));
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   useEffect(() => {
@@ -605,20 +798,93 @@ export function CreatorsPage() {
     });
   };
 
+  const openCreator = (item: CreatorRow) => {
+    const next = new URLSearchParams(params);
+    next.set("creator", item.key);
+    if (item.round_id != null) next.set("creator_round", String(item.round_id));
+    setParams(next, { replace: true });
+  };
+
   const renderCell = (key: string, item: CreatorRow) => {
     switch (key) {
       case "fans": return fmtNumber(item.fans);
       case "fans_wan": return item.fans_wan || "—";
       case "fans_tier": return item.fans_tier || "—";
-      case "status": return (
-        <InlineStatusSelect
-          item={item}
-          statuses={statuses}
-          pending={statusMutation.isPending && statusMutation.variables?.item.key === item.key}
-          onChange={(status) => statusMutation.mutate({ item, status })}
-        />
-      );
-      case "round_status": return <StatusBadge status={item.round_status} label={item.round_status_label} />;
+      case "status":
+        return (
+          <InlineStatusSelect
+            item={item}
+            statuses={statuses}
+            pending={
+              reviewStatusMutation.isPending &&
+              reviewStatusMutation.variables?.item.key === item.key
+            }
+            title={
+              roundFilter === null && item.round_name
+                ? `更新「${item.round_name}」的采用状态`
+                : undefined
+            }
+            onChange={(status) => reviewStatusMutation.mutate({ item, status })}
+          />
+        );
+      case "cooperation_status":
+        if (!item.cooperation_status) {
+          if (item.status !== "adopted") {
+            return <span className="text-muted-foreground">—</span>;
+          }
+          return (
+            <InlineCooperationStatusSelect
+              item={item}
+              statuses={cooperationStatuses}
+              pending={
+                cooperationMutation.isPending &&
+                cooperationMutation.variables?.item.key === item.key
+              }
+              onChange={(status) => cooperationMutation.mutate({ item, status })}
+            />
+          );
+        }
+        if (TERMINAL_COOPERATION_CODES.has(item.cooperation_status)) {
+          return (
+            <button
+              type="button"
+              className="inline-flex items-center gap-1 text-left"
+              onClick={() => openCreator(item)}
+              title="查看合作记录"
+            >
+              <CooperationStatusBadge
+                status={item.cooperation_status}
+                label={item.cooperation_status_label}
+              />
+              {item.cooperation_count > 1 ? (
+                <span className="text-[11px] text-muted-foreground">
+                  {item.cooperation_count} 次
+                </span>
+              ) : null}
+            </button>
+          );
+        }
+        return (
+          <InlineCooperationStatusSelect
+            item={item}
+            statuses={cooperationStatuses}
+            pending={
+              cooperationMutation.isPending &&
+              cooperationMutation.variables?.item.key === item.key
+            }
+            onChange={(status) => {
+              if (status && TERMINAL_COOPERATION_CODES.has(status)) {
+                setPendingCooperation({ item, status });
+                return;
+              }
+              cooperationMutation.mutate({ item, status });
+            }}
+          />
+        );
+      case "cooperation_updated_at":
+        return item.cooperation_updated_at
+          ? fmtDateTime(item.cooperation_updated_at)
+          : "—";
       case "match_direction": return shorten(item.match_direction, 36) || "—";
       case "top_title": return shorten(item.top_title, 48) || "—";
       case "posted": return fmtNumber(item.posted);
@@ -685,9 +951,13 @@ export function CreatorsPage() {
       <Page>
         <PageHeader title="达人库" />
         <EmptyState
-          title="还没有采集轮次"
-          description="新建一轮采集，再进入达人筛选。"
-          actions={user?.role === "admin" || user?.can_collect ? <Button asChild><Link to="/new">新建采集</Link></Button> : undefined}
+          title={canCollect ? "还没有采集轮次" : "暂无达人数据"}
+          description={
+            canCollect
+              ? "新建一轮采集，再进入达人筛选。"
+              : "管理员录入达人后会显示在这里。"
+          }
+          actions={canCollect ? <Button asChild><Link to="/new">新建采集</Link></Button> : undefined}
         />
       </Page>
     );
@@ -697,26 +967,34 @@ export function CreatorsPage() {
     <Page>
       <PageHeader
         title="达人库"
-        description={`${scopeLabel} · ${platformLabels.get(platform) ?? "全部平台"} · ${fmtNumber(total)} 位达人`}
+        description={
+          canCollect
+            ? `${scopeLabel} · ${platformLabels.get(platform) ?? "全部平台"} · ${fmtNumber(total)} 位达人`
+            : `${platformLabels.get(platform) ?? "全部平台"} · ${fmtNumber(total)} 位达人`
+        }
         actions={
           <>
-            <Select
-              value={roundFilter === null ? "all" : String(roundFilter)}
-              onValueChange={(value) => setRoundFilter(value === "all" ? null : Number(value))}
-              disabled={rounds.length === 0}
-            >
-              <SelectTrigger className="w-[180px] max-w-full" aria-label="轮次">
-                <SelectValue placeholder="全部轮次" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">全部轮次</SelectItem>
-                {rounds.map((round) => (
-                  <SelectItem key={round.id} value={String(round.id)}>
-                    {round.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            {canCollect ? (
+              <SearchableSelect
+                label="轮次"
+                value={roundFilter === null ? "all" : String(roundFilter)}
+                options={[
+                  { value: "all", label: "全部轮次", pinned: true },
+                  ...rounds.map((round) => ({
+                    value: String(round.id),
+                    label: round.name,
+                    description: [round.platform_label, round.category].filter(Boolean).join(" · "),
+                    keywords: [round.platform, String(round.id)],
+                  })),
+                ]}
+                onChange={(value) => setRoundFilter(value === "all" ? null : Number(value))}
+                placeholder="全部轮次"
+                searchPlaceholder="搜索轮次…"
+                emptyText="没有匹配的轮次"
+                className="w-[180px] max-w-full"
+                disabled={rounds.length === 0}
+              />
+            ) : null}
             <Select value={platform || "all"} onValueChange={(value) => setPlatform(value === "all" ? "" : value)} disabled={platformTabs.length === 0}>
               <SelectTrigger className="w-[220px] max-w-full" aria-label="平台">
                 <SelectValue placeholder="选择平台" />
@@ -770,7 +1048,7 @@ export function CreatorsPage() {
         }
       >
         <div className="space-y-4">
-          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
+          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-6">
             <div className="space-y-2">
               <Label htmlFor="creator-search">搜索</Label>
               <Input
@@ -784,7 +1062,9 @@ export function CreatorsPage() {
               />
             </div>
             <div className="space-y-2">
-              <Label>采用状态</Label>
+              <Label title={!canCollect ? "按各达人最近数据统计" : roundFilter === null ? "全轮次视图按各达人最近一条轮次显示" : "本轮审核结果"}>
+                采用状态
+              </Label>
               <MultiSelect
                 label="采用状态"
                 options={statuses.map((item) => ({ value: item.code, label: item.label }))}
@@ -793,6 +1073,18 @@ export function CreatorsPage() {
                 placeholder="全部状态"
                 searchPlaceholder="搜索状态…"
                 emptyText="暂无状态"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label title={canCollect ? "合作状态是达人主档，跨轮次共享" : "合作状态为达人主档，全员共享"}>合作状态</Label>
+              <MultiSelect
+                label="合作状态"
+                options={cooperationOptions}
+                value={cooperationFilter}
+                onChange={setCooperationFilter}
+                placeholder="全部合作状态"
+                searchPlaceholder="搜索合作状态…"
+                emptyText="暂无合作状态"
               />
             </div>
             <div className="space-y-2">
@@ -808,7 +1100,7 @@ export function CreatorsPage() {
               />
             </div>
             <div className="space-y-2">
-              <Label title="跟进人跨轮次保持，不随新采集重置">跟进人</Label>
+              <Label title={canCollect ? "跟进人跨轮次保持，不随新采集重置" : "跟进人由管理员或成员维护"}>跟进人</Label>
               <Select
                 value={ownerFilter || "all"}
                 onValueChange={(value) => setOwnerFilter(value === "all" ? "" : value)}
@@ -848,6 +1140,34 @@ export function CreatorsPage() {
                 </Button>
               </div>
             </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs text-muted-foreground">快捷筛选</span>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => applyPreset("adopted-uncontacted")}
+            >
+              已采用 · 未联系
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => applyPreset("my-follow-up")}
+            >
+              我的待跟进
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => applyPreset("stale")}
+            >
+              超期未跟进
+            </Button>
           </div>
 
           {showMore ? (
@@ -892,7 +1212,9 @@ export function CreatorsPage() {
                   </Select>
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  关键词是多标签统计，同一达人可计入多个关键词；全部轮次合并历史命中，合作状态取主档，最新轮次审核用于待办，跟进人跨轮次保持。
+                  {canCollect
+                    ? "关键词是多标签统计，同一达人可计入多个关键词；全部轮次合并历史命中，合作状态为达人主档、跨轮次共享，各轮次审核用于待办，跟进人跨轮次保持。"
+                    : "关键词是多标签统计，同一达人可计入多个关键词。"}
                 </p>
               </div>
               <div className="space-y-2">
@@ -906,7 +1228,11 @@ export function CreatorsPage() {
                   searchPlaceholder="搜索来源标签…"
                   emptyText="暂无来源标签"
                 />
-                <p className="text-xs text-muted-foreground">来自 Excel 导入的「数据来源」，与采集命中关键词分开。</p>
+                <p className="text-xs text-muted-foreground">
+                  {canCollect
+                    ? "来自 Excel 导入的「数据来源」，与采集命中关键词分开。"
+                    : "来自 Excel 导入的「数据来源」。"}
+                </p>
               </div>
               <div className="space-y-2">
                 <Label htmlFor="min-fans">最低粉丝</Label>
@@ -915,6 +1241,21 @@ export function CreatorsPage() {
               <div className="space-y-2">
                 <Label htmlFor="max-fans">最高粉丝</Label>
                 <Input id="max-fans" inputMode="numeric" value={maxFans} onChange={(event) => setMaxFans(event.target.value)} placeholder="不限" />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="cooperation-stale-days">超过 N 天未跟进</Label>
+                <Input
+                  id="cooperation-stale-days"
+                  inputMode="numeric"
+                  value={cooperationStaleDays}
+                  onChange={(event) =>
+                    setCooperationStaleDays(sanitizeStaleDays(event.target.value))
+                  }
+                  placeholder="如 7"
+                />
+                <p className="text-xs text-muted-foreground">
+                  仅统计未联系、已联系、洽谈中的达人。
+                </p>
               </div>
               <div className="flex items-center gap-2 pt-1">
                 <Switch id="only-unenriched" checked={onlyUnenriched} onCheckedChange={setOnlyUnenriched} />
@@ -934,7 +1275,22 @@ export function CreatorsPage() {
                 <FilterChip label={`搜索：${debouncedSearch}`} onRemove={() => setSearch("")} />
               ) : null}
               {statusFilter.length > 0 ? (
-                <FilterChip label={`状态：${summarize(statusFilter, new Map(statuses.map((item) => [item.code, item.label])))}`} onRemove={() => setStatusFilter([])} />
+                <FilterChip label={`采用：${summarize(statusFilter, new Map(statuses.map((item) => [item.code, item.label])))}`} onRemove={() => setStatusFilter([])} />
+              ) : null}
+              {cooperationFilter.length > 0 ? (
+                <FilterChip
+                  label={`合作：${summarize(
+                    cooperationFilter,
+                    new Map([...cooperationLabelMap, ["none", "未进入"]]),
+                  )}`}
+                  onRemove={() => setCooperationFilter([])}
+                />
+              ) : null}
+              {cooperationStaleDays ? (
+                <FilterChip
+                  label={`超过 ${cooperationStaleDays} 天未跟进`}
+                  onRemove={() => setCooperationStaleDays("")}
+                />
               ) : null}
               {tierFilter.length > 0 ? (
                 <FilterChip label={`层级：${summarize(tierFilter)}`} onRemove={() => setTierFilter([])} />
@@ -977,8 +1333,8 @@ export function CreatorsPage() {
               <div className="w-40 max-w-full sm:w-56">
                 <MultiSelect
                   label="显示列"
-                  options={TOGGLE_COLUMNS.map(([value, label]) => ({ value, label }))}
-                  value={TOGGLE_COLUMNS.filter(([key]) => visibleColumns[key] !== false).map(([key]) => key)}
+                  options={toggleColumns.map(([value, label]) => ({ value, label }))}
+                  value={toggleColumns.filter(([key]) => visibleColumns[key] !== false).map(([key]) => key)}
                   onChange={(value) =>
                     setVisibleColumns({
                       ...Object.fromEntries(ALL_COLUMNS.map(([key]) => [key, value.includes(key)])),
@@ -1063,7 +1419,15 @@ export function CreatorsPage() {
                       <TableHead
                         key={key}
                         className={`${NUMERIC_COLUMNS.has(key) ? "text-right" : ""} ${WIDE_COLUMNS.has(key) ? "min-w-[180px]" : "whitespace-nowrap"}`}
-                        title={key === "owner_username" ? "跟进人跨轮次保持，不随新采集重置" : undefined}
+                        title={
+                          !canCollect
+                            ? undefined
+                            : key === "owner_username"
+                              ? "跟进人跨轮次保持，不随新采集重置"
+                              : key === "cooperation_status"
+                                ? "合作状态为达人主档，跨轮次共享"
+                                : undefined
+                        }
                       >
                         {ALL_COLUMNS.find(([column]) => column === key)?.[1] ?? key}
                       </TableHead>
@@ -1142,18 +1506,49 @@ export function CreatorsPage() {
         <DialogContent>
           <DialogHeader>
             <DialogTitle>批量修改 {selectedCount} 位达人</DialogTitle>
-            <DialogDescription>字段可设置为不修改、设置新值或清空；{roundFilter === null ? "合作状态修改主档，本轮审核不变。" : "仅修改本轮审核，主档合作状态不变。"}未分配的达人默认会自动归你跟进。</DialogDescription>
+            <DialogDescription>
+              {canCollect
+                ? "字段可设置为不修改、设置新值或清空；采用状态只改本轮审核，合作状态修改达人主档、跨轮次生效。未分配的达人默认会自动归你跟进。"
+                : "字段可设置为不修改、设置新值或清空。未分配的达人默认会自动归你跟进。"}
+            </DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
+            {roundFilter !== null ? (
+              <div className="space-y-2">
+                <Label>本轮采用状态</Label>
+                <Select value={batchReviewStatus} onValueChange={setBatchReviewStatus}>
+                  <SelectTrigger className="w-full" aria-label="批量采用状态"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="none">不修改</SelectItem>
+                    {statuses.map((item) => <SelectItem key={item.code} value={item.code}>{item.label}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              </div>
+            ) : null}
             <div className="space-y-2">
-              <Label>采用状态</Label>
-              <Select value={batchStatus} onValueChange={setBatchStatus}>
-                <SelectTrigger className="w-full" aria-label="批量采用状态"><SelectValue /></SelectTrigger>
+              <Label>合作状态</Label>
+              <Select value={batchCooperationStatus} onValueChange={setBatchCooperationStatus}>
+                <SelectTrigger className="w-full" aria-label="批量合作状态"><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="none">不修改</SelectItem>
-                  {statuses.map((item) => <SelectItem key={item.code} value={item.code}>{item.label}</SelectItem>)}
+                  <SelectItem value="keep">不修改</SelectItem>
+                  {cooperationStatuses
+                    .filter((item) => OPEN_COOPERATION_CODES.includes(item.code))
+                    .map((item) => (
+                      <SelectItem key={item.code} value={item.code}>{item.label}</SelectItem>
+                    ))}
                 </SelectContent>
               </Select>
+              <div className="flex flex-wrap gap-2">
+                <Button type="button" variant="outline" size="sm" onClick={() => setBatchCooperationStatus("not_contacted")}>
+                  设为未联系
+                </Button>
+                <Button type="button" variant="outline" size="sm" onClick={() => setBatchCooperationStatus("contacted")}>
+                  设为已联系
+                </Button>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                批量只更新进行中的合作，或为从未合作过的已采用达人创建首次合作。
+              </p>
             </div>
             {user?.role === "admin" ? (
               <div className="space-y-2">
@@ -1247,11 +1642,46 @@ export function CreatorsPage() {
         </AlertDialogContent>
       </AlertDialog>
 
+      <AlertDialog
+        open={pendingCooperation !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingCooperation(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>确认变更合作状态？</AlertDialogTitle>
+            <AlertDialogDescription>
+              {pendingCooperation
+                ? `将「${pendingCooperation.item.nickname || pendingCooperation.item.key}」的合作状态改为「${
+                    cooperationLabelMap.get(pendingCooperation.status) ??
+                    pendingCooperation.status
+                  }」。合作完成或已拒绝属于终止状态，确认后仍可手动调整。`
+                : ""}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                if (pendingCooperation) {
+                  cooperationMutation.mutate(pendingCooperation);
+                  setPendingCooperation(null);
+                }
+              }}
+            >
+              确认变更
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
       {detailKey && detailRoundId !== null ? (
         <CreatorSheet
           roundId={detailRoundId}
           detailKey={detailKey}
           statuses={statuses}
+          cooperationStatuses={cooperationStatuses}
           onClose={() => {
             const next = new URLSearchParams(params);
             next.delete("creator");
@@ -1274,11 +1704,13 @@ function InlineStatusSelect({
   item,
   statuses,
   pending,
+  title,
   onChange,
 }: {
   item: CreatorRow;
   statuses: { code: string; label: string }[];
   pending: boolean;
+  title?: string;
   onChange: (status: string) => void;
 }) {
   return (
@@ -1293,12 +1725,70 @@ function InlineStatusSelect({
         size="sm"
         className="h-7 w-auto max-w-[130px] border-0 bg-transparent px-0.5 shadow-none hover:bg-muted/60 focus-visible:ring-2 [&>svg]:hidden"
         aria-label={`更改 ${item.nickname || item.key} 的采用状态`}
-        title={item.owner_user_id == null ? "修改状态后将自动归你跟进" : undefined}
+        title={
+          title ??
+          (item.owner_user_id == null ? "修改状态后将自动归你跟进" : undefined)
+        }
       >
         <StatusBadge status={item.status} label={item.status_label} />
       </SelectTrigger>
       <SelectContent position="popper" align="start" sideOffset={4}>
         {statuses.map((status) => (
+          <SelectItem key={status.code} value={status.code}>
+            {status.label}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  );
+}
+
+function InlineCooperationStatusSelect({
+  item,
+  statuses,
+  pending,
+  onChange,
+}: {
+  item: CreatorRow;
+  statuses: CooperationStatusDef[];
+  pending: boolean;
+  onChange: (status: string) => void;
+}) {
+  return (
+    <Select
+      value={item.cooperation_status || undefined}
+      onValueChange={(next) => {
+        if (next && next !== item.cooperation_status) onChange(next);
+      }}
+      disabled={pending}
+    >
+      <SelectTrigger
+        size="sm"
+        className="h-7 w-auto max-w-[150px] border-0 bg-transparent px-0.5 shadow-none hover:bg-muted/60 focus-visible:ring-2 [&>svg]:hidden"
+        aria-label={`更新 ${item.nickname || item.key} 的合作状态`}
+        title={item.cooperation_updated_at ? `更新于 ${fmtDateTime(item.cooperation_updated_at)}` : undefined}
+      >
+        {item.cooperation_status ? (
+          <span className="inline-flex items-center gap-1">
+            <CooperationStatusBadge
+              status={item.cooperation_status}
+              label={item.cooperation_status_label}
+            />
+            {item.cooperation_count > 1 ? (
+              <span className="text-[11px] text-muted-foreground">
+                {item.cooperation_count} 次
+              </span>
+            ) : null}
+          </span>
+        ) : (
+          <span className="text-xs text-muted-foreground">选择状态</span>
+        )}
+      </SelectTrigger>
+      <SelectContent position="popper" align="start" sideOffset={4}>
+        {(item.cooperation_status
+          ? statuses
+          : statuses.filter((status) => !TERMINAL_COOPERATION_CODES.has(status.code))
+        ).map((status) => (
           <SelectItem key={status.code} value={status.code}>
             {status.label}
           </SelectItem>

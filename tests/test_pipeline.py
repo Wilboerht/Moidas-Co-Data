@@ -155,6 +155,33 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual([row["user_id"] for row in rows], ["u1"])
         self.assertIsNotNone(self.db.get_creator("xhs", "u2"))
 
+    def test_call_recomputes_costs_after_concurrent_writes(self) -> None:
+        round_id = self._round(1)
+        job_id = self.db.claim_job(round_id)
+        pipeline = Pipeline(self.settings, self.db)
+        pipeline._active_job_id = job_id
+        provider = SimpleNamespace(
+            client=SimpleNamespace(last_attempts=1, last_cost=45)
+        )
+        for index in range(2):
+            pipeline._call(
+                round_id,
+                "xhs",
+                "search",
+                lambda: {"code": 0, "data": []},
+                {},
+                45,
+                f"cost-{index}",
+                "/search",
+                provider_obj=provider,
+            )
+            if index == 0:
+                self.db.log_api_call(
+                    round_id, "xhs", "search", {}, None, 200, 100, 1, job_id=job_id
+                )
+        self.assertEqual(self.db.get_job(job_id)["cost"], 190)
+        self.assertEqual(self.db.get_round(round_id)["cost_tokens"], 190)
+
 
 if __name__ == "__main__":
     unittest.main()

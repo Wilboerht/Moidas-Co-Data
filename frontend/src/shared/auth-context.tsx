@@ -8,7 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { api, setCsrfToken } from "./api";
+import { ApiError, api, setCsrfToken } from "./api";
 import type { AuthUser } from "./types";
 
 type AuthContextValue = {
@@ -42,8 +42,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       } else {
         clear();
       }
-    } catch {
-      clear();
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) clear();
     }
   }, [clear]);
 

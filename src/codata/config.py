@@ -9,6 +9,11 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(os.environ.get("CODATA_ROOT") or Path(__file__).resolve().parents[2])
 
 
+def runtime_env_path() -> Path:
+    path = Path(os.getenv("CODATA_ENV_FILE", str(PROJECT_ROOT / ".env"))).expanduser()
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
 def _env_csv(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
     values = tuple(item.strip() for item in os.getenv(name, "").split(",") if item.strip())
     return values or default
@@ -48,8 +53,23 @@ class Settings:
     lead_match_enabled: bool = True
     trusted_proxies: tuple[str, ...] = ("127.0.0.1", "localhost", "::1")
     max_request_bytes: int = 5_000_000
+    attachment_max_bytes: int = 20_000_000
+    attachment_allowed_types: tuple[str, ...] = (
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "application/pdf",
+        "text/plain",
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.ms-excel",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/zip",
+    )
     audit_retention_days: int = 365
     log_retention_days: int = 90
+    raw_retention_days: int = 365
+    api_call_retention_days: int = 365
     backup_retention_days: int = 90
     backup_retention_count: int = 10
     rnote_host: str = ""
@@ -62,7 +82,11 @@ class Settings:
 
 
 def load_settings(require_credentials: bool = True) -> Settings:
-    load_dotenv(PROJECT_ROOT / ".env")
+    base_env = PROJECT_ROOT / ".env"
+    load_dotenv(base_env)
+    runtime_env = runtime_env_path()
+    if runtime_env != base_env:
+        load_dotenv(runtime_env, override=True)
 
     host = os.getenv("DATAFLOW_HOST", "").strip().rstrip("/")
     token = os.getenv("DATAFLOW_TOKEN", "").strip()
@@ -122,8 +146,28 @@ def load_settings(require_credentials: bool = True) -> Settings:
         max_request_bytes=max(
             1024, int(os.getenv("CODATA_MAX_REQUEST_BYTES", "5000000"))
         ),
+        attachment_max_bytes=max(
+            1024, int(os.getenv("CODATA_ATTACHMENT_MAX_BYTES", "20000000"))
+        ),
+        attachment_allowed_types=_env_csv(
+            "CODATA_ATTACHMENT_ALLOWED_TYPES",
+            (
+                "image/png",
+                "image/jpeg",
+                "image/webp",
+                "application/pdf",
+                "text/plain",
+                "application/msword",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "application/vnd.ms-excel",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "application/zip",
+            ),
+        ),
         audit_retention_days=max(1, int(os.getenv("CODATA_AUDIT_RETENTION_DAYS", "365"))),
         log_retention_days=max(1, int(os.getenv("CODATA_LOG_RETENTION_DAYS", "90"))),
+        raw_retention_days=max(0, int(os.getenv("CODATA_RAW_RETENTION_DAYS", "365"))),
+        api_call_retention_days=max(0, int(os.getenv("CODATA_API_CALL_RETENTION_DAYS", "365"))),
         backup_retention_days=max(0, int(os.getenv("CODATA_BACKUP_RETENTION_DAYS", "90"))),
         backup_retention_count=max(0, int(os.getenv("CODATA_BACKUP_RETENTION_COUNT", "10"))),
         rnote_host=rnote_host,

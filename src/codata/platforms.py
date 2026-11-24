@@ -308,6 +308,7 @@ def _read_config(path: Path) -> dict[str, Any]:
 def load_registry(
     settings: Settings | None = None,
     path: Path | None = None,
+    credential_overrides: dict[str, str] | None = None,
 ) -> Registry:
     settings = settings or load_settings(require_credentials=False)
     config_path = path or Path(
@@ -347,7 +348,12 @@ def load_registry(
             api_key = settings.rnote_api_key
         else:
             key_env = str(item.get("api_key_env") or "")
-            api_key = os.getenv(key_env, "").strip() if key_env else ""
+            overrides = credential_overrides or {}
+            api_key = (
+                overrides[key_env].strip()
+                if key_env in overrides
+                else os.getenv(key_env, "").strip() if key_env else ""
+            )
 
         allowed: tuple[str, ...] = ()
         if provider_id == "dataflow" and settings.dataflow_allowed_hosts:

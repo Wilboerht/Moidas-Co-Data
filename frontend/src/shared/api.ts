@@ -7,6 +7,8 @@ import type {
   Balance,
   BatchUpdatePayload,
   CreateRoundPayload,
+  CooperationCaseDetail,
+  CooperationWorkPayload,
   CreatorDetail,
   CreatorListResponse,
   CreatorQuery,
@@ -24,6 +26,7 @@ import type {
   LeadMatchResult,
   LeadOwner,
   LeadQuery,
+  LeadVerifyResult,
   Meta,
   Round,
   RoundImpact,
@@ -55,6 +58,17 @@ function detailMessage(detail: unknown): string {
   return detail == null ? "" : JSON.stringify(detail);
 }
 
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly detail?: unknown,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const method = (options.method || "GET").toUpperCase();
   const headers: Record<string, string> = {
@@ -74,13 +88,40 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
       window.dispatchEvent(new Event("codata:unauthorized"));
     }
     let message = response.statusText;
+    let detail: unknown;
+    try {
+      const payload = await response.json();
+      detail = payload.detail;
+      message = detailMessage(payload.detail) || response.statusText;
+    } catch {
+      // ignore non-JSON errors
+    }
+    throw new ApiError(message || "请求失败", response.status, detail);
+  }
+  return response.json() as Promise<T>;
+}
+
+async function uploadRequest<T>(path: string, body: FormData): Promise<T> {
+  const headers: Record<string, string> = {};
+  if (csrfToken) headers["X-CSRF-Token"] = csrfToken;
+  const response = await fetch(`${BASE}${path}`, {
+    method: "POST",
+    credentials: "same-origin",
+    headers,
+    body,
+  });
+  if (!response.ok) {
+    if (response.status === 401) {
+      window.dispatchEvent(new Event("codata:unauthorized"));
+    }
+    let message = response.statusText;
     try {
       const payload = await response.json();
       message = detailMessage(payload.detail) || response.statusText;
     } catch {
       // ignore non-JSON errors
     }
-    throw new Error(message || "请求失败");
+    throw new ApiError(message || "上传失败", response.status);
   }
   return response.json() as Promise<T>;
 }
@@ -102,12 +143,12 @@ export const api = {
       }),
     }),
   getUsers: () => request<AuthUser[]>("/users"),
-  createUser: (payload: { username: string; password: string; role: string; can_collect: boolean }) =>
+  createUser: (payload: { username: string; password: string; role: string; can_collect: boolean; can_edit_leads: boolean }) =>
     request<AuthUser>("/users", {
       method: "POST",
       body: JSON.stringify(payload),
     }),
-  updateUser: (userId: number, payload: { role?: string; disabled?: boolean; can_collect?: boolean }) =>
+  updateUser: (userId: number, payload: { role?: string; disabled?: boolean; can_collect?: boolean; can_edit_leads?: boolean }) =>
     request<AuthUser>(`/users/${userId}`, {
       method: "PATCH",
       body: JSON.stringify(payload),
@@ -164,6 +205,10 @@ export const api = {
     if (query.sources.length && query.source_mode === "all") params.set("source_mode", "all");
     if (query.labels.length) params.set("label", query.labels.join(","));
     if (query.owner) params.set("owner", query.owner);
+    if (query.cooperation.length) params.set("cooperation", query.cooperation.join(","));
+    if (query.cooperation_stale_days) {
+      params.set("cooperation_stale_days", query.cooperation_stale_days);
+    }
     if (query.min_fans) params.set("min_fans", query.min_fans);
     if (query.max_fans) params.set("max_fans", query.max_fans);
     if (query.only_unenriched) params.set("only_unenriched", "true");
@@ -199,6 +244,139 @@ export const api = {
     request<CreatorDetail>(`/rounds/${roundId}/creators/${platform}/${encodeURIComponent(userId)}`, {
       method: "PATCH",
       body: JSON.stringify(payload),
+    }),
+  updateCooperation: (
+    platform: string,
+    userId: string,
+    payload: {
+      status: string;
+      expected_status?: string;
+      expected_updated_at?: string;
+    },
+  ) =>
+    request<{
+      changed: boolean;
+      previous_status: string;
+      status: string;
+      cooperation_status: string;
+      cooperation_status_label: string;
+      cooperation_updated_at: string;
+      claimed: boolean;
+    }>(`/creators/${platform}/${encodeURIComponent(userId)}/cooperation`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
+  batchUpdateCooperation: (payload: {
+    status: string;
+    items: {
+      platform: string;
+      user_id: string;
+      expected_status?: string;
+      expected_updated_at?: string;
+    }[];
+  }) =>
+    request<{
+      changed: number;
+      conflicts: { platform: string; user_id: string; reason: string }[];
+      claimed: number;
+    }>("/creators/cooperation/batch", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  getCooperationCase: (caseId: number) =>
+    request<CooperationCaseDetail>(`/cooperation-cases/${caseId}`),
+  createCooperationCase: (payload: {
+    platform: string;
+    user_id: string;
+    status?: string;
+    note?: string;
+  }) =>
+    request<CooperationCaseDetail>("/cooperation-cases", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  updateCooperationCaseStatus: (
+    caseId: number,
+    payload: {
+      status: string;
+      note?: string;
+      expected_updated_at?: string;
+    },
+  ) =>
+    request<CooperationCaseDetail>(`/cooperation-cases/${caseId}/status`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  completeCooperationCase: (
+    caseId: number,
+    payload: {
+      note?: string;
+      expected_updated_at?: string;
+      works: CooperationWorkPayload[];
+    },
+  ) =>
+    request<CooperationCaseDetail>(`/cooperation-cases/${caseId}/complete`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  addCooperationNote: (caseId: number, note: string) =>
+    request<CooperationCaseDetail>(`/cooperation-cases/${caseId}/notes`, {
+      method: "POST",
+      body: JSON.stringify({ note }),
+    }),
+  updateCooperationCaseSummary: (
+    caseId: number,
+    summary: string,
+    expectedUpdatedAt?: string,
+  ) =>
+    request<CooperationCaseDetail>(`/cooperation-cases/${caseId}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        summary,
+        expected_updated_at: expectedUpdatedAt,
+      }),
+    }),
+  correctCooperationCaseStatus: (
+    caseId: number,
+    payload: { status: string; note: string },
+  ) =>
+    request<CooperationCaseDetail>(`/cooperation-cases/${caseId}/correct`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  uploadCooperationAttachment: (
+    caseId: number,
+    file: File,
+    category: string,
+    description: string,
+  ) => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("category", category);
+    form.append("description", description);
+    return uploadRequest<CooperationCaseDetail>(
+      `/cooperation-cases/${caseId}/attachments`,
+      form,
+    );
+  },
+  deleteCooperationAttachment: (attachmentId: number) =>
+    request<CooperationCaseDetail>(
+      `/cooperation-attachments/${attachmentId}`,
+      { method: "DELETE" },
+    ),
+  addCooperationWork: (caseId: number, payload: CooperationWorkPayload) =>
+    request<CooperationCaseDetail>(`/cooperation-cases/${caseId}/works`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  updateCooperationWork: (workId: number, payload: CooperationWorkPayload) =>
+    request<CooperationCaseDetail>(`/cooperation-works/${workId}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
+  deleteCooperationWork: (workId: number) =>
+    request<CooperationCaseDetail>(`/cooperation-works/${workId}`, {
+      method: "DELETE",
     }),
   batchUpdate: (roundId: number, payload: BatchUpdatePayload) =>
     request<{
@@ -249,6 +427,7 @@ export const api = {
     platform: string;
     nickname: string;
     account_id: string;
+    platform_handle: string;
     profile_url: string;
     raw_title: string;
     source: string;
@@ -264,6 +443,7 @@ export const api = {
     platform: string;
     nickname: string;
     account_id: string;
+    platform_handle: string;
     profile_url: string;
     raw_title: string;
     source: string;
@@ -299,9 +479,31 @@ export const api = {
     }),
   convertLead: (
     leadId: number,
-    payload: { account_id: string; profile_url: string; fetch: boolean; provider?: string },
+    payload: {
+      account_id: string;
+      platform_handle: string;
+      profile_url: string;
+      fetch: boolean;
+      provider?: string;
+      confirm_mismatch?: boolean;
+    },
   ) =>
     request<{ lead: Lead; creator: unknown; rounds: number[] }>(`/leads/${leadId}/convert`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  verifyLead: (
+    leadId: number,
+    payload: {
+      provider?: string;
+      account_id?: string;
+      platform_handle?: string;
+      profile_url?: string;
+      apply?: boolean;
+      confirm_mismatch?: boolean;
+    },
+  ) =>
+    request<LeadVerifyResult>(`/leads/${leadId}/verify`, {
       method: "POST",
       body: JSON.stringify(payload),
     }),
@@ -329,10 +531,15 @@ export const api = {
     request<{ ok: boolean }>(`/keywords/${id}`, { method: "DELETE" }),
   getDashboard: (roundId: number | null) =>
     request<DashboardData>(`/dashboard${roundId == null ? "" : `?round_id=${roundId}`}`),
-  getActivityCalendar: (days = 365, tzOffset = -new Date().getTimezoneOffset()) =>
-    request<ActivityCalendarResponse>(
-      `/dashboard/activity?days=${days}&tz_offset=${tzOffset}`,
-    ),
+  getActivityCalendar: (
+    days = 365,
+    tzOffset = -new Date().getTimezoneOffset(),
+    roundId: number | null = null,
+  ) => {
+    const params = new URLSearchParams({ days: String(days), tz_offset: String(tzOffset) });
+    if (roundId !== null) params.set("round_id", String(roundId));
+    return request<ActivityCalendarResponse>(`/dashboard/activity?${params.toString()}`);
+  },
   getCounts: () => request<Counts>("/counts"),
   getActionQueue: (params: {
     roundId: number | null;
@@ -366,7 +573,7 @@ export const api = {
       `/settings/providers/${encodeURIComponent(providerId)}/token`,
       {
         method: "PUT",
-        body: JSON.stringify({ token, verify: false }),
+        body: JSON.stringify({ token, verify: true }),
       },
     ),
   getBalance: (provider = "dataflow") =>
@@ -391,14 +598,16 @@ export async function downloadFile(url: string, fallbackName: string): Promise<v
   const disposition = response.headers.get("content-disposition") || "";
   const match = /filename="?([^";]+)"?/i.exec(disposition);
   const name = match?.[1] || fallbackName;
-  if (response.body) await response.body.cancel();
+  const blob = await response.blob();
+  const objectUrl = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
-  anchor.href = url;
+  anchor.href = objectUrl;
   anchor.download = name;
   anchor.rel = "noopener";
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
 }
 
 export function exportUrl(
@@ -421,6 +630,10 @@ export function exportUrl(
     if (query.sources.length && query.source_mode === "all") params.set("source_mode", "all");
     if (query.labels.length) params.set("label", query.labels.join(","));
     if (query.owner) params.set("owner", query.owner);
+    if (query.cooperation.length) params.set("cooperation", query.cooperation.join(","));
+    if (query.cooperation_stale_days) {
+      params.set("cooperation_stale_days", query.cooperation_stale_days);
+    }
     if (query.min_fans) params.set("min_fans", query.min_fans);
     if (query.max_fans) params.set("max_fans", query.max_fans);
     if (query.only_unenriched) params.set("only_unenriched", "true");

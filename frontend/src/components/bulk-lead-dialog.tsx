@@ -37,6 +37,7 @@ type ParsedLead = {
   platform: string;
   nickname: string;
   account_id: string;
+  platform_handle: string;
   profile_url: string;
   raw_title: string;
 };
@@ -54,35 +55,70 @@ type BulkResult = {
 const HEADER_TOKENS = new Set([
   "平台", "platform",
   "昵称", "nickname",
-  "账号", "账号id", "account", "accountid",
+  "账号", "账号id", "account", "accountid", "平台账号",
+  "用户id", "平台用户id", "userid", "user_id", "platformuserid",
   "主页", "主页url", "profile", "profileurl", "链接", "url",
   "原始标题", "标题", "rawtitle", "title",
 ]);
 
-function splitRow(line: string) {
-  if (line.includes("\t")) {
-    return line.split("\t").map((cell) => cell.trim());
-  }
-  const cells: string[] = [];
+type DelimitedRow = { cells: string[]; line: number; raw: string };
+
+function readDelimitedRows(text: string): DelimitedRow[] {
+  const rows: DelimitedRow[] = [];
+  const delimiter = text.includes("\t") ? "\t" : ",";
+  let cells: string[] = [];
   let cell = "";
   let quoted = false;
-  for (const char of line) {
-    if (char === '"') {
-      quoted = !quoted;
-      continue;
-    }
-    if (char === "," && !quoted) {
-      cells.push(cell);
+  let line = 1;
+  let rowLine = 1;
+  let rowStart = 0;
+  const finishRow = (end: number, next: number) => {
+    cells.push(cell.trim());
+    const raw = text.slice(rowStart, end).trim();
+    if (raw) rows.push({ cells, line: rowLine, raw });
+    cells = [];
+    cell = "";
+    rowStart = next;
+    rowLine = line;
+  };
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (quoted) {
+      if (char === '"' && text[index + 1] === '"') {
+        cell += '"';
+        index += 1;
+      } else if (char === '"') {
+        quoted = false;
+      } else {
+        if (char === "\n") line += 1;
+        cell += char;
+      }
+    } else if (char === '"' && cell.trim() === "") {
+      quoted = true;
       cell = "";
-      continue;
+    } else if (char === delimiter) {
+      cells.push(cell.trim());
+      cell = "";
+    } else if (char === "\n" || char === "\r") {
+      const next = char === "\r" && text[index + 1] === "\n" ? index + 2 : index + 1;
+      line += 1;
+      finishRow(index, next);
+      index = next - 1;
+    } else {
+      cell += char;
     }
-    cell += char;
   }
-  cells.push(cell);
-  return cells.map((item) => item.trim());
+  if (cell || cells.length || text.slice(rowStart).trim()) finishRow(text.length, text.length);
+  return rows;
 }
 
-type LeadColumn = "platform" | "nickname" | "account_id" | "profile_url" | "raw_title";
+type LeadColumn =
+  | "platform"
+  | "nickname"
+  | "account_id"
+  | "platform_handle"
+  | "profile_url"
+  | "raw_title";
 type HeaderMap = Partial<Record<LeadColumn, number>>;
 
 const COLUMN_ALIASES: Record<string, LeadColumn> = {
@@ -90,10 +126,16 @@ const COLUMN_ALIASES: Record<string, LeadColumn> = {
   平台: "platform",
   nickname: "nickname",
   昵称: "nickname",
-  account: "account_id",
-  accountid: "account_id",
-  账号: "account_id",
-  账号id: "account_id",
+  account: "platform_handle",
+  accountid: "platform_handle",
+  账号: "platform_handle",
+  账号id: "platform_handle",
+  平台账号: "platform_handle",
+  userid: "account_id",
+  user_id: "account_id",
+  用户id: "account_id",
+  平台用户id: "account_id",
+  platformuserid: "account_id",
   profile: "profile_url",
   profileurl: "profile_url",
   主页: "profile_url",
@@ -113,7 +155,7 @@ function headerKey(value: string) {
     .replace(/[\s_-]+/g, "");
 }
 
-function parseLeadText(
+export function parseLeadText(
   text: string,
   platforms: { code: string; label: string }[],
   defaultPlatform: string,
@@ -128,11 +170,9 @@ function parseLeadText(
   let headers = 0;
   let headerMap: HeaderMap | null = null;
 
-  text.split(/\r?\n/).forEach((raw, index) => {
+  readDelimitedRows(text).forEach(({ raw, line, cells }) => {
     const trimmed = raw.trim();
     if (!trimmed || trimmed.startsWith("#")) return;
-    const line = index + 1;
-    const cells = splitRow(trimmed);
     const urlIndex = cells.findIndex((cell) => /^https?:\/\//i.test(cell));
     const isHeader =
       urlIndex < 0 && cells.some((cell) => HEADER_TOKENS.has(headerKey(cell)));
@@ -153,13 +193,18 @@ function parseLeadText(
         return cellIndex === undefined ? "" : (cells[cellIndex] ?? "").trim();
       };
       const platformCell = value("platform").toLowerCase();
-      const platform = aliases.get(platformCell) ?? defaultPlatform;
+      if (platformCell && !aliases.has(platformCell)) {
+        invalid.push({ line, raw: trimmed, reason: `未知平台：${value("platform")}` });
+        return;
+      }
+      const platform = platformCell ? aliases.get(platformCell)! : defaultPlatform;
       const nickname = value("nickname");
       const accountId = value("account_id");
+      const platformHandle = value("platform_handle");
       const profileUrl = value("profile_url");
       const rawTitle = value("raw_title");
-      if (!nickname && !accountId && !profileUrl) {
-        invalid.push({ line, raw: trimmed, reason: "缺少昵称、账号 ID 或主页 URL" });
+      if (!nickname && !accountId && !platformHandle && !profileUrl) {
+        invalid.push({ line, raw: trimmed, reason: "缺少昵称、账号或主页 URL" });
         return;
       }
       items.push({
@@ -168,6 +213,7 @@ function parseLeadText(
         platform,
         nickname,
         account_id: accountId,
+        platform_handle: platformHandle,
         profile_url: profileUrl,
         raw_title: rawTitle,
       });
@@ -182,10 +228,10 @@ function parseLeadText(
       platform = alias;
       fields = rest.slice(1);
     }
-    const [nickname = "", accountId = "", rawTitle = ""] = fields;
+    const [nickname = "", platformHandle = "", rawTitle = ""] = fields;
     const profileUrl = urlIndex >= 0 ? cells[urlIndex] : "";
-    if (!nickname.trim() && !accountId.trim() && !profileUrl.trim()) {
-      invalid.push({ line, raw: trimmed, reason: "缺少昵称、账号 ID 或主页 URL" });
+    if (!nickname.trim() && !platformHandle.trim() && !profileUrl.trim()) {
+      invalid.push({ line, raw: trimmed, reason: "缺少昵称、账号或主页 URL" });
       return;
     }
     items.push({
@@ -193,7 +239,8 @@ function parseLeadText(
       raw: trimmed,
       platform,
       nickname: nickname.trim(),
-      account_id: accountId.trim(),
+      account_id: "",
+      platform_handle: platformHandle.trim(),
       profile_url: profileUrl.trim(),
       raw_title: rawTitle.trim(),
     });
@@ -244,6 +291,7 @@ export function BulkLeadDialog({
         platform: item.platform,
         nickname: item.nickname,
         account_id: item.account_id,
+        platform_handle: item.platform_handle,
         profile_url: item.profile_url,
         raw_title: item.raw_title,
         source,
@@ -343,9 +391,9 @@ export function BulkLeadDialog({
             <DialogDescription>
               每行一条：纯主页 URL，或{" "}
               <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs">
-                平台,昵称,账号ID,主页URL,原始标题
+                平台,昵称,账号,主页URL,原始标题
               </code>
-              。支持从 CSV / TXT 导入，表头行会自动跳过。
+              。账号填小红书号/微博号等平台账号；如已有平台用户 ID，可加一列表头写「用户ID」。支持从 CSV / TXT 导入，表头行会自动跳过。
             </DialogDescription>
           </DialogHeader>
 
@@ -369,16 +417,18 @@ export function BulkLeadDialog({
                   </SelectContent>
                 </Select>
               </div>
-              <div className="space-y-2">
-                <Label htmlFor="bulk-round">来源轮次</Label>
-                <Select value={roundId} onValueChange={setRoundId} disabled={mutation.isPending}>
-                  <SelectTrigger id="bulk-round" className="w-full"><SelectValue placeholder="不关联" /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="none">不关联</SelectItem>
-                    {rounds.map((item) => <SelectItem key={item.id} value={String(item.id)}>{item.name}</SelectItem>)}
-                  </SelectContent>
-                </Select>
-              </div>
+              {rounds.length > 0 ? (
+                <div className="space-y-2">
+                  <Label htmlFor="bulk-round">来源轮次</Label>
+                  <Select value={roundId} onValueChange={setRoundId} disabled={mutation.isPending}>
+                    <SelectTrigger id="bulk-round" className="w-full"><SelectValue placeholder="不关联" /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="none">不关联</SelectItem>
+                      {rounds.map((item) => <SelectItem key={item.id} value={String(item.id)}>{item.name}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
+                </div>
+              ) : null}
             </div>
 
             {result && result.failures.length > 0 ? (
@@ -413,9 +463,18 @@ export function BulkLeadDialog({
                 onChange={async (event) => {
                   const file = event.target.files?.[0];
                   if (!file) return;
-                  setFileName(file.name);
-                  setText(await file.text());
-                  setResult(null);
+                  if (file.size > 4_500_000) {
+                    event.target.value = "";
+                    toast.error("文件不能超过 4.5 MB，请拆分后导入");
+                    return;
+                  }
+                  try {
+                    setFileName(file.name);
+                    setText(await file.text());
+                    setResult(null);
+                  } catch {
+                    toast.error("文件读取失败，请重新选择 CSV 或 TXT 文件");
+                  }
                 }}
               />
               <Button
@@ -451,12 +510,12 @@ export function BulkLeadDialog({
                     if (parsed.items.length > 0 && !mutation.isPending) mutation.mutate();
                   }
                 }}
-                placeholder={"https://www.xiaohongshu.com/user/profile/xxxx\nxhs,昵称,账号ID,https://...,原始标题"}
+                placeholder={"https://www.xiaohongshu.com/user/profile/xxxx\nxhs,昵称,小红书号,https://…,原始标题"}
               />
               {parsed.invalid.length > 0 ? (
                 <p className="text-xs text-amber-600">
                   第 {parsed.invalid.slice(0, 3).map((item) => item.line).join("、")} 行
-                  {parsed.invalid.length > 3 ? " 等" : ""}缺少昵称、账号 ID 或主页 URL，将被跳过。
+                  {parsed.invalid.length > 3 ? " 等" : ""}缺少昵称、账号或主页 URL，将被跳过。
                 </p>
               ) : null}
             </div>

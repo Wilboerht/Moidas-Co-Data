@@ -1,18 +1,25 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import hmac
 import json
+import mimetypes
 import sqlite3
 import os
 import re
 import tempfile
+import threading
+import uuid
+import zipfile
+from contextvars import ContextVar
 from dataclasses import replace
+from functools import wraps
 from pathlib import Path
 from typing import Annotated, Any, Generator, Iterable
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
@@ -45,7 +52,14 @@ from .auth import (
     verify_password,
 )
 from .client import DataFlowClient, RnoteClient
-from .config import PROJECT_ROOT, Settings, load_settings
+from .config import PROJECT_ROOT, Settings, load_settings, runtime_env_path
+from .cooperation_statuses import (
+    COOPERATION_OPEN_CODES,
+    COOPERATION_STATUS_CODES,
+    COOPERATION_STATUS_DEFS,
+    COOPERATION_STATUS_LABELS,
+    normalize_cooperation_status,
+)
 from .db import Database, JobBusyError, SCHEMA_VERSION
 from .normalize import (
     as_optional_int,
@@ -58,6 +72,8 @@ from .providers import build_provider
 from .panel.queries import EXPORT_COLUMNS, JOB_STATUS_LABELS, PLATFORM_LABELS, ROUND_STATUS_LABELS
 from .panel.runner import start_round_job, terminate_job_process
 from .lead_statuses import (
+    LEAD_IDENTITY_DEFS,
+    LEAD_IDENTITY_LABELS,
     LEAD_SOURCE_CODES,
     LEAD_SOURCE_LABELS,
     LEAD_STATUS_CODES,
@@ -66,17 +82,41 @@ from .lead_statuses import (
     normalize_lead_source,
     normalize_lead_status,
 )
+from .lead_identity import LeadIdentityMismatch, verify_lead_identity
 from .leads import convert_lead
 from .matching import match_lead_against_creators
 from .statuses import STATUS_CODES, STATUS_DEFS, STATUS_LABELS, normalize_status
 from .storage import unwrap_data
 
 settings = load_settings(require_credentials=False)
-ENV_PATH = PROJECT_ROOT / ".env"
+ENV_PATH = runtime_env_path()
 FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
+settings_update_lock = threading.Lock()
+
+
+def serialized_settings_update(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        with settings_update_lock:
+            return fn(*args, **kwargs)
+
+    return wrapped
 
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 PUBLIC_API_PATHS = {"/api/health", "/api/auth/login", "/api/auth/me"}
+_ROUND_NAMES_VISIBLE: ContextVar[bool] = ContextVar(
+    "codata_round_names_visible", default=True
+)
+
+
+def _round_names_visible() -> bool:
+    return _ROUND_NAMES_VISIBLE.get()
+
+
+def _set_round_names_visibility(user: dict[str, Any] | None) -> None:
+    _ROUND_NAMES_VISIBLE.set(
+        bool(user and (user.get("role") == "admin" or user.get("can_collect")))
+    )
 login_limiter = LoginRateLimiter(
     max_attempts=settings.max_login_attempts,
     window_seconds=settings.login_window_minutes * 60,
@@ -110,7 +150,11 @@ class RequestSizeMiddleware(BaseHTTPMiddleware):
         raw = request.headers.get("content-length")
         if raw:
             try:
-                if int(raw) > settings.max_request_bytes:
+                limit = settings.max_request_bytes
+                path = request.url.path
+                if path.startswith("/api/cooperation-cases/") and path.endswith("/attachments"):
+                    limit = settings.attachment_max_bytes + 1_000_000
+                if int(raw) > limit:
                     return JSONResponse({"detail": "请求体过大"}, status_code=413)
             except ValueError:
                 return JSONResponse({"detail": "无效的 Content-Length"}, status_code=400)
@@ -137,28 +181,29 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if not token:
             return JSONResponse({"detail": "请先登录"}, status_code=401)
 
-        def load_session() -> dict[str, Any] | None:
-            db = Database(settings.output_dir)
-            try:
-                return db.get_session(hash_session_token(token))
-            finally:
-                db.close()
-
-        session = await run_in_threadpool(load_session)
-        if not session:
-            return JSONResponse({"detail": "登录已失效，请重新登录"}, status_code=401)
-        if request.method not in SAFE_METHODS:
-            csrf = request.headers.get(CSRF_HEADER)
-            if not csrf or not hmac.compare_digest(csrf, session["session"]["csrf_token"]):
-                return JSONResponse({"detail": "CSRF 校验失败"}, status_code=403)
-        if (
-            session["user"].get("must_change_password")
-            and path not in {"/api/auth/change-password", "/api/auth/logout"}
-        ):
-            return JSONResponse({"detail": "请先修改初始密码"}, status_code=403)
-        request.state.user = session["user"]
-        request.state.session = session["session"]
-        return await call_next(request)
+        db = Database(settings.output_dir)
+        request.state.auth_db = db
+        try:
+            session = await run_in_threadpool(
+                db.get_session, hash_session_token(token)
+            )
+            if not session:
+                return JSONResponse({"detail": "登录已失效，请重新登录"}, status_code=401)
+            if request.method not in SAFE_METHODS:
+                csrf = request.headers.get(CSRF_HEADER)
+                if not csrf or not hmac.compare_digest(csrf, session["session"]["csrf_token"]):
+                    return JSONResponse({"detail": "CSRF 校验失败"}, status_code=403)
+            if (
+                session["user"].get("must_change_password")
+                and path not in {"/api/auth/change-password", "/api/auth/logout"}
+            ):
+                return JSONResponse({"detail": "请先修改初始密码"}, status_code=403)
+            request.state.user = session["user"]
+            request.state.session = session["session"]
+            _set_round_names_visibility(session["user"])
+            return await call_next(request)
+        finally:
+            db.close()
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -213,6 +258,9 @@ def reconcile_jobs_on_startup() -> None:
     with Database(settings.output_dir) as db:
         db.reconcile_stale_jobs(settings.job_stale_minutes)
         db.prune_maintenance(settings.audit_retention_days)
+        db.prune_raw_and_calls(
+            settings.raw_retention_days, settings.api_call_retention_days
+        )
         db.prune_backups(
             settings.backup_retention_days,
             settings.backup_retention_count,
@@ -220,7 +268,11 @@ def reconcile_jobs_on_startup() -> None:
         )
 
 
-def get_db() -> Generator[Database, None, None]:
+def get_db(request: Request) -> Generator[Database, None, None]:
+    existing = getattr(request.state, "auth_db", None)
+    if existing is not None:
+        yield existing
+        return
     db = Database(settings.output_dir)
     try:
         yield db
@@ -239,6 +291,8 @@ EXPORT_FIELDS = {
     "粉丝层级": "fans_tier",
     "数据轮次": "data_round",
     "采用状态": "status_label",
+    "合作状态": "cooperation_status_label",
+    "合作更新时间": "cooperation_updated_at",
     "匹配方向": "match_direction",
     "备注": "remark",
     "笔记数": "posted",
@@ -253,6 +307,8 @@ EXPORT_FIELDS = {
     "平台": "platform_label",
     "负责人": "owner_username",
     "合作主平台": "cooperation_platform",
+    "合作次数": "cooperation_count",
+    "最近完成合作": "cooperation_last_completed_at",
     "原始标题": "raw_title",
     "样本笔记": "sample_notes",
     "样本点赞": "sample_likes",
@@ -284,6 +340,18 @@ def _export_value(item: dict[str, Any], header: str) -> Any:
     if key in ("fans", "posted", "liked", "interaction") and value is None:
         value = ""
     return _safe_cell(value)
+
+
+def _creator_export_columns(actor: dict[str, Any]) -> list[str]:
+    if actor.get("role") == "admin" or actor.get("can_collect"):
+        return list(EXPORT_COLUMNS)
+    return [column for column in EXPORT_COLUMNS if column != "数据轮次"]
+
+
+def _lead_export_columns(actor: dict[str, Any]) -> list[str]:
+    if actor.get("role") == "admin" or actor.get("can_collect"):
+        return list(LEAD_EXPORT_COLUMNS)
+    return [column for column in LEAD_EXPORT_COLUMNS if column not in ("来源轮次", "匹配轮次")]
 
 
 def _iter_export_items(
@@ -349,6 +417,8 @@ def _round_dict(row: dict[str, Any]) -> dict[str, Any]:
     payload["archived"] = bool(row.get("archived_at"))
     if payload["archived"]:
         payload["status_label"] = "已归档"
+    if not _round_names_visible():
+        payload["name"] = ""
     return payload
 
 
@@ -365,13 +435,150 @@ def _round_payload(db: Database, round_id: int) -> dict[str, Any]:
     row = db.get_round(round_id)
     if not row:
         raise HTTPException(404, "轮次不存在")
-    keywords = db.get_round_keywords(round_id)
+    keywords = db.get_round_keywords(round_id, include_disabled=True)
     payload = _round_dict(row)
     payload["keywords"] = "、".join(item["word"] for item in keywords)
     payload["keyword_details"] = keywords
     payload["summary"] = db.round_summary(round_id)
     payload["job"] = _job_dict(db.latest_job(round_id))
+    if not _round_names_visible():
+        payload["keywords"] = ""
+        payload["keyword_details"] = []
+        payload["summary"] = {}
+        payload["job"] = None
     return payload
+
+
+def _cooperation_label(value: Any) -> str:
+    code = normalize_cooperation_status(value, default="")
+    if not code:
+        return "未进入"
+    return COOPERATION_STATUS_LABELS.get(code, code)
+
+
+COOPERATION_ATTACHMENT_CATEGORIES = {
+    "contract": "合同/协议",
+    "quote": "报价/沟通",
+    "screenshot": "截图",
+    "settlement": "结算凭证",
+    "other": "其他",
+}
+
+
+def _case_dict(row: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(row)
+    status = normalize_cooperation_status(payload.get("status"), default="")
+    payload["status"] = status
+    payload["status_label"] = COOPERATION_STATUS_LABELS.get(status, status)
+    payload["active"] = status in COOPERATION_OPEN_CODES
+    return payload
+
+
+def _case_event_dict(row: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(row)
+    payload["from_status_label"] = _cooperation_label(
+        payload.get("status_from") or ""
+    )
+    payload["to_status_label"] = _cooperation_label(payload.get("status_to") or "")
+    return payload
+
+
+def _attachment_dict(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "case_id": int(row["case_id"]),
+        "event_id": row.get("event_id"),
+        "original_name": row.get("original_name") or "",
+        "content_type": row.get("content_type") or "",
+        "size_bytes": int(row.get("size_bytes") or 0),
+        "sha256": row.get("sha256") or "",
+        "category": row.get("category") or "other",
+        "category_label": COOPERATION_ATTACHMENT_CATEGORIES.get(
+            row.get("category") or "other", "其他"
+        ),
+        "description": row.get("description") or "",
+        "uploaded_by": row.get("uploaded_by"),
+        "uploaded_by_username": row.get("uploaded_by_username") or "",
+        "created_at": row.get("created_at") or "",
+        "download_url": f"/api/cooperation-attachments/{int(row['id'])}",
+    }
+
+
+def _work_dict(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "case_id": int(row["case_id"]),
+        "platform": row.get("platform") or "",
+        "url": row.get("url") or "",
+        "title": row.get("title") or "",
+        "published_at": row.get("published_at") or "",
+        "note": row.get("note") or "",
+        "created_by": row.get("created_by"),
+        "created_by_username": row.get("created_by_username") or "",
+        "created_at": row.get("created_at") or "",
+        "updated_at": row.get("updated_at") or "",
+    }
+
+
+def _cooperation_case_payload(db: Database, case_id: int) -> dict[str, Any]:
+    detail = db.cooperation_case_detail(int(case_id))
+    if not detail:
+        raise HTTPException(404, "合作记录不存在")
+    case = _case_dict(detail["case"])
+    case["summary_info"] = detail["summary"]
+    creator_platform = case["platform"]
+    creator_user_id = case["user_id"]
+    creator = db.get_creator(creator_platform, creator_user_id) or {}
+    case["creator"] = {
+        "platform": creator_platform,
+        "user_id": creator_user_id,
+        "nickname": creator.get("nickname") or "",
+        "avatar": creator.get("avatar") or "",
+        "follow_up_user_id": creator.get("follow_up_user_id"),
+    }
+    return {
+        "case": case,
+        "summary": detail["summary"],
+        "events": [_case_event_dict(item) for item in detail["events"]],
+        "attachments": [
+            _attachment_dict(item) for item in detail["attachments"]
+        ],
+        "works": [_work_dict(item) for item in detail["works"]],
+    }
+
+
+def _validate_work_payload(work: Any) -> dict[str, Any]:
+    if not isinstance(work, dict):
+        raise HTTPException(400, "作品数据格式错误")
+    url = str(work.get("url") or "").strip()
+    if not re.match(r"^https?://", url, re.IGNORECASE):
+        raise HTTPException(400, "作品链接必须是 http/https 地址")
+    if len(url) > 2000:
+        raise HTTPException(400, "作品链接过长")
+    title = str(work.get("title") or "").strip()
+    note = str(work.get("note") or "").strip()
+    if len(title) > 500 or len(note) > 2000:
+        raise HTTPException(400, "作品标题或备注过长")
+    return {
+        "platform": str(work.get("platform") or "").strip()[:40],
+        "url": url,
+        "title": title,
+        "published_at": str(work.get("published_at") or "").strip()[:40] or None,
+        "note": note,
+    }
+
+
+def _attachment_root() -> Path:
+    return settings.output_dir / "cooperation_attachments"
+
+
+def _case_actor(request: Request) -> dict[str, Any]:
+    return require_user(request)
+
+
+def _case_error(exc: ValueError, *, conflict: bool = True) -> HTTPException:
+    message = str(exc)
+    return HTTPException(409 if conflict else 400, message)
 
 
 def _creator_dict(row: dict[str, Any]) -> dict[str, Any]:
@@ -387,7 +594,11 @@ def _creator_dict(row: dict[str, Any]) -> dict[str, Any]:
         account_id = "" if str(user_id).startswith("import:") else user_id
     tier_label = normalize_tier_label(fans, row.get("tier_label")) or "—"
     data_round = row.get("data_round") or row.get("round_name") or ""
-    return {
+    row_status = normalize_status(row.get("status"))
+    cooperation_status = normalize_cooperation_status(
+        row.get("cooperation_status"), default=""
+    )
+    payload = {
         "key": f"{row['platform']}|{row['user_id']}",
         "round_id": row.get("round_id"),
         "platform": row["platform"],
@@ -403,15 +614,21 @@ def _creator_dict(row: dict[str, Any]) -> dict[str, Any]:
         "fans_tier": tier_label,
         "round_name": row.get("round_name") or "",
         "data_round": data_round,
-        "status": normalize_status(row.get("status")),
-        "status_label": STATUS_LABELS.get(normalize_status(row.get("status")), normalize_status(row.get("status"))),
+        "status": row_status,
+        "status_label": STATUS_LABELS.get(row_status, row_status),
         "round_status": normalize_status(row.get("round_status") or row.get("status")),
         "round_status_label": STATUS_LABELS.get(
             normalize_status(row.get("round_status") or row.get("status")),
             normalize_status(row.get("round_status") or row.get("status")),
         ),
-        "cooperation_status": normalize_status(row.get("cooperation_status") or row.get("status")),
+        "cooperation_status": cooperation_status,
+        "cooperation_status_label": (
+            _cooperation_label(cooperation_status) if cooperation_status else ""
+        ),
         "cooperation_updated_at": row.get("cooperation_updated_at") or "",
+        "cooperation_count": int(row.get("cooperation_count") or 0),
+        "cooperation_last_completed_at": row.get("cooperation_last_completed_at") or "",
+        "cooperation_case_id": row.get("cooperation_case_id"),
         "updated_at": row.get("updated_at") or "",
         "enrichment_status": row.get("enrichment_status") or "not_fetched",
         "match_direction": row.get("match_direction") or "",
@@ -445,11 +662,15 @@ def _creator_dict(row: dict[str, Any]) -> dict[str, Any]:
         "verify_info": row.get("verify_info") or "",
         "fetched_at": row.get("fetched_at") or "",
     }
+    if not _round_names_visible():
+        payload["round_name"] = ""
+        payload["data_round"] = ""
+    return payload
 
 
 def _queue_item(row: dict[str, Any]) -> dict[str, Any]:
     status = normalize_status(row.get("status"))
-    return {
+    payload = {
         "key": f"{row['platform']}|{row['user_id']}",
         "round_id": int(row["round_id"]),
         "round_name": row.get("round_name") or "",
@@ -472,26 +693,43 @@ def _queue_item(row: dict[str, Any]) -> dict[str, Any]:
         "source_keywords": [str(item) for item in _json_list(row.get("source_keywords"))],
         "updated_at": row.get("updated_at") or "",
     }
+    if not _round_names_visible():
+        payload["round_name"] = ""
+    return payload
 
 
 def _efficiency_item(row: dict[str, Any]) -> dict[str, Any]:
     platform = str(row.get("platform") or "xhs")
     status = str(row.get("status") or "")
-    return {
+    payload = {
         **row,
         "platform_label": PLATFORM_LABELS.get(platform, platform),
         "status_label": ROUND_STATUS_LABELS.get(status, status),
     }
+    if not _round_names_visible():
+        payload["name"] = ""
+        payload.pop("cost", None)
+    return payload
 
 
 def _lead_dict(row: dict[str, Any]) -> dict[str, Any]:
     status = normalize_lead_status(row.get("status"))
-    return {
+    payload = {
         "id": int(row["id"]),
         "platform": row.get("platform") or "xhs",
         "platform_label": PLATFORM_LABELS.get(row.get("platform") or "xhs", row.get("platform") or "xhs"),
         "nickname": row.get("nickname") or "",
         "account_id": row.get("account_id") or "",
+        "platform_handle": row.get("platform_handle") or "",
+        "identity_status": row.get("identity_status") or "unverified",
+        "identity_status_label": LEAD_IDENTITY_LABELS.get(
+            row.get("identity_status") or "unverified",
+            row.get("identity_status") or "unverified",
+        ),
+        "identity_confidence": row.get("identity_confidence") or "",
+        "identity_provider": row.get("identity_provider") or "",
+        "identity_checked_at": row.get("identity_checked_at"),
+        "identity_note": row.get("identity_note") or "",
         "profile_url": row.get("profile_url") or "",
         "raw_title": row.get("raw_title") or "",
         "source": row.get("source") or "",
@@ -516,6 +754,14 @@ def _lead_dict(row: dict[str, Any]) -> dict[str, Any]:
         "matched_at": row.get("matched_at"),
         "match_confidence": row.get("match_confidence") or "",
     }
+    if not _round_names_visible():
+        payload["source_round_name"] = ""
+        payload["matched_round_name"] = ""
+        if payload["match_confidence"] == "round_account_id":
+            payload["match_confidence"] = "auto"
+        if payload["identity_confidence"] == "round_account_id":
+            payload["identity_confidence"] = "auto"
+    return payload
 
 
 def _lead_detail(db: Database, lead_id: int) -> dict[str, Any]:
@@ -524,8 +770,20 @@ def _lead_detail(db: Database, lead_id: int) -> dict[str, Any]:
         raise HTTPException(404, "线索不存在")
     payload = _lead_dict(lead)
     payload["raw_json"] = _safe_json_object(lead.get("raw_json"))
-    payload["rounds"] = db.lead_rounds(lead_id)
-    payload["attempts"] = db.lead_attempts(lead_id)
+    rounds = db.lead_rounds(lead_id)
+    attempts = db.lead_attempts(lead_id)
+    identity_events = db.lead_identity_events(lead_id)
+    if not _round_names_visible():
+        for item in rounds:
+            item["round_name"] = ""
+            if "data_round" in item:
+                item["data_round"] = ""
+        for item in (*attempts, *identity_events):
+            if item.get("confidence") == "round_account_id":
+                item["confidence"] = "auto"
+    payload["rounds"] = rounds
+    payload["attempts"] = attempts
+    payload["identity_events"] = identity_events
     matched_platform = str(lead.get("matched_platform") or "")
     matched_user_id = str(lead.get("matched_user_id") or "")
     if matched_platform and matched_user_id:
@@ -562,8 +820,8 @@ def _validate_owner(db: Database, owner_user_id: int | None) -> None:
     user = db.get_user(int(owner_user_id))
     if not user or user.get("disabled"):
         raise HTTPException(400, "负责人不存在或已禁用")
-    if user.get("role") != "admin" and not user.get("can_collect"):
-        raise HTTPException(400, "负责人必须是有采集权限的成员")
+    if user.get("role") != "admin" and not user.get("can_edit_leads"):
+        raise HTTPException(400, "负责人必须拥有线索权限")
 
 
 def _ensure_lead_owner(
@@ -604,6 +862,15 @@ def _detail_payload(db: Database, round_id: int, platform: str, user_id: str) ->
             "desc": detail.get("desc") or "",
             "creator_tags": _json_list(detail.get("tags_json")),
             "raw_json": _safe_json_object(detail.get("raw_json")),
+            "cooperation_cases": [
+                {
+                    **item,
+                    "status_label": _cooperation_label(item.get("status")),
+                }
+                for item in db.cooperation_cases(platform, user_id)
+            ],
+            "cooperation_summary": db.cooperation_summary(platform, user_id),
+            "cooperation_history": db.cooperation_history(platform, user_id, 20),
             "notes": [
                 {
                     "note_id": note.get("note_id"),
@@ -643,6 +910,21 @@ def _validated_status(value: str | None) -> str | None:
     return code
 
 
+def _validated_cooperation_status(
+    value: str | None, *, allow_empty: bool = False
+) -> str | None:
+    if value is None:
+        return None
+    if not str(value).strip():
+        if allow_empty:
+            return ""
+        raise HTTPException(400, "无效的合作状态")
+    code = normalize_cooperation_status(value, default="")
+    if code not in COOPERATION_STATUS_CODES:
+        raise HTTPException(400, "无效的合作状态")
+    return code
+
+
 KeywordText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=50)]
 
 
@@ -677,10 +959,70 @@ class BatchClaimRequest(BaseModel):
     items: list[BatchItem] = Field(min_length=1, max_length=500)
 
 
+class CooperationUpdateRequest(BaseModel):
+    status: str = Field(max_length=40)
+    expected_status: str | None = Field(None, max_length=40)
+    expected_updated_at: str | None = Field(None, max_length=40)
+
+
+class CooperationBatchItem(BaseModel):
+    platform: str = Field(min_length=1, max_length=20)
+    user_id: str = Field(min_length=1, max_length=100)
+    expected_status: str | None = Field(None, max_length=40)
+    expected_updated_at: str | None = Field(None, max_length=40)
+
+
+class CooperationBatchRequest(BaseModel):
+    status: str = Field(max_length=40)
+    items: list[CooperationBatchItem] = Field(min_length=1, max_length=500)
+
+
+class CooperationCaseCreateRequest(BaseModel):
+    platform: str = Field(min_length=1, max_length=20)
+    user_id: str = Field(min_length=1, max_length=100)
+    status: str | None = Field(None, max_length=40)
+    note: str | None = Field(None, max_length=5000)
+
+
+class CooperationCaseStatusRequest(BaseModel):
+    status: str = Field(min_length=1, max_length=40)
+    note: str | None = Field(None, max_length=5000)
+    expected_updated_at: str | None = Field(None, max_length=60)
+
+
+class CooperationCaseSummaryRequest(BaseModel):
+    summary: str = Field("", max_length=5000)
+    expected_updated_at: str | None = Field(None, max_length=60)
+
+
+class CooperationCaseNoteRequest(BaseModel):
+    note: str = Field(min_length=1, max_length=5000)
+
+
+class CooperationWorkRequest(BaseModel):
+    platform: str = Field("", max_length=40)
+    url: str = Field(min_length=1, max_length=2000)
+    title: str = Field("", max_length=500)
+    published_at: str = Field("", max_length=40)
+    note: str = Field("", max_length=2000)
+
+
+class CooperationCompleteRequest(BaseModel):
+    note: str | None = Field(None, max_length=5000)
+    expected_updated_at: str | None = Field(None, max_length=60)
+    works: list[CooperationWorkRequest] = Field(default_factory=list, max_length=50)
+
+
+class CooperationCorrectionRequest(BaseModel):
+    status: str = Field(min_length=1, max_length=40)
+    note: str = Field(min_length=1, max_length=5000)
+
+
 class LeadCreateRequest(BaseModel):
     platform: str = Field("xhs", min_length=1, max_length=20)
     nickname: str = Field("", max_length=200)
     account_id: str = Field("", max_length=200)
+    platform_handle: str = Field("", max_length=200)
     profile_url: str = Field("", max_length=2000)
     raw_title: str = Field("", max_length=500)
     source: str = Field("manual", max_length=30)
@@ -693,12 +1035,22 @@ class LeadUpdateRequest(BaseModel):
     platform: str | None = Field(None, min_length=1, max_length=20)
     nickname: str | None = Field(None, max_length=200)
     account_id: str | None = Field(None, max_length=200)
+    platform_handle: str | None = Field(None, max_length=200)
     profile_url: str | None = Field(None, max_length=2000)
     raw_title: str | None = Field(None, max_length=500)
     source: str | None = Field(None, max_length=30)
     source_round_id: int | None = None
     owner_user_id: int | None = None
     status: str | None = Field(None, max_length=30)
+
+
+class LeadVerifyRequest(BaseModel):
+    provider: str = Field("auto", min_length=1, max_length=20)
+    account_id: str | None = Field(None, max_length=200)
+    platform_handle: str | None = Field(None, max_length=200)
+    profile_url: str | None = Field(None, max_length=2000)
+    apply: bool = False
+    confirm_mismatch: bool = False
 
 
 class LeadBulkRequest(BaseModel):
@@ -715,9 +1067,11 @@ class CreatorAssignRequest(BaseModel):
 
 class LeadConvertRequest(BaseModel):
     account_id: str = Field("", max_length=200)
+    platform_handle: str = Field("", max_length=200)
     profile_url: str = Field("", max_length=2000)
     fetch: bool = True
     provider: str = Field("auto", min_length=1, max_length=20)
+    confirm_mismatch: bool = False
 
 
 class CreateRoundRequest(BaseModel):
@@ -783,12 +1137,14 @@ class UserCreateRequest(BaseModel):
     password: str = Field(min_length=1, max_length=200)
     role: str = Field(default="member", max_length=20)
     can_collect: bool = False
+    can_edit_leads: bool = False
 
 
 class UserUpdateRequest(BaseModel):
     role: str | None = Field(None, max_length=20)
     disabled: bool | None = None
     can_collect: bool | None = None
+    can_edit_leads: bool | None = None
 
 
 class UserResetPasswordRequest(BaseModel):
@@ -802,6 +1158,7 @@ def _public_user(user: dict[str, Any]) -> dict[str, Any]:
         "role": user["role"],
         "disabled": bool(user.get("disabled")),
         "can_collect": bool(user.get("can_collect")),
+        "can_edit_leads": bool(user.get("can_edit_leads")),
         "must_change_password": bool(user.get("must_change_password")),
         "auth_source": user.get("auth_source") or "password",
         "created_at": user.get("created_at"),
@@ -838,6 +1195,15 @@ def require_collector(request: Request) -> dict[str, Any]:
     user = getattr(request.state, "user", None)
     if not user or (user.get("role") != "admin" and not user.get("can_collect")):
         raise HTTPException(403, "当前账号没有发起采集的权限，请联系管理员")
+    return user
+
+
+def require_lead_editor(request: Request) -> dict[str, Any]:
+    user = getattr(request.state, "user", None)
+    if not user or (
+        user.get("role") != "admin" and not user.get("can_edit_leads")
+    ):
+        raise HTTPException(403, "当前账号没有维护线索的权限，请联系管理员")
     return user
 
 
@@ -884,8 +1250,8 @@ def health() -> dict[str, Any]:
             conn.close()
     except Exception as exc:
         raise HTTPException(503, "数据库不可用") from exc
-    if version < SCHEMA_VERSION:
-        raise HTTPException(503, "数据库迁移未完成")
+    if version != SCHEMA_VERSION:
+        raise HTTPException(503, "数据库 schema 版本与应用不兼容")
     return {"ok": True, "database": "ok", "schema_version": version}
 
 
@@ -1036,6 +1402,7 @@ def create_user(
             password_hash,
             role=role,
             can_collect=bool(payload.can_collect),
+            can_edit_leads=bool(payload.can_edit_leads),
             must_change_password=True,
         )
     except ValueError as exc:
@@ -1046,7 +1413,11 @@ def create_user(
         username,
         _client_ip(request),
         request.headers.get("user-agent", ""),
-        {"role": role, "can_collect": bool(payload.can_collect)},
+        {
+            "role": role,
+            "can_collect": bool(payload.can_collect),
+            "can_edit_leads": bool(payload.can_edit_leads),
+        },
     )
     return _public_user(db.get_user(user_id) or {})
 
@@ -1085,6 +1456,13 @@ def update_user(
             "from": bool(target["can_collect"]),
             "to": bool(payload.can_collect),
         }
+    if payload.can_edit_leads is not None and bool(payload.can_edit_leads) != bool(
+        target["can_edit_leads"]
+    ):
+        changes["can_edit_leads"] = {
+            "from": bool(target["can_edit_leads"]),
+            "to": bool(payload.can_edit_leads),
+        }
     if not changes:
         return _public_user(target)
     try:
@@ -1093,6 +1471,7 @@ def update_user(
             role=role,
             disabled=payload.disabled,
             can_collect=payload.can_collect,
+            can_edit_leads=payload.can_edit_leads,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -1176,7 +1555,13 @@ def api_meta() -> dict[str, Any]:
     return {
         "statuses": STATUS_DEFS,
         "default_status": "pending",
+        "cooperation_statuses": COOPERATION_STATUS_DEFS,
+        "cooperation_attachment_categories": [
+            {"code": code, "label": label}
+            for code, label in COOPERATION_ATTACHMENT_CATEGORIES.items()
+        ],
         "lead_statuses": LEAD_STATUS_DEFS,
+        "lead_identity_statuses": LEAD_IDENTITY_DEFS,
         "lead_sources": [
             {"code": code, "label": LEAD_SOURCE_LABELS[code]} for code in LEAD_SOURCE_CODES
         ],
@@ -1223,6 +1608,23 @@ def _settings_payload(include_paths: bool = False) -> dict[str, Any]:
 @app.get("/api/settings")
 def api_settings(request: Request) -> dict[str, Any]:
     user = getattr(request.state, "user", None)
+    if not _round_names_visible():
+        return {
+            "host": "",
+            "token_configured": False,
+            "rnote_host": "",
+            "rnote_token_configured": False,
+            "output_dir": "",
+            "cache_days": 0,
+            "xhs_cost": 0,
+            "douyin_cost": 0,
+            "token_cny": 0,
+            "usd_cny": 0,
+            "credentials_ok": False,
+            "providers": [],
+            "platforms": [],
+            "default_provider": None,
+        }
     return _settings_payload(include_paths=bool(user and user.get("role") == "admin"))
 
 
@@ -1267,6 +1669,7 @@ def _fetch_balance(target: Settings, provider: str = "dataflow") -> dict[str, An
 
 
 @app.put("/api/settings/dataflow-token")
+@serialized_settings_update
 def update_dataflow_token(
     payload: DataflowTokenRequest,
     request: Request,
@@ -1309,6 +1712,7 @@ def update_dataflow_token(
 
 
 @app.put("/api/settings/rnote-token")
+@serialized_settings_update
 def update_rnote_token(
     payload: RnoteTokenRequest,
     request: Request,
@@ -1355,6 +1759,7 @@ def update_rnote_token(
 
 
 @app.put("/api/settings/providers/{provider_id}/token")
+@serialized_settings_update
 def update_provider_token(
     provider_id: str,
     payload: ProviderTokenRequest,
@@ -1379,12 +1784,13 @@ def update_provider_token(
         raise HTTPException(400, "该服务商不支持在设置页更新令牌")
     verified = False
     balance = None
-    previous_env = os.environ.get(provider.api_key_env)
     if payload.verify:
-        os.environ[provider.api_key_env] = token
         try:
             candidate_settings = load_settings(require_credentials=False)
-            candidate_registry = load_registry(candidate_settings)
+            candidate_registry = load_registry(
+                candidate_settings,
+                credential_overrides={provider.api_key_env: token},
+            )
             option = None
             platform_code = "xhs"
             for platform in candidate_registry.platforms.values():
@@ -1416,10 +1822,6 @@ def update_provider_token(
             finally:
                 candidate.close()
         except Exception as exc:
-            if previous_env is None:
-                os.environ.pop(provider.api_key_env, None)
-            else:
-                os.environ[provider.api_key_env] = previous_env
             raise HTTPException(400, "令牌校验失败，请检查后重试") from exc
     try:
         set_key(str(ENV_PATH), provider.api_key_env, token, quote_mode="always")
@@ -1507,10 +1909,11 @@ def list_rounds(
     db: Database = Depends(get_db),
 ) -> list[dict[str, Any]]:
     jobs = db.latest_jobs_by_round()
+    visible = _round_names_visible()
     items: list[dict[str, Any]] = []
     for row in db.list_rounds(include_archived=include_archived):
         payload = _round_dict(row)
-        payload["job"] = _job_dict(jobs.get(int(row["id"])))
+        payload["job"] = _job_dict(jobs.get(int(row["id"]))) if visible else None
         items.append(payload)
     return items
 
@@ -1685,6 +2088,9 @@ def purge_round(
         request.headers.get("user-agent", ""),
         details={"impact": impact, "backup": str(backup)},
     )
+    db.prune_backups(
+        settings.backup_retention_days, settings.backup_retention_count, apply=True
+    )
     return {**result, "backup": str(backup), "impact": impact}
 
 
@@ -1749,6 +2155,19 @@ def _validated_statuses(value: str | None) -> list[str]:
     return codes
 
 
+def _validated_cooperation_filters(value: str | None) -> list[str]:
+    codes: list[str] = []
+    for item in _csv(value):
+        if item == "none":
+            codes.append("none")
+            continue
+        code = normalize_cooperation_status(item, default="")
+        if code not in COOPERATION_STATUS_CODES:
+            raise HTTPException(400, "无效的合作状态筛选")
+        codes.append(code)
+    return codes
+
+
 def _validated_owner_filter(value: str | None) -> str | None:
     if value in (None, "", "all"):
         return None
@@ -1772,12 +2191,16 @@ def _all_creator_filters(
     tier: str | None,
     direction: str | None,
     source: str | None,
+    cooperation: str | None = None,
+    cooperation_stale_days: int | None = None,
 ) -> dict[str, Any]:
     return {
         "statuses": _validated_statuses(status),
         "tiers": _csv(tier),
         "directions": _csv(direction),
         "sources": _csv(source),
+        "cooperation": _validated_cooperation_filters(cooperation),
+        "cooperation_stale_days": cooperation_stale_days,
     }
 
 
@@ -1794,6 +2217,8 @@ def list_all_creators(
     source_mode: str = Query("any", pattern="^(any|all)$"),
     label: str | None = None,
     owner: str | None = None,
+    cooperation: str | None = None,
+    cooperation_stale_days: int | None = Query(None, ge=1, le=365),
     min_fans: int | None = Query(None, ge=0),
     max_fans: int | None = Query(None, ge=0),
     only_unenriched: bool = False,
@@ -1806,7 +2231,9 @@ def list_all_creators(
 ) -> dict[str, Any]:
     if round_id is not None and not db.get_round(round_id):
         raise HTTPException(404, "轮次不存在")
-    filters = _all_creator_filters(status, tier, direction, source)
+    filters = _all_creator_filters(
+        status, tier, direction, source, cooperation, cooperation_stale_days
+    )
     actor = require_user(http_request)
     result = db.query_creators(
         round_id,
@@ -1859,6 +2286,8 @@ def list_creators(
     source_mode: str = Query("any", pattern="^(any|all)$"),
     label: str | None = None,
     owner: str | None = None,
+    cooperation: str | None = None,
+    cooperation_stale_days: int | None = Query(None, ge=1, le=365),
     min_fans: int | None = Query(None, ge=0),
     max_fans: int | None = Query(None, ge=0),
     only_unenriched: bool = False,
@@ -1883,6 +2312,8 @@ def list_creators(
         source_mode=source_mode,
         labels=_csv(label),
         owner=_validated_owner_filter(owner),
+        cooperation=_validated_cooperation_filters(cooperation),
+        cooperation_stale_days=cooperation_stale_days,
         min_fans=min_fans,
         max_fans=max_fans,
         only_unenriched=only_unenriched,
@@ -1941,13 +2372,27 @@ def update_creator(
 ) -> dict[str, Any]:
     actor = require_user(http_request)
     owner_before = _ensure_creator_exists(db, round_id, platform, user_id)
+    creator_before = db.get_creator(platform, user_id) or {}
     status = _validated_status(request.status)
-    cooperation_status = _validated_status(request.cooperation_status)
-    expected_cooperation_status = _validated_status(request.expected_cooperation_status)
+    cooperation_status = _validated_cooperation_status(
+        request.cooperation_status, allow_empty=True
+    )
+    expected_cooperation_status = _validated_cooperation_status(
+        request.expected_cooperation_status, allow_empty=True
+    )
     if request.expected_status is not None:
         expected = normalize_status(request.expected_status, default="")
         if expected not in STATUS_CODES:
             raise HTTPException(400, "无效的期望状态")
+    has_review_changes = any(
+        value is not None
+        for value in (
+            request.status,
+            request.match_direction,
+            request.tags_manual,
+            request.remark,
+        )
+    )
     try:
         db.update_review(
             round_id,
@@ -1964,12 +2409,12 @@ def update_creator(
             expected_cooperation_updated_at=request.expected_cooperation_updated_at,
             claim_user_id=int(actor["id"]),
         )
-    except ValueError as exc:
+    except (ValueError, sqlite3.IntegrityError) as exc:
         raise HTTPException(409, str(exc)) from exc
-    detail = _detail_payload(db, round_id, platform, user_id)
+    creator_after = db.get_creator(platform, user_id) or {}
     if (
         owner_before.get("owner_user_id") is None
-        and detail.get("owner_user_id") == actor["id"]
+        and creator_after.get("follow_up_user_id") == actor["id"]
     ):
         db.audit(
             actor["id"],
@@ -1977,23 +2422,42 @@ def update_creator(
             f"{round_id}:{platform}:{user_id}",
             _client_ip(http_request),
             http_request.headers.get("user-agent", ""),
-            details={"auto": True, "source": "review"},
+            details={
+                "auto": True,
+                "source": "review" if has_review_changes else "cooperation",
+            },
         )
-    db.audit(
-        actor["id"],
-        "creator.review_updated",
-        f"{round_id}:{platform}:{user_id}",
-        _client_ip(http_request),
-        http_request.headers.get("user-agent", ""),
-        details={
-            "status": status,
-            "cooperation_status": cooperation_status,
-            "match_direction": request.match_direction,
-            "tags_manual": request.tags_manual,
-            "remark": request.remark,
-        },
-    )
-    return detail
+    if has_review_changes:
+        db.audit(
+            actor["id"],
+            "creator.review_updated",
+            f"{round_id}:{platform}:{user_id}",
+            _client_ip(http_request),
+            http_request.headers.get("user-agent", ""),
+            details={
+                "status": status,
+                "match_direction": request.match_direction,
+                "tags_manual": request.tags_manual,
+                "remark": request.remark,
+            },
+        )
+    cooperation_before = creator_before.get("cooperation_status") or ""
+    cooperation_after = creator_after.get("cooperation_status") or ""
+    if cooperation_before != cooperation_after:
+        db.audit(
+            actor["id"],
+            "creator.cooperation_updated",
+            f"{platform}:{user_id}",
+            _client_ip(http_request),
+            http_request.headers.get("user-agent", ""),
+            details={
+                "from": cooperation_before,
+                "to": cooperation_after,
+                "auto": request.cooperation_status is None,
+                "batch": False,
+            },
+        )
+    return _detail_payload(db, round_id, platform, user_id)
 
 
 @app.post("/api/rounds/{round_id}/creators/batch")
@@ -2029,19 +2493,28 @@ def batch_update(
             if owner and owner.get("owner_user_id") is None:
                 auto_claim_targets += 1
     status = _validated_status(request.status)
-    cooperation_status = _validated_status(request.cooperation_status)
-    result = db.bulk_update_review(
-        round_id,
-        [item.model_dump() for item in request.items],
-        status=status,
-        cooperation_status=cooperation_status,
-        match_direction=request.match_direction,
-        tags_manual=request.tags_manual,
-        remark=request.remark,
-        claim_user_id=int(actor["id"]),
-        set_owner=request.set_owner,
-        owner_user_id=request.owner_user_id,
+    cooperation_status = _validated_cooperation_status(
+        request.cooperation_status, allow_empty=True
     )
+    for item in request.items:
+        _validated_cooperation_status(
+            item.expected_cooperation_status, allow_empty=True
+        )
+    try:
+        result = db.bulk_update_review(
+            round_id,
+            [item.model_dump() for item in request.items],
+            status=status,
+            cooperation_status=cooperation_status,
+            match_direction=request.match_direction,
+            tags_manual=request.tags_manual,
+            remark=request.remark,
+            claim_user_id=int(actor["id"]),
+            set_owner=request.set_owner,
+            owner_user_id=request.owner_user_id,
+        )
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        raise HTTPException(400, str(exc)) from exc
     if auto_claim_targets > 0:
         db.audit(
             actor["id"],
@@ -2051,25 +2524,637 @@ def batch_update(
             http_request.headers.get("user-agent", ""),
             details={"count": auto_claim_targets, "auto": True},
         )
+    has_review_fields = any(
+        value is not None
+        for value in (
+            request.status,
+            request.match_direction,
+            request.tags_manual,
+            request.remark,
+        )
+    )
+    if has_review_fields or request.set_owner:
+        db.audit(
+            actor["id"],
+            "creator.review_bulk_updated",
+            str(round_id),
+            _client_ip(http_request),
+            http_request.headers.get("user-agent", ""),
+            details={
+                "changed": result["changed"],
+                "conflicts": len(result["conflicts"]),
+                "status": status,
+                "match_direction": request.match_direction,
+                "tags_manual": request.tags_manual,
+                "remark": request.remark,
+                "set_owner": request.set_owner,
+                "owner_user_id": request.owner_user_id,
+            },
+        )
+    for change in result.get("cooperation_changes", []):
+        db.audit(
+            actor["id"],
+            "creator.cooperation_updated",
+            f"{change['platform']}:{change['user_id']}",
+            _client_ip(http_request),
+            http_request.headers.get("user-agent", ""),
+            details={
+                "from": change["previous_status"],
+                "to": change["status"],
+                "auto": False,
+                "batch": True,
+            },
+        )
+    for item in result.get("enrolled", []):
+        db.audit(
+            actor["id"],
+            "creator.cooperation_updated",
+            f"{item['platform']}:{item['user_id']}",
+            _client_ip(http_request),
+            http_request.headers.get("user-agent", ""),
+            details={
+                "from": "",
+                "to": "not_contacted",
+                "auto": True,
+                "batch": True,
+            },
+        )
+    return result
+
+
+@app.get("/api/cooperation-cases/{case_id}")
+def get_cooperation_case(
+    case_id: int,
+    http_request: Request,
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    require_user(http_request)
+    return _cooperation_case_payload(db, case_id)
+
+
+@app.post("/api/cooperation-cases")
+def create_cooperation_case(
+    request: CooperationCaseCreateRequest,
+    http_request: Request,
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    actor = require_user(http_request)
+    status = None
+    if request.status is not None and str(request.status).strip():
+        status = _validated_cooperation_status(request.status, allow_empty=False)
+    try:
+        created = db.create_cooperation_case(
+            request.platform,
+            request.user_id,
+            status,
+            note=request.note,
+            created_by=int(actor["id"]),
+        )
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        raise _case_error(exc) from exc
     db.audit(
         actor["id"],
-        "creator.review_bulk_updated",
-        str(round_id),
+        "cooperation.case_created",
+        f"cooperation_case:{created['case_id']}",
+        _client_ip(http_request),
+        http_request.headers.get("user-agent", ""),
+        details={"platform": request.platform, "user_id": request.user_id},
+    )
+    payload = _cooperation_case_payload(db, int(created["case_id"]))
+    payload["created"] = created
+    return payload
+
+
+@app.post("/api/cooperation-cases/{case_id}/status")
+def update_cooperation_case_status(
+    case_id: int,
+    request: CooperationCaseStatusRequest,
+    http_request: Request,
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    actor = require_user(http_request)
+    status = _validated_cooperation_status(request.status, allow_empty=False)
+    try:
+        result = db.update_cooperation_case_status(
+            case_id,
+            status,
+            note=request.note,
+            expected_updated_at=request.expected_updated_at,
+            actor_user_id=int(actor["id"]),
+            claim_user_id=int(actor["id"]),
+        )
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        raise _case_error(exc) from exc
+    db.audit(
+        actor["id"],
+        "cooperation.status_changed",
+        f"cooperation_case:{case_id}",
         _client_ip(http_request),
         http_request.headers.get("user-agent", ""),
         details={
-            "changed": result["changed"],
-            "conflicts": len(result["conflicts"]),
-            "status": status,
-            "cooperation_status": cooperation_status,
-            "match_direction": request.match_direction,
-            "tags_manual": request.tags_manual,
-            "remark": request.remark,
-            "set_owner": request.set_owner,
-            "owner_user_id": request.owner_user_id,
+            "from": result.get("previous_status") or "",
+            "to": result.get("status") or "",
+            "note": bool(request.note),
         },
     )
+    payload = _cooperation_case_payload(db, case_id)
+    payload["change"] = result
+    return payload
+
+
+@app.post("/api/cooperation-cases/{case_id}/complete")
+def complete_cooperation_case(
+    case_id: int,
+    request: CooperationCompleteRequest,
+    http_request: Request,
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    actor = require_user(http_request)
+    works = [_validate_work_payload(item.model_dump()) for item in request.works]
+    try:
+        result = db.complete_cooperation_case(
+            case_id,
+            note=request.note,
+            works=works,
+            expected_updated_at=request.expected_updated_at,
+            actor_user_id=int(actor["id"]),
+        )
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    db.audit(
+        actor["id"],
+        "cooperation.completed",
+        f"cooperation_case:{case_id}",
+        _client_ip(http_request),
+        http_request.headers.get("user-agent", ""),
+        details={"works": len(works)},
+    )
+    payload = _cooperation_case_payload(db, case_id)
+    payload["change"] = result
+    return payload
+
+
+@app.post("/api/cooperation-cases/{case_id}/notes")
+def add_cooperation_case_note(
+    case_id: int,
+    request: CooperationCaseNoteRequest,
+    http_request: Request,
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    actor = require_user(http_request)
+    try:
+        result = db.add_cooperation_note(
+            case_id, request.note, actor_user_id=int(actor["id"])
+        )
+    except ValueError as exc:
+        raise _case_error(exc) from exc
+    db.audit(
+        actor["id"],
+        "cooperation.note_added",
+        f"cooperation_case:{case_id}",
+        _client_ip(http_request),
+        http_request.headers.get("user-agent", ""),
+    )
+    payload = _cooperation_case_payload(db, case_id)
+    payload["change"] = result
+    return payload
+
+
+@app.patch("/api/cooperation-cases/{case_id}")
+def update_cooperation_case_summary(
+    case_id: int,
+    request: CooperationCaseSummaryRequest,
+    http_request: Request,
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    actor = require_user(http_request)
+    try:
+        result = db.update_cooperation_case_summary(
+            case_id,
+            request.summary,
+            expected_updated_at=request.expected_updated_at,
+            actor_user_id=int(actor["id"]),
+        )
+    except ValueError as exc:
+        raise _case_error(exc) from exc
+    payload = _cooperation_case_payload(db, case_id)
+    payload["change"] = result
+    return payload
+
+
+@app.post("/api/cooperation-cases/{case_id}/correct")
+def correct_cooperation_case_status(
+    case_id: int,
+    request: CooperationCorrectionRequest,
+    http_request: Request,
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    actor = require_admin(http_request)
+    status = _validated_cooperation_status(request.status, allow_empty=False)
+    try:
+        result = db.correct_cooperation_status(
+            case_id,
+            status,
+            note=request.note,
+            actor_user_id=int(actor["id"]),
+        )
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        raise _case_error(exc) from exc
+    db.audit(
+        actor["id"],
+        "cooperation.status_corrected",
+        f"cooperation_case:{case_id}",
+        _client_ip(http_request),
+        http_request.headers.get("user-agent", ""),
+        details={"to": status, "note": request.note},
+    )
+    payload = _cooperation_case_payload(db, case_id)
+    payload["change"] = result
+    return payload
+
+
+@app.post("/api/cooperation-cases/{case_id}/attachments")
+async def upload_cooperation_attachment(
+    case_id: int,
+    http_request: Request,
+    file: UploadFile = File(...),
+    category: str = Form("other"),
+    description: str = Form(""),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    actor = require_user(http_request)
+    if category not in COOPERATION_ATTACHMENT_CATEGORIES:
+        raise HTTPException(400, "无效的附件分类")
+    if len(description) > 500:
+        raise HTTPException(400, "附件说明过长")
+    detail = db.cooperation_case_detail(int(case_id))
+    if not detail:
+        raise HTTPException(404, "合作记录不存在")
+    original_name = re.sub(
+        r"[\r\n\"]+", "_", Path(file.filename or "attachment").name
+    )[:255]
+    if not original_name:
+        raise HTTPException(400, "附件文件名不能为空")
+    content_type = (
+        file.content_type
+        or mimetypes.guess_type(original_name)[0]
+        or "application/octet-stream"
+    )
+    if content_type not in settings.attachment_allowed_types:
+        raise HTTPException(400, "不支持该附件类型")
+    case_dir = _attachment_root() / str(int(case_id))
+    case_dir.mkdir(parents=True, exist_ok=True)
+    suffix = Path(original_name).suffix[:20]
+    storage_name = f"{uuid.uuid4().hex}{suffix}"
+    storage_key = f"cooperation_attachments/{int(case_id)}/{storage_name}"
+    final_path = settings.output_dir / storage_key
+    temp_path = case_dir / f".{uuid.uuid4().hex}.tmp"
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with temp_path.open("wb") as target:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > settings.attachment_max_bytes:
+                    raise HTTPException(413, "附件超过大小限制")
+                digest.update(chunk)
+                target.write(chunk)
+        temp_path.replace(final_path)
+        created = db.add_cooperation_attachment(
+            case_id,
+            original_name=original_name,
+            storage_key=storage_key,
+            content_type=content_type,
+            size_bytes=size,
+            sha256=digest.hexdigest(),
+            category=category,
+            description=description.strip(),
+            uploaded_by=int(actor["id"]),
+        )
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        final_path.unlink(missing_ok=True)
+        raise
+    db.audit(
+        actor["id"],
+        "cooperation.attachment_uploaded",
+        f"cooperation_case:{case_id}",
+        _client_ip(http_request),
+        http_request.headers.get("user-agent", ""),
+        details={
+            "attachment_id": created["id"],
+            "name": original_name,
+            "size": size,
+            "category": category,
+        },
+    )
+    payload = _cooperation_case_payload(db, case_id)
+    payload["uploaded_attachment_id"] = created["id"]
+    return payload
+
+
+@app.get("/api/cooperation-attachments/{attachment_id}")
+def download_cooperation_attachment(
+    attachment_id: int,
+    http_request: Request,
+    db: Database = Depends(get_db),
+) -> FileResponse:
+    require_user(http_request)
+    row = db.get_cooperation_attachment(attachment_id)
+    if not row or row.get("deleted_at"):
+        raise HTTPException(404, "附件不存在")
+    path = (settings.output_dir / str(row["storage_key"])).resolve()
+    root = settings.output_dir.resolve()
+    if not path.is_relative_to(root) or not path.is_file():
+        raise HTTPException(404, "附件文件不存在")
+    return FileResponse(
+        path,
+        media_type=row.get("content_type") or "application/octet-stream",
+        filename=row.get("original_name") or "attachment",
+        headers={"X-Content-Type-Options": "nosniff"},
+    )
+
+
+@app.delete("/api/cooperation-attachments/{attachment_id}")
+def delete_cooperation_attachment(
+    attachment_id: int,
+    http_request: Request,
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    actor = require_user(http_request)
+    row = db.get_cooperation_attachment(attachment_id)
+    if not row or row.get("deleted_at"):
+        raise HTTPException(404, "附件不存在")
+    if actor.get("role") != "admin" and int(row.get("uploaded_by") or 0) != int(actor["id"]):
+        raise HTTPException(403, "只能删除自己上传的附件")
+    try:
+        result = db.delete_cooperation_attachment(
+            attachment_id, actor_user_id=int(actor["id"])
+        )
+    except ValueError as exc:
+        raise _case_error(exc) from exc
+    db.audit(
+        actor["id"],
+        "cooperation.attachment_deleted",
+        f"cooperation_case:{row['case_id']}",
+        _client_ip(http_request),
+        http_request.headers.get("user-agent", ""),
+        details={"attachment_id": attachment_id, "name": row.get("original_name")},
+    )
+    payload = _cooperation_case_payload(db, int(row["case_id"]))
+    payload["change"] = result
+    return payload
+
+
+@app.post("/api/cooperation-cases/{case_id}/works")
+def add_cooperation_work(
+    case_id: int,
+    request: CooperationWorkRequest,
+    http_request: Request,
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    actor = require_user(http_request)
+    work = _validate_work_payload(request.model_dump())
+    try:
+        result = db.add_cooperation_work(
+            case_id, work, actor_user_id=int(actor["id"])
+        )
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    db.audit(
+        actor["id"],
+        "cooperation.work_added",
+        f"cooperation_case:{case_id}",
+        _client_ip(http_request),
+        http_request.headers.get("user-agent", ""),
+        details={"work_id": result["id"]},
+    )
+    payload = _cooperation_case_payload(db, case_id)
+    payload["change"] = result
+    return payload
+
+
+@app.patch("/api/cooperation-works/{work_id}")
+def update_cooperation_work(
+    work_id: int,
+    request: CooperationWorkRequest,
+    http_request: Request,
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    actor = require_user(http_request)
+    existing = db.get_cooperation_work(work_id)
+    if not existing:
+        raise HTTPException(404, "作品不存在")
+    work = _validate_work_payload(request.model_dump())
+    try:
+        result = db.update_cooperation_work(
+            work_id, work, actor_user_id=int(actor["id"])
+        )
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    db.audit(
+        actor["id"],
+        "cooperation.work_updated",
+        f"cooperation_case:{existing['case_id']}",
+        _client_ip(http_request),
+        http_request.headers.get("user-agent", ""),
+        details={"work_id": work_id},
+    )
+    payload = _cooperation_case_payload(db, int(existing["case_id"]))
+    payload["change"] = result
+    return payload
+
+
+@app.delete("/api/cooperation-works/{work_id}")
+def delete_cooperation_work(
+    work_id: int,
+    http_request: Request,
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    actor = require_user(http_request)
+    existing = db.get_cooperation_work(work_id)
+    if not existing:
+        raise HTTPException(404, "作品不存在")
+    result = db.delete_cooperation_work(
+        work_id, actor_user_id=int(actor["id"])
+    )
+    db.audit(
+        actor["id"],
+        "cooperation.work_deleted",
+        f"cooperation_case:{existing['case_id']}",
+        _client_ip(http_request),
+        http_request.headers.get("user-agent", ""),
+        details={"work_id": work_id},
+    )
+    payload = _cooperation_case_payload(db, int(existing["case_id"]))
+    payload["change"] = result
+    return payload
+
+
+@app.get("/api/cooperation-cases/{case_id}/export")
+def export_cooperation_case(
+    case_id: int,
+    http_request: Request,
+    db: Database = Depends(get_db),
+) -> FileResponse:
+    actor = require_user(http_request)
+    payload = _cooperation_case_payload(db, case_id)
+    temp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    temp_path = Path(temp.name)
+    temp.close()
+    manifest: list[dict[str, Any]] = []
+    try:
+        with zipfile.ZipFile(temp_path, "w", zipfile.ZIP_DEFLATED) as archive:
+            case_json = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+            archive.writestr("case.json", case_json)
+            manifest.append({
+                "path": "case.json",
+                "sha256": hashlib.sha256(case_json.encode("utf-8")).hexdigest(),
+            })
+            for attachment in payload["attachments"]:
+                row = db.get_cooperation_attachment(int(attachment["id"]))
+                if not row or row.get("deleted_at"):
+                    continue
+                path = (settings.output_dir / str(row["storage_key"])).resolve()
+                if not path.is_relative_to(settings.output_dir.resolve()) or not path.is_file():
+                    continue
+                safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", attachment["original_name"])[:120]
+                archive_name = f"attachments/{attachment['id']}_{safe_name or 'attachment'}"
+                archive.write(path, archive_name)
+                manifest.append({
+                    "path": archive_name,
+                    "sha256": attachment["sha256"],
+                    "attachment_id": attachment["id"],
+                    "original_name": attachment["original_name"],
+                })
+            manifest_bytes = json.dumps(manifest, ensure_ascii=False, indent=2)
+            archive.writestr("manifest.json", manifest_bytes)
+        db.audit(
+            actor["id"],
+            "cooperation.evidence_exported",
+            f"cooperation_case:{case_id}",
+            _client_ip(http_request),
+            http_request.headers.get("user-agent", ""),
+            details={"attachments": len(payload["attachments"])},
+        )
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+    return FileResponse(
+        temp_path,
+        media_type="application/zip",
+        filename=f"cooperation_case_{case_id}.zip",
+        background=BackgroundTask(os.unlink, temp_path),
+    )
+
+
+@app.patch("/api/creators/{platform}/{user_id}/cooperation")
+def update_creator_cooperation(
+    platform: str,
+    user_id: str,
+    request: CooperationUpdateRequest,
+    http_request: Request,
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    actor = require_user(http_request)
+    status = _validated_cooperation_status(request.status, allow_empty=True)
+    expected = _validated_cooperation_status(
+        request.expected_status, allow_empty=True
+    )
+    try:
+        result = db.update_cooperation(
+            platform,
+            user_id,
+            status,
+            expected_status=expected,
+            expected_updated_at=request.expected_updated_at,
+            claim_user_id=int(actor["id"]),
+        )
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        message = str(exc)
+        if "不存在" in message:
+            raise HTTPException(404, message) from exc
+        raise HTTPException(409, message) from exc
+    if result.get("changed"):
+        db.audit(
+            actor["id"],
+            "creator.cooperation_updated",
+            f"{platform}:{user_id}",
+            _client_ip(http_request),
+            http_request.headers.get("user-agent", ""),
+            details={
+                "from": result.get("previous_status") or "",
+                "to": result.get("status") or "",
+                "auto": False,
+                "batch": False,
+            },
+        )
+    if result.get("claimed"):
+        db.audit(
+            actor["id"],
+            "creator.claimed",
+            f"{platform}:{user_id}",
+            _client_ip(http_request),
+            http_request.headers.get("user-agent", ""),
+            details={"auto": True, "source": "cooperation"},
+        )
+    result["cooperation_status"] = result.get("status") or ""
+    result["cooperation_status_label"] = _cooperation_label(
+        result.get("status")
+    )
     return result
+
+
+@app.post("/api/creators/cooperation/batch")
+def batch_update_cooperation(
+    request: CooperationBatchRequest,
+    http_request: Request,
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    actor = require_user(http_request)
+    status = _validated_cooperation_status(request.status, allow_empty=True)
+    for item in request.items:
+        _validated_cooperation_status(item.expected_status, allow_empty=True)
+    try:
+        result = db.bulk_update_cooperation(
+            [item.model_dump() for item in request.items],
+            status,
+            claim_user_id=int(actor["id"]),
+        )
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    for change in result.get("changes", []):
+        db.audit(
+            actor["id"],
+            "creator.cooperation_updated",
+            f"{change['platform']}:{change['user_id']}",
+            _client_ip(http_request),
+            http_request.headers.get("user-agent", ""),
+            details={
+                "from": change.get("previous_status") or "",
+                "to": change.get("status") or "",
+                "auto": False,
+                "batch": True,
+            },
+        )
+    claimed = sum(1 for change in result.get("changes", []) if change.get("claimed"))
+    if claimed:
+        db.audit(
+            actor["id"],
+            "creator.claimed_bulk",
+            "cooperation",
+            _client_ip(http_request),
+            http_request.headers.get("user-agent", ""),
+            details={"count": claimed, "auto": True, "source": "cooperation"},
+        )
+    return {
+        "changed": result.get("changed", 0),
+        "conflicts": result.get("conflicts", []),
+        "claimed": claimed,
+    }
 
 
 @app.post("/api/rounds/{round_id}/creators/{platform}/{user_id}/claim")
@@ -2208,6 +3293,8 @@ def batch_claim_creators(
 
 @app.get("/api/rounds/{round_id}/job")
 def latest_job(round_id: int, db: Database = Depends(get_db)) -> dict[str, Any] | None:
+    if not _round_names_visible():
+        return None
     if not db.get_round(round_id):
         raise HTTPException(404, "轮次不存在")
     return _job_dict(db.latest_job(round_id))
@@ -2252,7 +3339,10 @@ def lead_facets(
 ) -> dict[str, Any]:
     if round_id is not None and not db.get_round(round_id):
         raise HTTPException(404, "轮次不存在")
-    return db.lead_facets(round_id)
+    result = db.lead_facets(round_id)
+    if not _round_names_visible():
+        result["rounds"] = []
+    return result
 
 
 @app.get("/api/leads/owners")
@@ -2264,6 +3354,8 @@ LEAD_EXPORT_COLUMNS = [
     "昵称",
     "平台",
     "账号 ID",
+    "平台用户 ID",
+    "身份状态",
     "主页 URL",
     "原始标题",
     "来源",
@@ -2316,7 +3408,9 @@ def _lead_export_value(row: dict[str, Any], column: str) -> Any:
     mapping = {
         "昵称": "nickname",
         "平台": "platform_label",
-        "账号 ID": "account_id",
+        "账号 ID": "platform_handle",
+        "平台用户 ID": "account_id",
+        "身份状态": "identity_status_label",
         "主页 URL": "profile_url",
         "原始标题": "raw_title",
         "来源": "source_label",
@@ -2348,11 +3442,15 @@ def export_leads(
     sort: str = "updated_at",
     order: str = "desc",
     db: Database = Depends(get_db),
+    actor: dict[str, Any] = Depends(require_user),
 ) -> Response:
+    if actor.get("role") != "admin" and not actor.get("can_collect"):
+        round_id = None
     if round_id is not None and not db.get_round(round_id):
         raise HTTPException(404, "轮次不存在")
     statuses = _validated_lead_statuses(status)
     owner_filter = _validated_owner_filter(owner)
+    columns = _lead_export_columns(actor)
     if export_format == "csv":
         filename = "codata_leads.csv"
 
@@ -2360,7 +3458,7 @@ def export_leads(
             yield "\ufeff".encode("utf-8")
             buffer = io.StringIO()
             writer = csv.writer(buffer, lineterminator="\r\n")
-            writer.writerow(LEAD_EXPORT_COLUMNS)
+            writer.writerow(columns)
             yield buffer.getvalue().encode("utf-8")
             with Database(settings.output_dir) as stream_db:
                 for row in _iter_lead_export_rows(
@@ -2369,7 +3467,7 @@ def export_leads(
                     buffer.seek(0)
                     buffer.truncate(0)
                     writer.writerow(
-                        [_lead_export_value(row, column) for column in LEAD_EXPORT_COLUMNS]
+                        [_lead_export_value(row, column) for column in columns]
                     )
                     yield buffer.getvalue().encode("utf-8")
 
@@ -2386,11 +3484,11 @@ def export_leads(
         workbook = Workbook(write_only=True)
         sheet = workbook.create_sheet("线索")
         sheet.freeze_panes = "A2"
-        sheet.append(LEAD_EXPORT_COLUMNS)
+        sheet.append(columns)
         for row in _iter_lead_export_rows(
             db, round_id, platform, search, statuses, source, owner_filter, sort, order
         ):
-            sheet.append([_lead_export_value(row, column) for column in LEAD_EXPORT_COLUMNS])
+            sheet.append([_lead_export_value(row, column) for column in columns])
         workbook.save(temp_path)
     except Exception:
         temp_path.unlink(missing_ok=True)
@@ -2408,7 +3506,7 @@ def create_lead(
     payload: LeadCreateRequest,
     http_request: Request,
     db: Database = Depends(get_db),
-    actor: dict[str, Any] = Depends(require_collector),
+    actor: dict[str, Any] = Depends(require_lead_editor),
 ) -> dict[str, Any]:
     if payload.source_round_id is not None and not db.get_round(payload.source_round_id):
         raise HTTPException(400, "来源轮次不存在")
@@ -2419,6 +3517,7 @@ def create_lead(
         platform=payload.platform.strip().lower(),
         nickname=payload.nickname.strip(),
         account_id=payload.account_id.strip(),
+        platform_handle=payload.platform_handle.strip(),
         profile_url=payload.profile_url.strip(),
         raw_title=payload.raw_title.strip(),
         source=normalize_lead_source(payload.source),
@@ -2463,7 +3562,7 @@ def create_leads_bulk(
     payload: LeadBulkRequest,
     http_request: Request,
     db: Database = Depends(get_db),
-    actor: dict[str, Any] = Depends(require_collector),
+    actor: dict[str, Any] = Depends(require_lead_editor),
 ) -> dict[str, Any]:
     _enforce_action_limit(f"leads-bulk:{actor['id']}")
     created: list[int] = []
@@ -2481,6 +3580,7 @@ def create_leads_bulk(
                 platform=item.platform.strip().lower(),
                 nickname=item.nickname.strip(),
                 account_id=item.account_id.strip(),
+                platform_handle=item.platform_handle.strip(),
                 profile_url=item.profile_url.strip(),
                 raw_title=item.raw_title.strip(),
                 source=normalize_lead_source(item.source),
@@ -2548,7 +3648,7 @@ def update_lead(
     payload: LeadUpdateRequest,
     http_request: Request,
     db: Database = Depends(get_db),
-    actor: dict[str, Any] = Depends(require_collector),
+    actor: dict[str, Any] = Depends(require_lead_editor),
 ) -> dict[str, Any]:
     lead = db.get_lead(lead_id)
     if not lead:
@@ -2608,7 +3708,7 @@ def assign_lead(
     payload: LeadAssignRequest,
     http_request: Request,
     db: Database = Depends(get_db),
-    actor: dict[str, Any] = Depends(require_collector),
+    actor: dict[str, Any] = Depends(require_lead_editor),
 ) -> dict[str, Any]:
     lead = db.get_lead(lead_id)
     if not lead:
@@ -2636,7 +3736,7 @@ def match_lead_endpoint(
     lead_id: int,
     http_request: Request,
     db: Database = Depends(get_db),
-    actor: dict[str, Any] = Depends(require_collector),
+    actor: dict[str, Any] = Depends(require_lead_editor),
 ) -> dict[str, Any]:
     lead = db.get_lead(lead_id)
     if not lead:
@@ -2659,6 +3759,54 @@ def match_lead_endpoint(
     return result
 
 
+@app.post("/api/leads/{lead_id}/verify")
+def verify_lead_endpoint(
+    lead_id: int,
+    payload: LeadVerifyRequest,
+    http_request: Request,
+    db: Database = Depends(get_db),
+    actor: dict[str, Any] = Depends(require_collector),
+) -> dict[str, Any]:
+    lead = db.get_lead(lead_id)
+    if not lead:
+        raise HTTPException(404, "线索不存在")
+    _ensure_lead_owner(lead, actor, "校验")
+    _enforce_action_limit(f"lead-verify:{actor['id']}")
+    try:
+        result = verify_lead_identity(
+            db,
+            settings,
+            lead_id,
+            provider_code=payload.provider,
+            account_id=payload.account_id,
+            platform_handle=payload.platform_handle,
+            profile_url=payload.profile_url,
+            apply=payload.apply,
+            confirm_mismatch=payload.confirm_mismatch,
+            actor_id=actor["id"],
+        )
+    except (ValueError, RuntimeError, PlatformConfigError) as exc:
+        raise HTTPException(400, _public_error(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(400, f"校验失败：{_public_error(exc)}") from exc
+    result.pop("fetched", None)
+    result["note"] = _public_error(result.get("note") or "")
+    result["error"] = _public_error(result.get("error") or "")
+    if result.get("applied"):
+        db.audit(
+            actor["id"],
+            "lead.identity_verified",
+            str(lead_id),
+            _client_ip(http_request),
+            http_request.headers.get("user-agent", ""),
+            details={
+                "confidence": result.get("confidence") or "",
+                "status": result.get("status") or "",
+            },
+        )
+    return result
+
+
 @app.post("/api/leads/{lead_id}/convert")
 def convert_lead_endpoint(
     lead_id: int,
@@ -2678,11 +3826,15 @@ def convert_lead_endpoint(
             settings,
             lead_id,
             account_id=payload.account_id,
+            platform_handle=payload.platform_handle,
             profile_url=payload.profile_url,
             fetch=payload.fetch,
             provider_code=payload.provider,
+            confirm_mismatch=payload.confirm_mismatch,
             actor_id=actor["id"],
         )
+    except LeadIdentityMismatch as exc:
+        raise HTTPException(409, exc.to_dict()) from exc
     except (ValueError, RuntimeError, PlatformConfigError) as exc:
         raise HTTPException(400, _public_error(exc)) from exc
     except Exception as exc:
@@ -2700,6 +3852,8 @@ def convert_lead_endpoint(
 
 @app.get("/api/jobs/active")
 def active_job(db: Database = Depends(get_db)) -> dict[str, Any] | None:
+    if not _round_names_visible():
+        return None
     db.reconcile_stale_jobs(settings.job_stale_minutes)
     payload = _job_dict(db.latest_active_job())
     if payload is not None:
@@ -2709,6 +3863,8 @@ def active_job(db: Database = Depends(get_db)) -> dict[str, Any] | None:
 
 @app.get("/api/jobs/latest")
 def latest_job_overall(db: Database = Depends(get_db)) -> dict[str, Any] | None:
+    if not _round_names_visible():
+        return None
     db.reconcile_stale_jobs(settings.job_stale_minutes)
     payload = _job_dict(db.latest_job_overall())
     if payload is not None:
@@ -2733,7 +3889,9 @@ def cancel_job(
         if starter is None or int(starter) != int(actor["id"]):
             raise HTTPException(403, "只能取消自己发起的任务")
     updated = db.cancel_job(job_id, cancelled_by=int(actor["id"]))
-    terminate_job_process(job.get("pid"), round_id=job.get("round_id"), job_id=job_id)
+    process_terminated = terminate_job_process(
+        job.get("pid"), round_id=job.get("round_id"), job_id=job_id
+    )
     db.audit(
         actor["id"],
         "job.cancelled",
@@ -2742,7 +3900,7 @@ def cancel_job(
         http_request.headers.get("user-agent", ""),
         details={"round_id": job.get("round_id")},
     )
-    return _job_dict(updated)
+    return {**(_job_dict(updated) or {}), "process_terminated": process_terminated}
 
 
 @app.get("/api/rounds/{round_id}/calls")
@@ -2751,6 +3909,8 @@ def recent_calls(
     http_request: Request,
     db: Database = Depends(get_db),
 ) -> list[dict[str, Any]]:
+    if not _round_names_visible():
+        raise HTTPException(403, "当前账号没有采集权限")
     if not db.get_round(round_id):
         raise HTTPException(404, "轮次不存在")
     actor = require_user(http_request)
@@ -2773,6 +3933,8 @@ def job_log(
     lines: int = Query(200, ge=1, le=2000),
     db: Database = Depends(get_db),
 ) -> dict[str, Any]:
+    if not _round_names_visible():
+        raise HTTPException(403, "当前账号没有采集权限")
     if not db.get_round(round_id):
         raise HTTPException(404, "轮次不存在")
     actor = require_user(http_request)
@@ -2797,7 +3959,12 @@ def job_log(
     }
 
 
-def _xlsx_response(items: Iterable[dict[str, Any]], filename: str) -> FileResponse:
+def _xlsx_response(
+    items: Iterable[dict[str, Any]],
+    filename: str,
+    columns: list[str] | None = None,
+) -> FileResponse:
+    headers = columns or list(EXPORT_COLUMNS)
     temp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
     temp_path = Path(temp.name)
     temp.close()
@@ -2805,13 +3972,13 @@ def _xlsx_response(items: Iterable[dict[str, Any]], filename: str) -> FileRespon
         workbook = Workbook(write_only=True)
         sheet = workbook.create_sheet("达人数据")
         sheet.freeze_panes = "A2"
-        for index, header in enumerate(EXPORT_COLUMNS, 1):
+        for index, header in enumerate(headers, 1):
             sheet.column_dimensions[get_column_letter(index)].width = min(
                 max(10, len(header) * 2 + 4), 40
             )
-        sheet.append(list(EXPORT_COLUMNS))
+        sheet.append(headers)
         for item in items:
-            sheet.append([_export_value(item, header) for header in EXPORT_COLUMNS])
+            sheet.append([_export_value(item, header) for header in headers])
         workbook.save(temp_path)
     except Exception:
         temp_path.unlink(missing_ok=True)
@@ -2839,6 +4006,8 @@ def export_round(
     source_mode: str = Query("any", pattern="^(any|all)$"),
     label: str | None = None,
     owner: str | None = None,
+    cooperation: str | None = None,
+    cooperation_stale_days: int | None = Query(None, ge=1, le=365),
     min_fans: int | None = Query(None, ge=0),
     max_fans: int | None = Query(None, ge=0),
     only_unenriched: bool = False,
@@ -2847,6 +4016,8 @@ def export_round(
     order: str = "desc",
     db: Database = Depends(get_db),
 ) -> Response:
+    if not _round_names_visible():
+        raise HTTPException(403, "当前账号没有采集权限")
     if not db.get_round(round_id):
         raise HTTPException(404, "轮次不存在")
     if scope == "all":
@@ -2859,14 +4030,20 @@ def export_round(
         source_mode = "any"
         label = None
         owner = None
+        cooperation = None
+        cooperation_stale_days = None
         min_fans = None
         max_fans = None
         only_unenriched = False
         needs_action = False
+    actor = require_user(http_request)
+    columns = _creator_export_columns(actor)
     filters = {
         "platform": platform,
         "search": search,
-        **_all_creator_filters(status, tier, direction, source),
+        **_all_creator_filters(
+            status, tier, direction, source, cooperation, cooperation_stale_days
+        ),
         "source_mode": source_mode,
         "labels": _csv(label),
         "owner": _validated_owner_filter(owner),
@@ -2874,7 +4051,7 @@ def export_round(
         "max_fans": max_fans,
         "only_unenriched": only_unenriched,
         "needs_action": needs_action,
-        "action_actor_id": int(require_user(http_request)["id"]),
+        "action_actor_id": int(actor["id"]),
     }
     suffix = re.sub(r"[^A-Za-z0-9_-]+", "_", platform or "all")[:40]
     if export_format == "csv":
@@ -2884,7 +4061,7 @@ def export_round(
             yield "\ufeff".encode("utf-8")
             header_buffer = io.StringIO()
             header_writer = csv.writer(header_buffer, lineterminator="\r\n")
-            header_writer.writerow(EXPORT_COLUMNS)
+            header_writer.writerow(columns)
             yield header_buffer.getvalue().encode("utf-8")
             row_buffer = io.StringIO()
             row_writer = csv.writer(row_buffer, lineterminator="\r\n")
@@ -2893,7 +4070,7 @@ def export_round(
                     row_buffer.seek(0)
                     row_buffer.truncate(0)
                     row_writer.writerow(
-                        [_export_value(item, header) for header in EXPORT_COLUMNS]
+                        [_export_value(item, header) for header in columns]
                     )
                     yield row_buffer.getvalue().encode("utf-8")
 
@@ -2904,7 +4081,11 @@ def export_round(
         )
 
     filename = f"codata_round_{round_id}_{suffix}_{scope}.xlsx"
-    return _xlsx_response(_iter_export_items(db, round_id, filters, sort=sort, order=order), filename)
+    return _xlsx_response(
+        _iter_export_items(db, round_id, filters, sort=sort, order=order),
+        filename,
+        columns,
+    )
 
 
 @app.get("/api/creators/export")
@@ -2921,6 +4102,8 @@ def export_all_creators(
     source_mode: str = Query("any", pattern="^(any|all)$"),
     label: str | None = None,
     owner: str | None = None,
+    cooperation: str | None = None,
+    cooperation_stale_days: int | None = Query(None, ge=1, le=365),
     min_fans: int | None = Query(None, ge=0),
     max_fans: int | None = Query(None, ge=0),
     only_unenriched: bool = False,
@@ -2939,14 +4122,20 @@ def export_all_creators(
         source_mode = "any"
         label = None
         owner = None
+        cooperation = None
+        cooperation_stale_days = None
         min_fans = None
         max_fans = None
         only_unenriched = False
         needs_action = False
+    actor = require_user(http_request)
+    columns = _creator_export_columns(actor)
     filters = {
         "platform": platform,
         "search": search,
-        **_all_creator_filters(status, tier, direction, source),
+        **_all_creator_filters(
+            status, tier, direction, source, cooperation, cooperation_stale_days
+        ),
         "source_mode": source_mode,
         "labels": _csv(label),
         "owner": _validated_owner_filter(owner),
@@ -2954,7 +4143,7 @@ def export_all_creators(
         "max_fans": max_fans,
         "only_unenriched": only_unenriched,
         "needs_action": needs_action,
-        "action_actor_id": int(require_user(http_request)["id"]),
+        "action_actor_id": int(actor["id"]),
     }
     suffix = re.sub(r"[^A-Za-z0-9_-]+", "_", platform or "all")[:40]
     if export_format == "csv":
@@ -2964,7 +4153,7 @@ def export_all_creators(
             yield "\ufeff".encode("utf-8")
             header_buffer = io.StringIO()
             header_writer = csv.writer(header_buffer, lineterminator="\r\n")
-            header_writer.writerow(EXPORT_COLUMNS)
+            header_writer.writerow(columns)
             yield header_buffer.getvalue().encode("utf-8")
             row_buffer = io.StringIO()
             row_writer = csv.writer(row_buffer, lineterminator="\r\n")
@@ -2973,7 +4162,7 @@ def export_all_creators(
                     row_buffer.seek(0)
                     row_buffer.truncate(0)
                     row_writer.writerow(
-                        [_export_value(item, header) for header in EXPORT_COLUMNS]
+                        [_export_value(item, header) for header in columns]
                     )
                     yield row_buffer.getvalue().encode("utf-8")
 
@@ -2984,11 +4173,18 @@ def export_all_creators(
         )
 
     filename = f"codata_all_{suffix}_{scope}.xlsx"
-    return _xlsx_response(_iter_export_items(db, None, filters, sort=sort, order=order), filename)
+    return _xlsx_response(
+        _iter_export_items(db, None, filters, sort=sort, order=order),
+        filename,
+        columns,
+    )
 
 
 @app.get("/api/keywords")
-def list_keywords(db: Database = Depends(get_db)) -> list[dict[str, Any]]:
+def list_keywords(
+    actor: dict[str, Any] = Depends(require_collector),
+    db: Database = Depends(get_db),
+) -> list[dict[str, Any]]:
     return db.list_keywords()
 
 
@@ -3060,7 +4256,10 @@ def delete_keyword(
 
 @app.get("/api/counts")
 def counts_endpoint(db: Database = Depends(get_db)) -> dict[str, int]:
-    return db.counts()
+    counts = db.counts()
+    if not _round_names_visible():
+        counts.update({"rounds": 0, "keywords": 0, "creator_rounds": 0})
+    return counts
 
 
 @app.get("/api/dashboard/queue")
@@ -3097,9 +4296,12 @@ def dashboard_queue(
 def dashboard_activity(
     days: int = Query(365, ge=30, le=730),
     tz_offset: int = Query(480, ge=-720, le=840),
+    round_id: int | None = None,
     db: Database = Depends(get_db),
 ) -> dict[str, Any]:
-    return db.activity_calendar(days, tz_offset)
+    if round_id is not None and not db.get_round(round_id):
+        raise HTTPException(404, "轮次不存在")
+    return db.activity_calendar(days, tz_offset, round_id=round_id)
 
 
 @app.get("/api/dashboard/efficiency")
@@ -3108,27 +4310,41 @@ def dashboard_efficiency(
     db: Database = Depends(get_db),
 ) -> dict[str, Any]:
     result = db.round_efficiency(limit)
-    return {
-        "items": [_efficiency_item(row) for row in result["items"]],
-        "totals": result["totals"],
-    }
+    items = [_efficiency_item(row) for row in result["items"]]
+    totals = result["totals"]
+    if not _round_names_visible():
+        for item in items:
+            item.pop("cost", None)
+        totals.pop("cost", None)
+    return {"items": items, "totals": totals}
 
 
 @app.get("/api/dashboard")
 def dashboard(
     round_id: int | None = None,
+    stale_days: int = Query(7, ge=1, le=365),
     db: Database = Depends(get_db),
 ) -> dict[str, Any]:
-    payload: dict[str, Any] = {"counts": db.counts()}
+    if not _round_names_visible():
+        round_id = None
+    counts = db.counts()
+    if not _round_names_visible():
+        counts.update({"rounds": 0, "keywords": 0, "creator_rounds": 0})
+    payload: dict[str, Any] = {"counts": counts}
     if round_id is None:
-        breakdown = db.dashboard_breakdown(None)
+        breakdown = db.dashboard_breakdown(None, stale_days=stale_days)
         metrics = breakdown["metrics"]
         metrics["cost"] = db.sum_round_cost(None)
+        if not _round_names_visible():
+            metrics.pop("cost", None)
         payload.update(
             {
                 "round": None,
                 "tier_counts": breakdown["tier_counts"],
                 "status_counts": breakdown["status_counts"],
+                "cooperation_counts": breakdown["cooperation_counts"],
+                "cooperation_metrics": breakdown["cooperation_metrics"],
+                "cooperation_stale_days": breakdown["cooperation_stale_days"],
                 "metrics": metrics,
                 "lead_metrics": db.lead_metrics(),
             }
@@ -3137,7 +4353,7 @@ def dashboard(
     if not db.get_round(round_id):
         raise HTTPException(404, "轮次不存在")
     round_payload = _round_payload(db, round_id)
-    breakdown = db.dashboard_breakdown(round_id)
+    breakdown = db.dashboard_breakdown(round_id, stale_days=stale_days)
     metrics = breakdown["metrics"]
     metrics["cost"] = int(round_payload.get("summary", {}).get("cost", 0))
     payload.update(
@@ -3145,6 +4361,9 @@ def dashboard(
             "round": round_payload,
             "tier_counts": breakdown["tier_counts"],
             "status_counts": breakdown["status_counts"],
+            "cooperation_counts": breakdown["cooperation_counts"],
+            "cooperation_metrics": breakdown["cooperation_metrics"],
+            "cooperation_stale_days": breakdown["cooperation_stale_days"],
             "metrics": metrics,
             "lead_metrics": db.lead_metrics(round_id),
         }

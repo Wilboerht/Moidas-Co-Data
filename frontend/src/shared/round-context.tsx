@@ -10,6 +10,7 @@ import {
 } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../shared/api";
+import { useAuth } from "../shared/auth-context";
 import type { Counts, Job, Meta, Round, Settings } from "../shared/types";
 
 type RoundContextValue = {
@@ -50,6 +51,10 @@ async function loadBootstrap() {
 
 export function RoundProvider({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient();
+  const { user } = useAuth();
+  const canCollect = Boolean(
+    user && (user.role === "admin" || user.can_collect),
+  );
   const query = useQuery({ queryKey: ["bootstrap"], queryFn: loadBootstrap });
   const [roundId, setRoundIdState] = useState<number | null>(() => {
     const saved = window.localStorage.getItem("codata_round");
@@ -61,7 +66,7 @@ export function RoundProvider({ children }: { children: ReactNode }) {
   const jobQuery = useQuery({
     queryKey: ["job", roundId],
     queryFn: () => api.getJob(roundId!),
-    enabled: roundId !== null,
+    enabled: canCollect && roundId !== null,
     refetchInterval: (query) => {
       const status = query.state.data?.status;
       return status === "running" || status === "pending" ? 2500 : 30000;
@@ -70,6 +75,7 @@ export function RoundProvider({ children }: { children: ReactNode }) {
   const latestJobQuery = useQuery({
     queryKey: ["latest-job"],
     queryFn: api.getLatestJob,
+    enabled: canCollect,
     refetchInterval: (query) => {
       const status = query.state.data?.status;
       return status === "running" || status === "pending" ? 2500 : 15000;
@@ -78,6 +84,7 @@ export function RoundProvider({ children }: { children: ReactNode }) {
   const activeJobQuery = useQuery({
     queryKey: ["active-job"],
     queryFn: api.getActiveJob,
+    enabled: canCollect,
     refetchInterval: (query) => (query.state.data ? 2500 : 15000),
   });
   const latestJob = latestJobQuery.data ?? null;

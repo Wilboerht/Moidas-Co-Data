@@ -145,3 +145,74 @@ def normalize_identity(platform: str, account_id: str, profile_url: str) -> tupl
         ):
             canonical = raw_profile
     return account, canonical
+
+
+_DIGIT_ID_PLATFORMS = {"weibo", "weibo_live", "bilibili", "douyin", "taobao", "kuaishou"}
+_HANDLE_IDENTIFIER_PLATFORMS = {"instagram", "zhihu"}
+
+
+def is_probable_user_id(platform: str, value: str) -> bool:
+    code = str(platform or "xhs").strip().lower()
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if code == "xhs":
+        return bool(re.fullmatch(r"[0-9a-fA-F]{24}", text))
+    if code in _DIGIT_ID_PLATFORMS:
+        return text.isdigit() and len(text) >= 5
+    return False
+
+
+def split_platform_identity(
+    platform: str, value: str, profile_url: str = ""
+) -> tuple[str, str]:
+    """Split a legacy account value into (platform_user_id, platform_handle)."""
+    code = str(platform or "xhs").strip().lower()
+    account = normalize_account_id(code, value) if value else ""
+    profile_account = profile_id_from_url(code, profile_url) if profile_url else ""
+    if not account and profile_account:
+        account = profile_account
+    if code == "xhs":
+        if is_probable_user_id(code, account):
+            return account, ""
+        if profile_account and is_probable_user_id(code, profile_account):
+            return profile_account, account
+        return "", account
+    if code in _DIGIT_ID_PLATFORMS:
+        candidate = account
+        if candidate.upper().startswith("UID:"):
+            candidate = candidate[4:].strip()
+        if is_probable_user_id(code, candidate):
+            return candidate, ""
+        if profile_account and is_probable_user_id(code, profile_account):
+            return profile_account, account
+        return "", account
+    if code in _HANDLE_IDENTIFIER_PLATFORMS:
+        return account, account
+    return "", account
+
+
+_TITLE_SPLIT_RE = re.compile(r"[/|｜∕／]")
+_TITLE_CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
+
+
+def handle_from_raw_title(raw_title: str) -> str:
+    """Best-effort visible handle from an imported raw title's last segment."""
+    parts = [part.strip() for part in _TITLE_SPLIT_RE.split(str(raw_title or ""))]
+    parts = [part.strip().strip(".,;，。；、") for part in parts if part and part.strip()]
+    if not parts:
+        return ""
+    candidate = parts[-1]
+    if not candidate or _TITLE_CJK_RE.search(candidate):
+        return ""
+    if re.search(r"\s", candidate) or "://" in candidate:
+        return ""
+    if re.search(r"[\"'“”‘’「」『』《》]", candidate):
+        return ""
+    if candidate.lower() in {
+        "s", "kol", "ins", "uid", "travel", "fashion", "lifestyle",
+    }:
+        return ""
+    if re.fullmatch(r"[A-Za-z0-9_.\-:@]+", candidate):
+        return candidate
+    return ""

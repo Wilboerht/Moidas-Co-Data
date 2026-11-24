@@ -22,7 +22,8 @@ def _round_creator_rows(db: Database, round_id: int) -> list[dict[str, Any]]:
     rows = db._conn.execute(
         """
         SELECT cr.platform, cr.user_id, cr.account_id AS round_account_id,
-               c.nickname, c.profile_url, c.raw_json, c.fetched_at
+               c.nickname, c.profile_url, c.raw_json, c.fetched_at,
+               c.red_id AS creator_handle
         FROM creator_rounds cr
         JOIN rounds r ON r.id = cr.round_id
         LEFT JOIN creators c
@@ -39,16 +40,20 @@ def _leads_by_identity(
     platform: str,
     account_keys: set[str],
     legacy_keys: set[str],
+    handle_keys: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     leads: dict[int, dict[str, Any]] = {}
-    for chunk in _chunks(account_keys):
+    handle_keys = handle_keys or set()
+    identity_keys = {str(value).strip() for value in [*account_keys, *handle_keys] if str(value).strip()}
+    for chunk in _chunks(identity_keys):
         placeholders = ",".join("?" * len(chunk))
         rows = db._conn.execute(
             f"""
             SELECT * FROM leads
-            WHERE platform = ? AND status IN (?, ?) AND account_id IN ({placeholders})
+            WHERE platform = ? AND status IN (?, ?)
+              AND (account_id IN ({placeholders}) OR platform_handle IN ({placeholders}))
             """,
-            [platform, *ACTIVE_LEAD_STATUSES, *chunk],
+            [platform, *ACTIVE_LEAD_STATUSES, *chunk, *chunk],
         ).fetchall()
         for row in rows:
             leads[int(row["id"])] = dict(row)
@@ -67,12 +72,20 @@ def _leads_by_identity(
 
 
 def _pick_lead(
-    leads: list[dict[str, Any]], user_id: str, round_account_id: str = ""
+    leads: list[dict[str, Any]],
+    user_id: str,
+    round_account_id: str = "",
+    creator_handle: str = "",
 ) -> tuple[dict[str, Any], int]:
+    handle_keys = {value for value in (round_account_id, creator_handle) if value}
+
     def rank(item: dict[str, Any]) -> tuple[int, int]:
         account = str(item.get("account_id") or "")
+        handle = str(item.get("platform_handle") or "")
         if account and account == user_id:
             return 0, int(item["id"])
+        if handle and handle in handle_keys:
+            return 1, int(item["id"])
         if round_account_id and account and account == round_account_id:
             return 1, int(item["id"])
         if (item.get("matched_user_id") or "") == user_id:
@@ -83,10 +96,18 @@ def _pick_lead(
     return ordered[0], max(0, len(ordered) - 1)
 
 
-def _confidence(lead: dict[str, Any], user_id: str, round_account_id: str) -> str:
+def _confidence(
+    lead: dict[str, Any],
+    user_id: str,
+    round_account_id: str,
+    creator_handle: str = "",
+) -> str:
     account = str(lead.get("account_id") or "")
+    handle = str(lead.get("platform_handle") or "")
     if account and account == user_id:
         return "account_id"
+    if handle and handle in {value for value in (round_account_id, creator_handle) if value}:
+        return "platform_handle"
     if round_account_id and account == round_account_id:
         return "round_account_id"
     return "legacy_user_id"
@@ -175,9 +196,15 @@ def match_round_leads(
         platform = str(row.get("platform") or "xhs")
         user_id = str(row.get("user_id") or "").strip()
         round_account_id = str(row.get("round_account_id") or "").strip()
+        creator_handle = str(row.get("creator_handle") or "").strip()
         entry = platforms.setdefault(
             platform,
-            {"creators": [], "account_keys": set(), "legacy_keys": set()},
+            {
+                "creators": [],
+                "account_keys": set(),
+                "handle_keys": set(),
+                "legacy_keys": set(),
+            },
         )
         entry["creators"].append(row)
         if user_id:
@@ -185,20 +212,31 @@ def match_round_leads(
             entry["legacy_keys"].add(user_id)
         if round_account_id:
             entry["account_keys"].add(round_account_id)
+            entry["handle_keys"].add(round_account_id)
+        if creator_handle:
+            entry["handle_keys"].add(creator_handle)
 
     matches: dict[int, dict[str, Any]] = {}
     seen_leads: set[int] = set()
     for platform, entry in platforms.items():
         leads = _leads_by_identity(
-            db, platform, entry["account_keys"], entry["legacy_keys"]
+            db,
+            platform,
+            entry["account_keys"],
+            entry["legacy_keys"],
+            entry["handle_keys"],
         )
         by_account: dict[str, list[dict[str, Any]]] = {}
+        by_handle: dict[str, list[dict[str, Any]]] = {}
         by_legacy: dict[str, list[dict[str, Any]]] = {}
         for lead in leads:
             account = str(lead.get("account_id") or "")
+            handle = str(lead.get("platform_handle") or "")
             legacy = str(lead.get("legacy_user_id") or "")
             if account:
                 by_account.setdefault(account, []).append(lead)
+            if handle:
+                by_handle.setdefault(handle, []).append(lead)
             if legacy:
                 by_legacy.setdefault(legacy, []).append(lead)
         for creator in entry["creators"]:
@@ -206,28 +244,37 @@ def match_round_leads(
             if not user_id:
                 continue
             round_account_id = str(creator.get("round_account_id") or "").strip()
+            creator_handle = str(creator.get("creator_handle") or "").strip()
             candidates: dict[int, dict[str, Any]] = {}
             for key in {user_id, round_account_id}:
                 if not key:
                     continue
                 for lead in by_account.get(key, []):
                     candidates[int(lead["id"])] = lead
+            for key in {round_account_id, creator_handle}:
+                if not key:
+                    continue
+                for lead in by_handle.get(key, []):
+                    candidates[int(lead["id"])] = lead
             for lead in by_legacy.get(user_id, []):
                 candidates[int(lead["id"])] = lead
             if not candidates:
                 continue
             selected, extra = _pick_lead(
-                list(candidates.values()), user_id, round_account_id
+                list(candidates.values()), user_id, round_account_id, creator_handle
             )
             stats["ambiguous"] += extra
             lead_id = int(selected["id"])
             seen_leads.add(lead_id)
-            confidence = _confidence(selected, user_id, round_account_id)
+            confidence = _confidence(
+                selected, user_id, round_account_id, creator_handle
+            )
             match = {
                 "lead_id": lead_id,
                 "platform": platform,
                 "user_id": user_id,
                 "account_id": round_account_id or user_id,
+                "handle": creator_handle,
                 "round_id": round_id,
                 "confidence": confidence,
                 "nickname": creator.get("nickname") or "",
@@ -236,7 +283,7 @@ def match_round_leads(
                 "overwrite": bool(creator.get("fetched_at")),
             }
             current = matches.get(lead_id)
-            if current is None or confidence == "account_id":
+            if current is None or confidence in {"account_id", "platform_handle"}:
                 matches[lead_id] = match
             if len(stats["examples"]) < 10:
                 stats["examples"].append(
@@ -299,28 +346,40 @@ def match_lead_against_creators(
     account, _ = normalize_identity(
         platform, lead.get("account_id") or "", lead.get("profile_url") or ""
     )
-    keys = {key for key in (account, str(lead.get("legacy_user_id") or "").strip()) if key}
+    handle = str(lead.get("platform_handle") or "").strip()
+    keys = {
+        key
+        for key in (
+            account,
+            handle,
+            str(lead.get("legacy_user_id") or "").strip(),
+        )
+        if key
+    }
     if not keys:
         stats["skipped"] = 1
         return stats
     placeholders = ",".join("?" * len(keys))
     rows = db._conn.execute(
         f"""
-        SELECT cr.user_id, cr.round_id, cr.account_id
+        SELECT cr.user_id, cr.round_id, cr.account_id, c.red_id AS creator_handle
         FROM creator_rounds cr
         JOIN rounds r ON r.id = cr.round_id
+        LEFT JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id
         WHERE cr.platform = ?
           AND r.archived_at IS NULL
-          AND (cr.user_id IN ({placeholders}) OR cr.account_id IN ({placeholders}))
+          AND (cr.user_id IN ({placeholders}) OR cr.account_id IN ({placeholders})
+               OR c.red_id IN ({placeholders}))
         ORDER BY cr.round_id DESC
         LIMIT 20
         """,
-        [platform, *keys, *keys],
+        [platform, *keys, *keys, *keys],
     ).fetchall()
     creator: dict[str, Any] | None = None
     round_id: int | None = None
     matched_user_id = ""
     matched_round_account = ""
+    matched_handle = ""
     for row in rows:
         candidate = db.get_creator(platform, row["user_id"])
         if candidate:
@@ -328,6 +387,7 @@ def match_lead_against_creators(
             round_id = int(row["round_id"])
             matched_user_id = str(candidate.get("user_id") or "")
             matched_round_account = str(row["account_id"] or "")
+            matched_handle = str(row["creator_handle"] or "")
             break
     if creator is None:
         for key in keys:
@@ -342,8 +402,11 @@ def match_lead_against_creators(
             db.clear_lead_match(lead_id, actor_id=actor_id)
         return stats
     account = str(lead.get("account_id") or "")
+    handle = str(lead.get("platform_handle") or "")
     if account and account == matched_user_id:
         confidence = "account_id"
+    elif handle and handle in {matched_round_account, matched_handle}:
+        confidence = "platform_handle"
     elif account and matched_round_account and account == matched_round_account:
         confidence = "round_account_id"
     else:
@@ -353,6 +416,7 @@ def match_lead_against_creators(
         "platform": platform,
         "user_id": matched_user_id,
         "account_id": matched_round_account or matched_user_id,
+        "handle": matched_handle,
         "round_id": round_id,
         "confidence": confidence,
         "nickname": creator.get("nickname") or "",

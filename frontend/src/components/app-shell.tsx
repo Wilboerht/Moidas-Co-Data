@@ -96,10 +96,13 @@ function AppSidebar() {
   const { loading, error } = useRound();
   const runtimeStatus = error ? "系统异常" : loading ? "连接中" : "运行正常";
   const runtimeTone = error ? "bg-destructive" : loading ? "bg-amber-500" : "bg-emerald-500";
-  const navItems =
+  const canCollect = user?.role === "admin" || Boolean(user?.can_collect);
+  const navItems = (
     user?.role === "admin"
       ? [...NAV_ITEMS, { href: "/users", label: "用户", icon: UserCog }]
-      : NAV_ITEMS;
+      : NAV_ITEMS
+  ).filter((item) => canCollect || (item.href !== "/tasks" && item.href !== "/keywords"));
+  const systemItems = user?.role === "admin" ? SYSTEM_ITEMS : [];
 
   return (
     <Sidebar collapsible="icon" variant="inset">
@@ -150,31 +153,33 @@ function AppSidebar() {
             </SidebarMenu>
           </SidebarGroupContent>
         </SidebarGroup>
-        <SidebarGroup>
-          <SidebarGroupLabel>系统</SidebarGroupLabel>
-          <SidebarGroupContent>
-            <SidebarMenu>
-              {SYSTEM_ITEMS.map((item) => {
-                const active = location.pathname.startsWith(item.href);
-                return (
-                  <SidebarMenuItem key={item.href}>
-                    <SidebarMenuButton asChild isActive={active} tooltip={item.label}>
-                      <NavLink
-                        to={item.href}
-                        onClick={() => {
-                          if (isMobile) setOpenMobile(false);
-                        }}
-                      >
-                        <item.icon />
-                        <span>{item.label}</span>
-                      </NavLink>
-                    </SidebarMenuButton>
-                  </SidebarMenuItem>
-                );
-              })}
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
+        {systemItems.length > 0 ? (
+          <SidebarGroup>
+            <SidebarGroupLabel>系统</SidebarGroupLabel>
+            <SidebarGroupContent>
+              <SidebarMenu>
+                {systemItems.map((item) => {
+                  const active = location.pathname.startsWith(item.href);
+                  return (
+                    <SidebarMenuItem key={item.href}>
+                      <SidebarMenuButton asChild isActive={active} tooltip={item.label}>
+                        <NavLink
+                          to={item.href}
+                          onClick={() => {
+                            if (isMobile) setOpenMobile(false);
+                          }}
+                        >
+                          <item.icon />
+                          <span>{item.label}</span>
+                        </NavLink>
+                      </SidebarMenuButton>
+                    </SidebarMenuItem>
+                  );
+                })}
+              </SidebarMenu>
+            </SidebarGroupContent>
+          </SidebarGroup>
+        ) : null}
       </SidebarContent>
 
       <SidebarFooter>
@@ -195,13 +200,22 @@ function AppSidebar() {
         <div className="hidden justify-center group-data-[collapsible=icon]:flex">
           <Tooltip>
             <TooltipTrigger asChild>
-              <Link
-                to="/settings"
-                aria-label={`系统${runtimeStatus}，打开设置`}
-                className="flex size-8 items-center justify-center rounded-md outline-hidden hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-sidebar-ring"
-              >
-                <span className={`size-2 rounded-full ${runtimeTone}`} aria-hidden="true" />
-              </Link>
+              {user?.role === "admin" ? (
+                <Link
+                  to="/settings"
+                  aria-label={`系统${runtimeStatus}，打开设置`}
+                  className="flex size-8 items-center justify-center rounded-md outline-hidden hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-sidebar-ring"
+                >
+                  <span className={`size-2 rounded-full ${runtimeTone}`} aria-hidden="true" />
+                </Link>
+              ) : (
+                <span
+                  aria-label={`系统${runtimeStatus}`}
+                  className="flex size-8 items-center justify-center"
+                >
+                  <span className={`size-2 rounded-full ${runtimeTone}`} aria-hidden="true" />
+                </span>
+              )}
             </TooltipTrigger>
             <TooltipContent side="right" align="center">
               系统{runtimeStatus} · v{APP_VERSION}
@@ -256,6 +270,7 @@ export function AppShell() {
   }, [pageTitle]);
 
   useEffect(() => {
+    if (!canCollect) return;
     const previous = previousJobRef.current;
     previousJobRef.current = latestJob;
     if (!previous || !latestJob || previous.id !== latestJob.id) return;
@@ -278,7 +293,7 @@ export function AppShell() {
       description: latestJob.error || "请进入采集记录查看详情",
       duration: 8000,
     });
-  }, [latestJob, rounds]);
+  }, [latestJob, rounds, canCollect]);
 
   return (
     <SidebarProvider defaultOpen={sidebarDefaultOpen}>
@@ -326,34 +341,36 @@ export function AppShell() {
           </Breadcrumb>
           <span className="text-sm font-medium text-[#1C316A] md:hidden">Moidas</span>
           <div className="ml-auto flex items-center gap-3">
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Link
-                  to={statusHref}
-                  aria-label={statusDescription}
-                  className={`group flex h-9 items-center gap-2 text-sm font-medium outline-none transition-colors focus-visible:ring-3 focus-visible:ring-ring/50 ${
-                    statusJob
-                      ? "text-foreground hover:text-primary"
-                      : "text-muted-foreground hover:text-foreground"
-                  }`}
-                >
-                  <span className="flex size-8 items-center justify-center" aria-hidden="true">
-                    <ThinkingOrb
-                      size={32}
-                      dots={80}
-                      dotSize={2}
-                      state={orbState}
-                      color={orbState === "error" ? "#ff3b30" : "currentColor"}
-                      haptics={false}
-                    />
-                  </span>
-                  <span className="hidden max-w-[180px] truncate sm:inline">{statusText}</span>
-                </Link>
-              </TooltipTrigger>
-              <TooltipContent side="bottom" align="end" sideOffset={6}>
-                {statusDescription}
-              </TooltipContent>
-            </Tooltip>
+            {canCollect ? (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Link
+                    to={statusHref}
+                    aria-label={statusDescription}
+                    className={`group flex h-9 items-center gap-2 text-sm font-medium outline-none transition-colors focus-visible:ring-3 focus-visible:ring-ring/50 ${
+                      statusJob
+                        ? "text-foreground hover:text-primary"
+                        : "text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    <span className="flex size-8 items-center justify-center" aria-hidden="true">
+                      <ThinkingOrb
+                        size={32}
+                        dots={80}
+                        dotSize={2}
+                        state={orbState}
+                        color={orbState === "error" ? "#ff3b30" : "currentColor"}
+                        haptics={false}
+                      />
+                    </span>
+                    <span className="hidden max-w-[180px] truncate sm:inline">{statusText}</span>
+                  </Link>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" align="end" sideOffset={6}>
+                  {statusDescription}
+                </TooltipContent>
+              </Tooltip>
+            ) : null}
             {canCollect ? (
               <>
                 <span aria-hidden="true" className="h-4 w-px shrink-0 self-center bg-border" />

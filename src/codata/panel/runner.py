@@ -121,20 +121,19 @@ def terminate_job_process(
     pid: int | None,
     round_id: int | None = None,
     job_id: int | None = None,
-) -> None:
-    if not pid:
-        return
-    if not _process_matches(int(pid), round_id, job_id):
-        return
+) -> bool:
+    if not pid or not _process_matches(int(pid), round_id, job_id):
+        return False
     try:
         if os.name == "nt":
-            subprocess.run(
+            result = subprocess.run(
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
                 capture_output=True,
                 check=False,
                 timeout=10,
             )
-        else:
-            os.kill(int(pid), 15)
+            return result.returncode == 0
+        os.kill(int(pid), 15)
+        return True
     except Exception:
-        pass
+        return False

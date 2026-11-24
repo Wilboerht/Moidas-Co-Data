@@ -9,6 +9,7 @@ Group=codata
 WorkingDirectory=/opt/codata
 EnvironmentFile=/opt/codata/.env
 Environment=CODATA_ROOT=/opt/codata
+Environment=CODATA_ENV_FILE=/opt/codata/data/runtime.env
 ExecStart=/opt/codata/.venv/bin/codata-web --host 127.0.0.1 --port 8501
 Restart=always
 RestartSec=3
@@ -19,7 +20,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/codata/data /opt/codata/.env
+ReadWritePaths=/opt/codata/data
 
 [Install]
 WantedBy=multi-user.target

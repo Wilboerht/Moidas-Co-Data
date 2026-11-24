@@ -288,7 +288,7 @@ def cmd_round_create(settings: Any, args: argparse.Namespace) -> None:
             categories=categories,
         )
         row = db.get_round(round_id)
-        keywords = db.get_round_keywords(round_id)
+        keywords = db.get_round_keywords(round_id, include_disabled=True)
         estimate = Pipeline.estimate(len(keywords), args.pages, args.max_creators or None)
     _out(f"已创建轮次 #{round_id} {row['name']}（关键词 {len(keywords)} 个，每词 {args.pages} 页）")
     _out(f"预估最多 {estimate['total_calls']} 次调用，约 {estimate['tokens']} token")
@@ -445,7 +445,7 @@ def cmd_import_excel(settings: Any, args: argparse.Namespace) -> None:
             categories={keyword: category},
         )
 
-        seen: set[str] = set()
+        seen: set[tuple[str, str]] = set()
         items: list[dict[str, Any]] = []
         with_id = 0
         enriched = 0
@@ -472,11 +472,13 @@ def cmd_import_excel(settings: Any, args: argparse.Namespace) -> None:
                 tags = _cell_text(row.get("标签"))
                 source = _cell_text(row.get("数据来源")) or "护肤达人池"
                 cooperation_platform = _cell_text(row.get("合作主平台"))
+                cooperation_status = _cell_text(row.get("合作状态"))
+                cooperation_updated_at = _cell_text(row.get("合作更新时间"))
                 top_title = _cell_text(row.get("代表作"))
 
                 if account_id:
                     user_id = account_id
-                    if user_id in seen:
+                    if (platform, user_id) in seen:
                         user_id = f"{account_id}~{sheet_name}-{excel_row}"
                     with_id += 1
                 else:
@@ -486,9 +488,9 @@ def cmd_import_excel(settings: Any, args: argparse.Namespace) -> None:
                         )
                     ).hexdigest()[:20]
                     user_id = f"import:{digest}"
-                    while user_id in seen:
+                    while (platform, user_id) in seen:
                         user_id = f"import:{digest}-{excel_row}"
-                seen.add(user_id)
+                seen.add((platform, user_id))
                 if fans is not None:
                     enriched += 1
 
@@ -526,6 +528,8 @@ def cmd_import_excel(settings: Any, args: argparse.Namespace) -> None:
 
                 items.append(
                     {
+                        "cooperation_status": cooperation_status,
+                        "cooperation_updated_at": cooperation_updated_at,
                         "creator": {
                             "platform": platform,
                             "user_id": user_id,

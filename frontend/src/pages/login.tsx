@@ -34,6 +34,7 @@ export function LoginPage() {
       <div className="flex flex-1 items-center justify-center p-6">
         <div className="w-full max-w-sm">
           <div className="mb-6 flex justify-center">
+            <h1 className="sr-only">登录 Moidas Co-data</h1>
             <img src={moidasLogo} alt="Moidas" width={1583} height={462} className="h-10 w-auto" />
           </div>
 
@@ -46,6 +47,8 @@ export function LoginPage() {
                   </Label>
                   <Input
                     id="login-username"
+                    name="username"
+                    spellCheck={false}
                     className="h-10 rounded-lg px-3"
                     autoComplete="username"
                     placeholder="请输入用户名"
@@ -62,6 +65,7 @@ export function LoginPage() {
                   <div className="relative">
                     <Input
                       id="login-password"
+                      name="password"
                       className="h-10 rounded-lg px-3 pr-10"
                       type={showPassword ? "text" : "password"}
                       autoComplete="current-password"
@@ -74,7 +78,7 @@ export function LoginPage() {
                       type="button"
                       variant="ghost"
                       size="icon-sm"
-                      className="absolute top-1/2 right-1.5 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                      className="absolute inset-y-0 right-1.5 my-auto text-muted-foreground hover:text-foreground"
                       onClick={() => setShowPassword((visible) => !visible)}
                       aria-label={showPassword ? "隐藏密码" : "显示密码"}
                       disabled={submitting}

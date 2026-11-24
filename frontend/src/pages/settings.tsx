@@ -56,9 +56,9 @@ const DATA_POLICY = [
     value:
       "数据库结构升级前自动备份；默认保留 90 天、最多 10 份，可用 CODATA_BACKUP_RETENTION_DAYS / CODATA_BACKUP_RETENTION_COUNT 调整（0 表示对应规则不限制）。",
   },
-  { label: "原始响应", value: "服务商原始响应保存在 data/raw，便于复核与重新解析。" },
+  { label: "原始响应", value: "服务商原始响应保存在 data/raw，默认与 API 调用记录保留 365 天；可通过 CODATA_RAW_RETENTION_DAYS / CODATA_API_CALL_RETENTION_DAYS 调整，0 表示永久保留。" },
   { label: "运行日志", value: "采集与运行日志保存在 data/logs。" },
-  { label: "访问凭据", value: "访问令牌仅写入 .env，界面只显示配置状态。" },
+  { label: "访问凭据", value: "访问令牌仅写入配置的密钥文件（本地默认 .env，生产示例为 data/runtime.env），界面只显示配置状态。" },
   { label: "网络边界", value: "默认只监听本机；也支持通过 Nginx/HTTPS 在单台服务器上进行内网或公网部署，所有用户均需登录。" },
   { label: "采集边界", value: "仅采集公开数据，并遵守各服务商的使用条款。" },
 ];

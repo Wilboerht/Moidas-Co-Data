@@ -2,11 +2,12 @@ import { useState, type FormEvent } from "react";
 import { KeyRound, Loader2, LogOut } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "@/shared/auth-context";
-import { MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH } from "@/shared/constants";
+import { MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH, passwordLength } from "@/shared/constants";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import logo from "@/assets/logo.svg";
 
 export function ChangePasswordRequiredPage() {
   const { user, changePassword, logout } = useAuth();
@@ -18,7 +19,7 @@ export function ChangePasswordRequiredPage() {
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (newPassword.length < MIN_PASSWORD_LENGTH) {
+    if (passwordLength(newPassword) < MIN_PASSWORD_LENGTH) {
       setError(`密码至少需要 ${MIN_PASSWORD_LENGTH} 个字符`);
       return;
     }
@@ -40,9 +41,12 @@ export function ChangePasswordRequiredPage() {
   return (
     <div className="flex min-h-screen items-center justify-center bg-muted/30 p-6">
       <div className="w-full max-w-sm space-y-4">
-        <div>
-          <p className="text-base font-semibold text-[#1C316A]">Moidas</p>
-          <p className="text-xs text-muted-foreground">账号：{user?.username}</p>
+        <div className="flex items-center gap-2.5">
+          <img src={logo} alt="" aria-hidden="true" width={481} height={424} className="h-8 w-auto shrink-0" />
+          <div className="min-w-0">
+            <p className="text-base font-semibold text-[#1C316A]">Moidas</p>
+            <p className="text-xs text-muted-foreground">账号：{user?.username}</p>
+          </div>
         </div>
         <Card>
           <CardHeader>
@@ -93,14 +97,14 @@ export function ChangePasswordRequiredPage() {
                   disabled={submitting}
                 />
               </div>
-              {error ? <p className="text-sm text-destructive">{error}</p> : null}
+              {error ? <p role="alert" className="text-sm text-destructive">{error}</p> : null}
               <Button
                 type="submit"
                 className="w-full"
                 disabled={
                   submitting ||
                   !currentPassword ||
-                  newPassword.length < MIN_PASSWORD_LENGTH ||
+                  passwordLength(newPassword) < MIN_PASSWORD_LENGTH ||
                   newPassword !== confirmPassword
                 }
               >

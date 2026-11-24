@@ -43,6 +43,22 @@ function PageFallback() {
   );
 }
 
+function NoCollectAccess() {
+  return (
+    <div className="flex min-h-[40vh] items-center justify-center text-sm text-muted-foreground">
+      无权访问该页面
+    </div>
+  );
+}
+
+function NoAdminAccess() {
+  return (
+    <div className="flex min-h-[40vh] items-center justify-center text-sm text-muted-foreground">
+      需要管理员权限
+    </div>
+  );
+}
+
 function page(Component: ComponentType) {
   return (
     <Suspense fallback={<PageFallback />}>
@@ -70,6 +86,9 @@ export function App() {
     return <ChangePasswordRequiredPage />;
   }
 
+  const canCollect = user.role === "admin" || user.can_collect;
+  const isAdmin = user.role === "admin";
+
   return (
     <RoundProvider>
       <Routes>
@@ -77,12 +96,12 @@ export function App() {
           <Route index element={page(DashboardPage)} />
           <Route path="/creators" element={page(CreatorsPage)} />
           <Route path="/leads" element={page(LeadsPage)} />
-          <Route path="/new" element={page(NewRoundPage)} />
-          <Route path="/tasks" element={page(TasksPage)} />
-          <Route path="/tasks/:roundId" element={page(TaskDetailPage)} />
-          <Route path="/keywords" element={page(KeywordsPage)} />
+          <Route path="/new" element={canCollect ? page(NewRoundPage) : <NoCollectAccess />} />
+          <Route path="/tasks" element={canCollect ? page(TasksPage) : <NoCollectAccess />} />
+          <Route path="/tasks/:roundId" element={canCollect ? page(TaskDetailPage) : <NoCollectAccess />} />
+          <Route path="/keywords" element={canCollect ? page(KeywordsPage) : <NoCollectAccess />} />
           <Route path="/users" element={page(UsersPage)} />
-          <Route path="/settings" element={page(SettingsPage)} />
+          <Route path="/settings" element={isAdmin ? page(SettingsPage) : <NoAdminAccess />} />
           <Route
             path="*"
             element={

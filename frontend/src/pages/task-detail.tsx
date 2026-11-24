@@ -201,9 +201,13 @@ export function TaskDetailPage() {
     if (roundId === null || !job) return;
     setCancelling(true);
     try {
-      await api.cancelJob(job.id);
+      const cancelled = await api.cancelJob(job.id);
       setCancelOpen(false);
-      toast.success("任务已取消");
+      if (cancelled?.process_terminated === false) {
+        toast.warning("任务状态已取消，但进程退出尚未确认，请稍后刷新检查");
+      } else {
+        toast.success("任务已取消");
+      }
       await queryClient.invalidateQueries({ queryKey: ["task", roundId] });
       await queryClient.invalidateQueries({ queryKey: ["task-log", roundId] });
       await queryClient.invalidateQueries({ queryKey: ["task-list"] });
@@ -296,6 +300,23 @@ export function TaskDetailPage() {
   const providerOptions =
     settings?.platforms.find((item) => item.code === roundPlatform)?.providers ?? [];
   const providerValue = providerOverride || round?.provider || "auto";
+  const rerunSearchCalls = (round?.keyword_details?.length ?? 0) * (round?.pages ?? 1);
+  const rerunUserCalls = round?.max_creators ?? rerunSearchCalls * 10;
+  const estimatedRerunTokens = (() => {
+    const candidates = providerOptions.filter((item) => item.ready && item.enabled);
+    const selected = providerValue === "auto"
+      ? candidates.reduce<(typeof providerOptions)[number] | undefined>((best, item) => {
+          const total = rerunSearchCalls * item.search_cost_tokens + rerunUserCalls * item.user_cost_tokens;
+          const bestTotal = best
+            ? rerunSearchCalls * best.search_cost_tokens + rerunUserCalls * best.user_cost_tokens
+            : Number.POSITIVE_INFINITY;
+          return total < bestTotal ? item : best;
+        }, undefined)
+      : candidates.find((item) => item.id === providerValue);
+    return selected
+      ? rerunSearchCalls * selected.search_cost_tokens + rerunUserCalls * selected.user_cost_tokens
+      : 0;
+  })();
   const canCancel = isAdmin || (job?.created_by != null && job.created_by === user?.id);
   const running = job?.status === "running" || job?.status === "pending";
   const taskBusy = running || taskQuery.isLoading || taskQuery.isFetching || !canCollect;
@@ -475,7 +496,10 @@ export function TaskDetailPage() {
                       <TableCell className="text-muted-foreground">{fmtDateTime(call.ts)}</TableCell>
                       <TableCell>{call.kind || "—"}</TableCell>
                       <TableCell>{call.provider ? PROVIDER_LABELS[call.provider] ?? call.provider : "—"}</TableCell>
-                      <TableCell className="max-w-[260px] truncate font-mono text-xs">{call.path || "—"}</TableCell>
+                      <TableCell className="max-w-[260px] font-mono text-xs">
+                        <div className="truncate" title={call.path || undefined}>{call.path || "—"}</div>
+                        {call.error ? <p className="mt-1 whitespace-normal text-destructive">{call.error}</p> : null}
+                      </TableCell>
                       <TableCell className="text-right tabular-nums">{call.code ?? "—"}</TableCell>
                       <TableCell className="text-right tabular-nums">
                         {fmtNumber(call.cost)}
@@ -697,7 +721,7 @@ export function TaskDetailPage() {
           <AlertDialogHeader>
             <AlertDialogTitle>{job ? "重新运行采集？" : "开始采集？"}</AlertDialogTitle>
             <AlertDialogDescription>
-              会再次调用接口读取数据。已缓存的内容默认不会重复扣费。
+              会再次调用接口读取数据。已缓存的内容默认不会重复扣费；按当前配置最多约 {fmtNumber(estimatedRerunTokens)} token。余额检查是预检，不是并发任务间的硬限额。
               {forceRun ? " 本次已选择跳过余额检查。" : ""}
             </AlertDialogDescription>
           </AlertDialogHeader>

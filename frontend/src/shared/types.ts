@@ -17,6 +17,7 @@ export interface Job {
   finished_at: string | null;
   heartbeat_at?: string | null;
   active_count?: number;
+  process_terminated?: boolean;
 }
 
 export interface Round {
@@ -85,7 +86,11 @@ export interface Creator {
   round_status: string;
   round_status_label: string;
   cooperation_status: string;
+  cooperation_status_label: string;
   cooperation_updated_at: string;
+  cooperation_count: number;
+  cooperation_last_completed_at: string;
+  cooperation_case_id: number | null;
   enrichment_status: "not_fetched" | "partial" | "complete";
   match_direction: string;
   posted: number | null;
@@ -133,10 +138,132 @@ export interface Note {
   keywords: string[];
 }
 
+export interface CooperationHistoryEntry {
+  id: number;
+  case_id?: number;
+  ts: string;
+  from_status: string;
+  to_status: string;
+  event_type?: string;
+  note?: string;
+  auto: boolean;
+  batch: boolean;
+  actor_username: string;
+}
+
+export interface CooperationCase {
+  id: number;
+  platform: string;
+  user_id: string;
+  seq: number;
+  status: string;
+  status_label: string;
+  summary: string;
+  started_at: string;
+  status_updated_at: string;
+  completed_at: string | null;
+  closed_at: string | null;
+  created_by: number | null;
+  created_at: string;
+  updated_at: string;
+  event_count: number;
+  attachment_count: number;
+  work_count: number;
+  active: boolean;
+  summary_info?: CooperationSummary;
+  creator?: {
+    platform: string;
+    user_id: string;
+    nickname: string;
+    avatar: string;
+    follow_up_user_id: number | null;
+  };
+}
+
+export interface CooperationEvent {
+  id: number;
+  case_id: number;
+  event_type: string;
+  status_from: string | null;
+  status_to: string | null;
+  from_status_label: string;
+  to_status_label: string;
+  note: string | null;
+  metadata: Record<string, unknown>;
+  actor_user_id: number | null;
+  actor_username: string;
+  created_at: string;
+}
+
+export interface CooperationAttachment {
+  id: number;
+  case_id: number;
+  event_id: number | null;
+  original_name: string;
+  content_type: string;
+  size_bytes: number;
+  sha256: string;
+  category: string;
+  category_label: string;
+  description: string;
+  uploaded_by: number | null;
+  uploaded_by_username: string;
+  created_at: string;
+  download_url: string;
+}
+
+export interface CooperationWork {
+  id: number;
+  case_id: number;
+  platform: string;
+  url: string;
+  title: string;
+  published_at: string;
+  note: string;
+  created_by: number | null;
+  created_by_username: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CooperationSummary {
+  cooperation_status: string;
+  cooperation_updated_at: string;
+  cooperation_count: number;
+  cooperation_last_completed_at: string;
+  cooperation_case_id: number | null;
+}
+
+export interface CooperationCaseDetail {
+  case: CooperationCase;
+  summary: CooperationSummary;
+  events: CooperationEvent[];
+  attachments: CooperationAttachment[];
+  works: CooperationWork[];
+  change?: Record<string, unknown>;
+  created?: Record<string, unknown>;
+  uploaded_attachment_id?: number;
+}
+
+export interface CooperationCaseList {
+  items: CooperationCase[];
+}
+
+export interface CooperationWorkPayload {
+  platform?: string;
+  url: string;
+  title?: string;
+  published_at?: string;
+  note?: string;
+}
+
 export interface CreatorDetail extends Creator {
   desc: string;
   creator_tags: string[];
   raw_json: Record<string, unknown>;
+  cooperation_cases: CooperationCase[];
+  cooperation_summary: CooperationSummary;
+  cooperation_history: CooperationHistoryEntry[];
   notes: Note[];
 }
 
@@ -146,6 +273,13 @@ export interface Lead {
   platform_label: string;
   nickname: string;
   account_id: string;
+  platform_handle: string;
+  identity_status: string;
+  identity_status_label: string;
+  identity_confidence: string;
+  identity_provider: string;
+  identity_checked_at: string | null;
+  identity_note: string;
   profile_url: string;
   raw_title: string;
   source: string;
@@ -207,6 +341,22 @@ export interface LeadAttempt {
   created_at: string;
 }
 
+export interface LeadIdentityEvent {
+  id: number;
+  lead_id: number;
+  event_type: string;
+  old_user_id: string;
+  new_user_id: string;
+  old_handle: string;
+  new_handle: string;
+  provider: string;
+  confidence: string;
+  status: string;
+  note: string;
+  actor_id: number | null;
+  created_at: string;
+}
+
 export interface LeadMatchedCreator {
   platform: string;
   user_id: string;
@@ -216,10 +366,40 @@ export interface LeadMatchedCreator {
   profile_url: string;
 }
 
+export interface LeadVerifyResult {
+  lead_id: number;
+  platform: string;
+  requested_user_id: string;
+  requested_handle: string;
+  requested_profile_url: string;
+  resolved_user_id: string;
+  resolved_handle: string;
+  resolved_nickname: string;
+  resolved_profile_url: string;
+  avatar: string;
+  fans: number | null;
+  confidence: string;
+  status: string;
+  note: string;
+  error: string;
+  provider: string;
+  cost: number;
+  cost_native: number;
+  cost_currency: string;
+  estimated_cost: number;
+  attempts: number;
+  search_cost: number;
+  resolution: string;
+  checked_at: string;
+  applied: boolean;
+  lead?: Lead;
+}
+
 export interface LeadDetail extends Lead {
   raw_json: Record<string, unknown>;
   rounds: LeadRound[];
   attempts: LeadAttempt[];
+  identity_events: LeadIdentityEvent[];
   matched_creator?: LeadMatchedCreator | null;
 }
 
@@ -231,8 +411,10 @@ export interface LeadCreateResponse extends LeadDetail {
 
 export interface LeadIdentityHealth {
   account_index: boolean;
+  handle_index: boolean;
   profile_index: boolean;
   duplicate_account_groups: number;
+  duplicate_handle_groups: number;
   duplicate_profile_groups: number;
 }
 
@@ -252,6 +434,7 @@ export interface LeadOwner {
   username: string;
   role: string;
   can_collect: number;
+  can_edit_leads: number;
 }
 
 export interface LeadFacet {
@@ -358,6 +541,7 @@ export interface AuthUser {
   role: "admin" | "member";
   disabled: boolean;
   can_collect: boolean;
+  can_edit_leads: boolean;
   must_change_password: boolean;
   auth_source: string;
   created_at: string;
@@ -396,6 +580,19 @@ export interface LeadMetrics {
   discarded: number;
 }
 
+export interface DashboardCooperationMetrics {
+  enrolled: number;
+  open: number;
+  stale: number;
+  cooperating: number;
+  completed: number;
+  declined: number;
+  cancelled: number;
+  total_cases: number;
+  completed_cases: number;
+  repeat_creators: number;
+}
+
 export interface DashboardData {
   counts: Counts;
   round?: Round;
@@ -404,6 +601,9 @@ export interface DashboardData {
   tier_counts?: Record<string, number>;
   status_counts?: Record<string, number>;
   metrics?: DashboardMetrics;
+  cooperation_counts?: Record<string, number>;
+  cooperation_metrics?: DashboardCooperationMetrics;
+  cooperation_stale_days?: number;
   lead_metrics?: LeadMetrics;
 }
 
@@ -473,6 +673,7 @@ export interface ApiCall {
   cost_native: number;
   cost_currency: string;
   duration_ms: number | null;
+  error?: string | null;
   raw_file: string | null;
   ts: string;
 }
@@ -513,6 +714,13 @@ export interface StatusDef {
   order: number;
 }
 
+export interface CooperationStatusDef {
+  code: string;
+  label: string;
+  color: string;
+  order: number;
+}
+
 export interface PlatformDef {
   code: string;
   label: string;
@@ -530,9 +738,16 @@ export interface LeadSourceDef {
   label: string;
 }
 
+export interface CooperationAttachmentCategoryDef {
+  code: string;
+  label: string;
+}
+
 export interface Meta {
   statuses: StatusDef[];
   default_status: string;
+  cooperation_statuses: CooperationStatusDef[];
+  cooperation_attachment_categories: CooperationAttachmentCategoryDef[];
   lead_statuses: LeadStatusDef[];
   lead_sources: LeadSourceDef[];
   platforms: PlatformDef[];
@@ -553,6 +768,7 @@ export interface FacetItem {
 export interface Facets {
   platforms: FacetItem[];
   statuses: FacetItem[];
+  cooperation_statuses: FacetItem[];
   tiers: FacetItem[];
   directions: FacetItem[];
   sources: FacetItem[];
@@ -571,6 +787,8 @@ export interface CreatorQuery {
   source_mode: "any" | "all";
   labels: string[];
   owner: string;
+  cooperation: string[];
+  cooperation_stale_days: string;
   min_fans: string;
   max_fans: string;
   only_unenriched: boolean;

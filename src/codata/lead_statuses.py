@@ -26,6 +26,15 @@ LEAD_SOURCE_CODES = [item["code"] for item in LEAD_SOURCE_DEFS]
 LEAD_SOURCE_LABELS = {item["code"]: item["label"] for item in LEAD_SOURCE_DEFS}
 DEFAULT_LEAD_SOURCE = "manual"
 
+LEAD_IDENTITY_DEFS = [
+    {"code": "unverified", "label": "未校验", "color": "gray", "order": 10},
+    {"code": "verified", "label": "已校验", "color": "green", "order": 20},
+    {"code": "mismatch", "label": "待确认", "color": "amber", "order": 30},
+    {"code": "not_found", "label": "未找到", "color": "red", "order": 40},
+]
+LEAD_IDENTITY_CODES = [item["code"] for item in LEAD_IDENTITY_DEFS]
+LEAD_IDENTITY_LABELS = {item["code"]: item["label"] for item in LEAD_IDENTITY_DEFS}
+
 
 def normalize_lead_status(value: Any, default: str = DEFAULT_LEAD_STATUS) -> str:
     text = str(value or "").strip()

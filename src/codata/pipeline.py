@@ -278,22 +278,24 @@ class Pipeline:
                         **search_state,
                         **{key: value for key, value in response.state.items() if value},
                     }
-                for rank, item in enumerate(items, 1):
-                    note, author = provider.normalize_search(item)
-                    if not note.get("note_id"):
-                        continue
-                    if author:
-                        self.db.upsert_creator_basic(author)
-                    self.db.upsert_note(note)
-                    if note.get("author_id"):
-                        self.db.add_note_hit(
-                            round_id,
-                            note["platform"],
-                            note["note_id"],
-                            word,
-                            page,
-                            rank,
-                        )
+                with self.db.transaction():
+                    for rank, item in enumerate(items, 1):
+                        note, author = provider.normalize_search(item)
+                        if not note.get("note_id"):
+                            continue
+                        if author:
+                            self.db.upsert_creator_basic(author, commit=False)
+                        self.db.upsert_note(note, commit=False)
+                        if note.get("author_id"):
+                            self.db.add_note_hit(
+                                round_id,
+                                note["platform"],
+                                note["note_id"],
+                                word,
+                                page,
+                                rank,
+                                commit=False,
+                            )
                 done += 1
                 self.db.update_job(job_id, progress_done=done)
                 print(f"[search] {word} 第 {page} 页: {len(items)} 条")
@@ -492,11 +494,16 @@ class Pipeline:
                 path=path,
                 job_id=getattr(self, "_active_job_id", None),
                 provider=provider,
-                cost_native=float(cost_native.amount) if cost_native is not None else 0,
+                cost_native=(
+                    float(cost_native.amount) * max(1, int(attempts or 1))
+                    if cost_native is not None
+                    else 0
+                ),
                 cost_currency=cost_native.unit if cost_native is not None else "token",
                 estimated_cost=charged_cost or cost * max(1, int(attempts or 1)),
                 attempt=max(1, int(attempts or 1)),
                 status="error",
+                error=str(exc)[:1000],
             )
             raise
         duration = int((time.monotonic() - start) * 1000)
@@ -505,11 +512,15 @@ class Pipeline:
         code = payload.get("code") if isinstance(payload, dict) else None
         if code is None:
             code = 200
-        native_amount = float(cost_native.amount) if cost_native is not None else float(cost)
         native_currency = cost_native.unit if cost_native is not None else "token"
         job_id = getattr(self, "_active_job_id", None)
         client = getattr(provider_obj, "client", None)
         attempts = getattr(client, "last_attempts", 0)
+        native_amount = (
+            float(cost_native.amount) * max(1, int(attempts or 1))
+            if cost_native is not None
+            else float(cost) * max(1, int(attempts or 1))
+        )
         actual_cost = int(getattr(client, "last_cost", 0) or 0) or cost * max(1, int(attempts or 1))
         self.db.log_api_call(
             round_id,
@@ -530,10 +541,8 @@ class Pipeline:
             status="ok",
         )
         if job_id:
-            self._job_cost = getattr(self, "_job_cost", self.db.sum_job_cost(job_id)) + actual_cost
-            self._round_cost = (
-                getattr(self, "_round_cost", self.db.sum_round_cost(round_id)) + actual_cost
-            )
+            self._job_cost = self.db.sum_job_cost(job_id)
+            self._round_cost = self.db.sum_round_cost(round_id)
             self.db.update_job(job_id, cost=self._job_cost)
             self.db.update_round(round_id, cost_tokens=self._round_cost)
         return result

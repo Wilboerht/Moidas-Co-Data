@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 SESSION_COOKIE = "codata_session"
 CSRF_HEADER = "x-csrf-token"
 ROLES = {"admin", "member"}
-MIN_PASSWORD_LENGTH = 6
+MIN_PASSWORD_LENGTH = 8
 MAX_PASSWORD_LENGTH = 200
 USERNAME_RE = re.compile(r"^[\w.@-]{2,32}$", re.UNICODE)
 

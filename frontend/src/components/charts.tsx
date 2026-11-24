@@ -25,20 +25,35 @@ type BarItem = {
   href?: string;
 };
 
+type ChartItem = BarItem & { placeholder?: boolean };
+
 export function HorizontalBarChart({
   items,
   ariaLabel,
   scaleMax: requestedScaleMax,
+  minCategories = 0,
 }: {
   items: BarItem[];
   ariaLabel: string;
   scaleMax?: number;
+  minCategories?: number;
 }) {
   const navigate = useNavigate();
   const hasLinks = items.some((item) => item.href);
   const maxPercent = Math.max(0, ...items.map((item) => item.percent));
   const scaleMax = requestedScaleMax ?? Math.max(10, Math.ceil(maxPercent / 10) * 10);
   const ticks = Array.from({ length: Math.floor(scaleMax / 10) + 1 }, (_, index) => index * 10);
+  const chartItems: ChartItem[] = [...items];
+  for (let index = items.length; index < minCategories; index += 1) {
+    chartItems.push({
+      label: "",
+      value: 0,
+      percent: 0,
+      display: "",
+      color: "transparent",
+      placeholder: true,
+    });
+  }
   const config = {
     percent: { label: "占比", color: "var(--chart-2)" },
   } satisfies ChartConfig;
@@ -51,7 +66,7 @@ export function HorizontalBarChart({
         aria-label={ariaLabel}
       >
         <RechartsBarChart
-          data={items}
+          data={chartItems}
           layout="vertical"
           margin={{ top: 0, right: 130, bottom: 0, left: 0 }}
           barCategoryGap={16}
@@ -69,10 +84,10 @@ export function HorizontalBarChart({
           <YAxis
             type="category"
             dataKey="label"
-            width={80}
+            width={56}
             tickLine={false}
             axisLine={false}
-            tick={{ fontSize: 12 }}
+            tick={{ fontSize: 12, fill: "var(--muted-foreground)" }}
           />
           <ChartTooltip
             cursor={false}
@@ -98,8 +113,11 @@ export function HorizontalBarChart({
             }}
             className={hasLinks ? "cursor-pointer" : undefined}
           >
-            {items.map((item) => (
-              <Cell key={item.label} fill={item.color ?? "var(--color-percent)"} />
+            {chartItems.map((item, index) => (
+              <Cell
+                key={`${item.label}-${index}`}
+                fill={item.placeholder ? "transparent" : item.color ?? "var(--color-percent)"}
+              />
             ))}
             <LabelList dataKey="display" content={<BarValueLabel />} />
           </Bar>

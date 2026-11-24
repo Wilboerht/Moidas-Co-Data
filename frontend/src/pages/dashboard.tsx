@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { CheckCircle2, Coins, ContactRound, RotateCw, UserCheck, Users } from "lucide-react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/shared/api";
 import { fmtNumber } from "@/shared/format";
 import { useAuth } from "@/shared/auth-context";
@@ -32,6 +32,16 @@ const STATUS_CHART_COLORS: Record<string, string> = {
   rejected: "#f43f5e",
 };
 
+const COOPERATION_CHART_COLORS: Record<string, string> = {
+  not_contacted: "#a1a1aa",
+  contacted: "#0ea5e9",
+  negotiating: "#f59e0b",
+  cooperating: "#8b5cf6",
+  completed: "#10b981",
+  declined: "#f43f5e",
+  cancelled: "#94a3b8",
+};
+
 export function withRound(path: string, selectedRoundId: number | null, params: Record<string, string> = {}) {
   if (path !== "/creators" && path !== "/leads") return path;
   const search = new URLSearchParams(params);
@@ -43,14 +53,20 @@ export function withRound(path: string, selectedRoundId: number | null, params: 
 export function DashboardPage() {
   const { user } = useAuth();
   const { roundId, meta, rounds, loading, setRoundId, job, activeJob } = useRound();
+  const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
+  const canCollect = user?.role === "admin" || Boolean(user?.can_collect);
   const [selectedRoundId, setSelectedRoundId] = useState<number | null>(() => {
+    if (!canCollect) return null;
     const value = Number(searchParams.get("round"));
     return Number.isFinite(value) && value > 0 ? value : null;
   });
-  const canCollect = user?.role === "admin" || Boolean(user?.can_collect);
   const selectedJob = selectedRoundId !== null && selectedRoundId === roundId ? job : null;
-  const watchedJob = selectedRoundId === null ? activeJob : selectedJob;
+  const watchedJob = canCollect
+    ? selectedRoundId === null
+      ? activeJob
+      : selectedJob
+    : null;
   const jobActive = watchedJob?.status === "running" || watchedJob?.status === "pending";
   const dashboard = useQuery({
     queryKey: ["dashboard", selectedRoundId],
@@ -58,13 +74,27 @@ export function DashboardPage() {
     refetchInterval: jobActive ? 2500 : false,
   });
 
-  useEffect(() => {
-    const value = Number(searchParams.get("round"));
-    setSelectedRoundId(Number.isFinite(value) && value > 0 ? value : null);
-  }, [searchParams]);
+  const refreshDashboard = () => {
+    void dashboard.refetch();
+    void queryClient.invalidateQueries({ queryKey: ["activity"] });
+  };
 
   useEffect(() => {
-    if (loading || selectedRoundId === null) return;
+    if (!canCollect) {
+      setSelectedRoundId(null);
+      if (searchParams.has("round")) {
+        const params = new URLSearchParams(searchParams);
+        params.delete("round");
+        setSearchParams(params, { replace: true });
+      }
+      return;
+    }
+    const value = Number(searchParams.get("round"));
+    setSelectedRoundId(Number.isFinite(value) && value > 0 ? value : null);
+  }, [searchParams, canCollect, setSearchParams]);
+
+  useEffect(() => {
+    if (!canCollect || loading || selectedRoundId === null) return;
     if (rounds.some((item) => item.id === selectedRoundId)) {
       if (roundId !== selectedRoundId) setRoundId(selectedRoundId);
       return;
@@ -73,7 +103,7 @@ export function DashboardPage() {
     const params = new URLSearchParams(searchParams);
     params.delete("round");
     setSearchParams(params, { replace: true });
-  }, [loading, selectedRoundId, rounds, roundId, setRoundId, searchParams, setSearchParams]);
+  }, [loading, canCollect, selectedRoundId, rounds, roundId, setRoundId, searchParams, setSearchParams]);
 
   const handleRoundChange = (value: string) => {
     const next = value === "all" ? null : Number(value);
@@ -107,7 +137,7 @@ export function DashboardPage() {
         <ErrorState message={dashboard.error instanceof Error ? dashboard.error.message : "加载失败"} />
         <Button
           variant="outline"
-          onClick={() => void dashboard.refetch()}
+          onClick={refreshDashboard}
           disabled={dashboard.isFetching}
           className="w-fit"
         >
@@ -124,11 +154,11 @@ export function DashboardPage() {
       <Page>
         <PageHeader title="工作台" />
         <EmptyState
-          title="还没有采集轮次"
+          title={canCollect ? "还没有采集轮次" : "暂无数据"}
           description={
             canCollect
               ? "新建第一轮采集后，达人数、补全进度和互动数据会出现在这里。"
-              : "暂无采集数据，请联系管理员开通采集权限。"
+              : "当前还没有可展示的达人数据。"
           }
           actions={canCollect ? <Button asChild><Link to="/new">新建采集</Link></Button> : undefined}
         />
@@ -193,20 +223,56 @@ export function DashboardPage() {
       display: `${fmtNumber(count)} · ${percent.toFixed(1)}%`,
     };
   });
+  const cooperationStatuses = meta?.cooperation_statuses ?? [];
+  const cooperationCounts = data.cooperation_counts ?? {};
+  const cooperationMetrics = data.cooperation_metrics;
+  const cooperationEnrolled =
+    cooperationMetrics?.enrolled ??
+    Object.entries(cooperationCounts).reduce(
+      (sum, [code, count]) => (code === "none" ? sum : sum + count),
+      0,
+    );
+  const cooperationSegments = cooperationStatuses
+    .filter((item) => (cooperationCounts[item.code] ?? 0) > 0)
+    .map((item) => {
+      const count = cooperationCounts[item.code] ?? 0;
+      const percent = cooperationEnrolled > 0 ? (count / cooperationEnrolled) * 100 : 0;
+      return {
+        key: item.code,
+        label: item.label,
+        value: count,
+        percent,
+        display: `${fmtNumber(count)} · ${percent.toFixed(1)}%`,
+        color: COOPERATION_CHART_COLORS[item.code],
+        href: withRound("/creators", selectedRoundId, { cooperation: item.code }),
+      };
+    });
+  const notContactedCount = cooperationCounts["not_contacted"] ?? 0;
+  const cooperatingCount = cooperationCounts["cooperating"] ?? 0;
+  const completedCount = cooperationCounts["completed"] ?? 0;
+  const followedUpCount = Math.max(0, cooperationEnrolled - notContactedCount);
+  const followUpRate =
+    cooperationEnrolled > 0 ? (followedUpCount / cooperationEnrolled) * 100 : 0;
+  const cooperationOpen = cooperationMetrics?.open ?? 0;
+  const cooperationStale = cooperationMetrics?.stale ?? 0;
+  const completedCases = cooperationMetrics?.completed_cases ?? 0;
+  const repeatCreators = cooperationMetrics?.repeat_creators ?? 0;
   const jobPercent =
     watchedJob && watchedJob.progress_total > 0
       ? Math.round((watchedJob.progress_done / watchedJob.progress_total) * 100)
       : null;
   const isAllRounds = selectedRoundId === null;
-  const pageDescription = isAllRounds
-    ? `全部 ${rounds.length} 个未归档轮次 · ${fmtNumber(metrics.creators)} 位达人 · ${fmtNumber(leadMetrics.leads)} 条线索`
-    : `${round?.platform_label ? `${round.platform_label} · ` : ""}${round?.category ? `${round.category} · ` : ""}${keywordCount} 个关键词 · 每词 ${round?.pages ?? 1} 页 · ${fmtNumber(metrics.creators)} 位达人 · ${fmtNumber(leadMetrics.leads)} 条线索`;
+  const pageDescription = !canCollect
+    ? `${fmtNumber(metrics.creators)} 位达人 · ${fmtNumber(leadMetrics.leads)} 条线索`
+    : isAllRounds
+      ? `全部 ${rounds.length} 个未归档轮次 · ${fmtNumber(metrics.creators)} 位达人 · ${fmtNumber(leadMetrics.leads)} 条线索`
+      : `${round?.platform_label ? `${round.platform_label} · ` : ""}${round?.category ? `${round.category} · ` : ""}${keywordCount} 个关键词 · 每词 ${round?.pages ?? 1} 页 · ${fmtNumber(metrics.creators)} 位达人 · ${fmtNumber(leadMetrics.leads)} 条线索`;
 
   const kpis = [
     {
       label: "达人总数",
       value: fmtNumber(metrics.creators),
-      hint: isAllRounds ? "跨轮去重后" : "本轮候选",
+      hint: isAllRounds ? (canCollect ? "跨轮去重后" : "已汇总去重") : "本轮候选",
       icon: Users,
       href: withRound("/creators", selectedRoundId),
     },
@@ -225,14 +291,33 @@ export function DashboardPage() {
     {
       label: "已采用",
       value: fmtNumber(metrics.adopted),
-      hint:
+      hint: isAllRounds ? (
         processedTotal > 0 ? (
           <>
-            审核通过率 <span className="font-medium text-foreground">{adoptedRate}%</span>
+            采用率 <span className="font-medium text-foreground">{adoptedRate}%</span>
+            {canCollect ? <>{" "}· 按各达人最近一条轮次统计</> : null}
           </>
         ) : (
           "尚无已审核"
-        ),
+        )
+      ) : processedTotal > 0 ? (
+        <>
+          审核通过率 <span className="font-medium text-foreground">{adoptedRate}%</span>
+          {notContactedCount > 0 || cooperatingCount > 0 || completedCount > 0 ? (
+            <>
+              {" "}· 未联系 <span className="font-medium text-foreground">{fmtNumber(notContactedCount)}</span>
+              {" "}· 合作中 <span className="font-medium text-foreground">{fmtNumber(cooperatingCount)}</span>
+              {completedCount > 0 ? (
+                <>
+                  {" "}· 完成 <span className="font-medium text-foreground">{fmtNumber(completedCount)}</span>
+                </>
+              ) : null}
+            </>
+          ) : null}
+        </>
+      ) : (
+        "尚无已审核"
+      ),
       icon: UserCheck,
       href: withRound("/creators", selectedRoundId, { status: "adopted" }),
     },
@@ -268,9 +353,9 @@ export function DashboardPage() {
           </>
         ),
       icon: Coins,
-      href: "/tasks",
+      href: canCollect ? "/tasks" : null,
     },
-  ];
+  ].filter((item) => canCollect || item.href !== null);
 
   return (
     <Page>
@@ -279,23 +364,25 @@ export function DashboardPage() {
         description={`${pageDescription}${jobActive ? " · 采集进行中，自动刷新" : ""}`}
         actions={
           <>
-            <Button variant="outline" onClick={() => void dashboard.refetch()} disabled={dashboard.isFetching}>
+            <Button variant="outline" onClick={refreshDashboard} disabled={dashboard.isFetching}>
               <RotateCw className={dashboard.isFetching ? "animate-spin" : undefined} />
               刷新
             </Button>
-            <Select value={isAllRounds ? "all" : String(selectedRoundId)} onValueChange={handleRoundChange}>
-              <SelectTrigger className="w-[220px]" aria-label="选择轮次">
-                <SelectValue placeholder="全部轮次" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">全部轮次</SelectItem>
-                {rounds.map((item) => (
-                  <SelectItem key={item.id} value={String(item.id)}>
-                    {item.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            {canCollect ? (
+              <Select value={isAllRounds ? "all" : String(selectedRoundId)} onValueChange={handleRoundChange}>
+                <SelectTrigger className="w-[220px]" aria-label="选择轮次">
+                  <SelectValue placeholder="全部轮次" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">全部轮次</SelectItem>
+                  {rounds.map((item) => (
+                    <SelectItem key={item.id} value={String(item.id)}>
+                      {item.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            ) : null}
           </>
         }
       />
@@ -324,19 +411,17 @@ export function DashboardPage() {
               <Progress value={jobPercent} className="h-1 max-w-md" aria-label="采集任务进度" />
             ) : null}
           </div>
-          <Button asChild variant="outline" size="sm">
-            <Link to={`/tasks/${watchedJob?.round_id ?? roundId}`}>查看采集任务</Link>
-          </Button>
+          {canCollect ? (
+            <Button asChild variant="outline" size="sm">
+              <Link to={`/tasks/${watchedJob?.round_id ?? roundId}`}>查看采集任务</Link>
+            </Button>
+          ) : null}
         </div>
       ) : null}
 
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-6">
-        {kpis.map((item) => (
-          <Link
-            key={item.label}
-            to={item.href}
-            className="rounded-xl outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
-          >
+        {kpis.map((item) => {
+          const card = (
             <Card size="sm" className="h-full transition-colors hover:bg-muted/30">
               <CardHeader className="gap-1">
                 <CardDescription>{item.label}</CardDescription>
@@ -347,47 +432,116 @@ export function DashboardPage() {
                 </CardAction>
               </CardHeader>
             </Card>
-          </Link>
-        ))}
+          );
+          return item.href ? (
+            <Link
+              key={item.label}
+              to={item.href}
+              className="rounded-xl outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+            >
+              {card}
+            </Link>
+          ) : (
+            <div key={item.label}>{card}</div>
+          );
+        })}
         <ActionSummary roundId={selectedRoundId} />
       </div>
 
-      <div className="grid items-start gap-4 lg:grid-cols-2">
-        <Card>
+      <div className="grid gap-4 lg:grid-cols-3">
+        <Card className="h-full">
           <CardHeader>
-            <CardTitle>审核进度</CardTitle>
-            <CardDescription>
-              共 {fmtNumber(total)} 位达人，点击柱条按审核状态筛选。
+            <CardTitle>{isAllRounds ? "采用分布" : "本轮审核进度"}</CardTitle>
+            <CardDescription className="min-h-10">
+              {isAllRounds
+                ? `共 ${fmtNumber(total)} 位达人${canCollect ? "，按各达人最近一条轮次统计" : ""}，点击柱条按采用状态筛选。`
+                : `共 ${fmtNumber(total)} 位达人，点击柱条按审核状态筛选。`}
             </CardDescription>
             <CardAction>
-              <Badge variant="secondary">已处理 {processedPercent.toFixed(1)}%</Badge>
+              <Badge
+                variant="secondary"
+                title={
+                  isAllRounds
+                    ? canCollect
+                      ? "已处理 = 已审核（非待审核）达人 / 全部达人；按各达人最近一条轮次统计"
+                      : "已处理 = 已审核（非待审核）达人 / 全部达人"
+                    : "已处理 = 本轮已审核（非待审核）达人 / 本轮达人"
+                }
+              >
+                已处理 {processedPercent.toFixed(1)}%
+              </Badge>
             </CardAction>
           </CardHeader>
           <CardContent>
             {statusSegments.length === 0 ? (
               <p className="text-sm text-muted-foreground">暂无达人数据。</p>
             ) : (
-              <HorizontalBarChart items={statusSegments} ariaLabel="审核状态分布" />
+              <HorizontalBarChart
+                items={statusSegments}
+                ariaLabel={isAllRounds ? "采用状态分布" : "审核状态分布"}
+                minCategories={5}
+              />
             )}
           </CardContent>
         </Card>
 
-        <Card>
+        <Card className="h-full">
           <CardHeader>
             <CardTitle>粉丝层级</CardTitle>
-            <CardDescription>已补全 {fmtNumber(tierTotal)} 位达人的粉丝量级分布。</CardDescription>
+            <CardDescription className="min-h-10">
+              已补全 {fmtNumber(tierTotal)} 位达人的粉丝量级分布。
+            </CardDescription>
+            <CardAction>
+              <Badge
+                variant="secondary"
+                title="已补全 = 资料完整（粉丝、笔记数、总点赞等已抓取）的达人 / 全部达人"
+              >
+                已补全 {completion}%
+              </Badge>
+            </CardAction>
           </CardHeader>
           <CardContent>
             {tierItems.length === 0 ? (
               <p className="text-sm text-muted-foreground">暂无已补全的粉丝层级数据。</p>
             ) : (
-              <HorizontalBarChart items={tierItems} ariaLabel="粉丝层级分布" />
+              <HorizontalBarChart items={tierItems} ariaLabel="粉丝层级分布" minCategories={5} />
+            )}
+          </CardContent>
+        </Card>
+
+        <Card className="h-full">
+          <CardHeader>
+            <CardTitle>合作跟进</CardTitle>
+            <CardDescription className="min-h-10">
+              共 {fmtNumber(cooperationEnrolled)} 位已进入合作流程；进行中{" "}
+              {fmtNumber(cooperationOpen)} 位，超期 {fmtNumber(cooperationStale)} 位。
+              累计完成 {fmtNumber(completedCases)} 次，重复合作{" "}
+              {fmtNumber(repeatCreators)} 人。
+            </CardDescription>
+            <CardAction>
+              <Badge
+                variant="secondary"
+                title="按已进入合作流程的达人计算；已联系、洽谈中、合作中、合作完成、已拒绝、已取消均视为已跟进"
+              >
+                已跟进 {followUpRate.toFixed(1)}%
+              </Badge>
+            </CardAction>
+          </CardHeader>
+          <CardContent>
+            {cooperationSegments.length === 0 ? (
+              <p className="text-sm text-muted-foreground">暂无已进入合作流程的达人。</p>
+            ) : (
+              <HorizontalBarChart
+                items={cooperationSegments}
+                ariaLabel="合作状态分布"
+                minCategories={5}
+              />
             )}
           </CardContent>
         </Card>
       </div>
 
-      <ActivityCalendar />
+      <ActivityCalendar roundId={selectedRoundId} hideRoundScope={!canCollect} />
     </Page>
   );
 }

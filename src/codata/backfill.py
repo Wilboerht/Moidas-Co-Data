@@ -4,7 +4,6 @@ import argparse
 import json
 import re
 import sys
-import time
 from typing import Any
 
 from .config import load_settings
@@ -12,6 +11,7 @@ from .db import Database
 from .matching import match_round_leads
 from .normalize import as_optional_int
 from .platforms import load_registry
+from .provider_audit import call_provider
 from .providers import build_provider
 from .providers_multi import EveryInfraProvider
 
@@ -122,27 +122,14 @@ def main(argv: list[str] | None = None) -> None:
                     print(f"[{index}/{len(candidates)}] {imported_id}: 无昵称，跳过")
                     continue
                 try:
-                    started = time.perf_counter()
-                    result = provider.search_users(nickname)
-                    duration_ms = int((time.perf_counter() - started) * 1000)
-                    search_price = provider.search_price
-                    search_attempts = max(1, int(provider.client.last_attempts or 1))
-                    search_cost = provider.client.last_cost or provider.search_cost_tokens * search_attempts
-                    db.log_api_call(
-                        None,
-                        args.platform,
+                    result = call_provider(
+                        db,
+                        provider,
                         "search_users",
-                        {"keyword": nickname},
-                        None,
-                        200,
-                        search_cost,
-                        duration_ms,
-                        path=provider.search_path,
-                        provider=provider.provider_id,
-                        cost_native=float(search_price.amount) if search_price else 0.0,
-                        cost_currency=search_price.currency if search_price else "token",
-                        estimated_cost=search_cost,
-                        attempt=search_attempts,
+                        lambda: provider.search_users(nickname),
+                        params={"keyword": nickname},
+                        round_id=None,
+                        label=f"backfill_{args.platform}_search_{imported_id}",
                     )
                     selected, note = choose_exact(result.items, nickname)
                     if selected is None:
@@ -168,27 +155,14 @@ def main(argv: list[str] | None = None) -> None:
                         skipped += 1
                         print(f"[{index}/{len(candidates)}] {nickname}: 匹配结果无 ID，跳过")
                         continue
-                    started = time.perf_counter()
-                    payload = provider.user(real_id)
-                    duration_ms = int((time.perf_counter() - started) * 1000)
-                    user_price = provider.user_price
-                    user_attempts = max(1, int(provider.client.last_attempts or 1))
-                    user_cost = provider.client.last_cost or provider.user_cost_tokens * user_attempts
-                    db.log_api_call(
-                        None,
-                        args.platform,
+                    payload = call_provider(
+                        db,
+                        provider,
                         "user",
-                        {"userId": real_id},
-                        None,
-                        200,
-                        user_cost,
-                        duration_ms,
-                        path=provider.user_path,
-                        provider=provider.provider_id,
-                        cost_native=float(user_price.amount) if user_price else 0.0,
-                        cost_currency=user_price.currency if user_price else "token",
-                        estimated_cost=user_cost,
-                        attempt=user_attempts,
+                        lambda: provider.user(real_id),
+                        params={"userId": real_id},
+                        round_id=None,
+                        label=f"backfill_{args.platform}_user_{real_id}",
                     )
                     creator = provider.normalize_user(payload, real_id)
                     affected_rounds.update(

@@ -6,6 +6,10 @@ from typing import Any
 
 import pandas as pd
 
+from ..cooperation_statuses import (
+    COOPERATION_STATUS_LABELS,
+    normalize_cooperation_status,
+)
 from ..db import Database
 from ..normalize import format_fans_wan, normalize_tier_label, split_tags
 from ..statuses import STATUS_LABELS
@@ -48,6 +52,7 @@ REQUESTED_COLUMNS = [
     "粉丝层级",
     "数据轮次",
     "采用状态",
+    "合作状态",
     "匹配方向",
     "笔记数",
     "总点赞",
@@ -65,6 +70,9 @@ EXTRA_COLUMNS = [
     "备注",
     "负责人",
     "合作主平台",
+    "合作更新时间",
+    "合作次数",
+    "最近完成合作",
     "原始标题",
     "样本笔记",
     "样本点赞",
@@ -164,6 +172,14 @@ def creator_rows(db: Database, round_id: int) -> pd.DataFrame:
             account_id = "" if str(user_id).startswith("import:") else user_id
         tier_label = normalize_tier_label(fans, row.get("tier_label"))
         data_round = row.get("data_round") or row.get("round_name") or ""
+        cooperation_code = normalize_cooperation_status(
+            row.get("cooperation_status")
+        )
+        cooperation_label = (
+            COOPERATION_STATUS_LABELS.get(cooperation_code, cooperation_code)
+            if cooperation_code
+            else "未进入"
+        )
         rows.append(
             {
                 "_key": f"{row['platform']}|{user_id}",
@@ -176,6 +192,10 @@ def creator_rows(db: Database, round_id: int) -> pd.DataFrame:
                 "粉丝层级": tier_label,
                 "数据轮次": data_round,
                 "采用状态": STATUS_LABELS.get(row.get("status"), row.get("status") or "待审核"),
+                "合作状态": cooperation_label,
+                "合作更新时间": row.get("cooperation_updated_at") or "",
+                "合作次数": int(row.get("cooperation_count") or 0),
+                "最近完成合作": row.get("cooperation_last_completed_at") or "",
                 "匹配方向": row.get("match_direction") or "",
                 "备注": row.get("remark") or "",
                 "笔记数": row.get("posted"),

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from codata import config
 from codata.storage import as_cursor, as_items, item_author, item_id, item_title
 
 
@@ -45,6 +49,23 @@ class ExtractionTests(unittest.TestCase):
 
     def test_item_id_handles_userid(self) -> None:
         self.assertEqual(item_id({"userid": "u1", "nickname": "咖啡师"}), "u1")
+
+
+class ConfigTests(unittest.TestCase):
+    def test_runtime_env_overrides_base_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".env").write_text("DATAFLOW_TOKEN=base\n", encoding="utf-8")
+            runtime = root / "data" / "runtime.env"
+            runtime.parent.mkdir()
+            runtime.write_text("DATAFLOW_TOKEN=runtime\n", encoding="utf-8")
+            with (
+                patch.object(config, "PROJECT_ROOT", root),
+                patch.dict(os.environ, {"CODATA_ENV_FILE": str(runtime)}),
+            ):
+                loaded = config.load_settings(require_credentials=False)
+                self.assertEqual(loaded.token, "runtime")
+                self.assertEqual(config.runtime_env_path(), runtime)
 
 
 if __name__ == "__main__":

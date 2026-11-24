@@ -83,7 +83,7 @@ class AuthApiTests(unittest.TestCase):
         )
         response = self.client.post(
             "/api/users",
-            json={"username": "new-user", "password": "new-password-123", "role": "member"},
+            json={"username": "new-user", "password": "new-password-123word-123", "role": "member"},
             headers=headers,
         )
         self.assertEqual(response.status_code, 200, response.text)
@@ -103,12 +103,12 @@ class AuthApiTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 400, response.text)
 
-    def test_six_character_password_is_allowed(self) -> None:
+    def test_eight_character_password_is_allowed(self) -> None:
         login = self.login("admin-test", "admin-password-123")
         headers = {"X-CSRF-Token": login["csrf_token"]}
         response = self.client.post(
             "/api/users",
-            json={"username": "short-pass", "password": "123456", "role": "member"},
+            json={"username": "short-pass", "password": "12345678", "role": "member"},
             headers=headers,
         )
         self.assertEqual(response.status_code, 200, response.text)
@@ -210,6 +210,104 @@ class AuthApiTests(unittest.TestCase):
         )
         self.assertEqual(allowed.status_code, 200, allowed.text)
 
+    def test_lead_editor_permission_without_collect(self) -> None:
+        admin = self.login("admin-test", "admin-password-123")
+        admin_headers = {"X-CSRF-Token": admin["csrf_token"]}
+        created = self.client.post(
+            "/api/users",
+            json={
+                "username": "lead-editor",
+                "password": "lead-editor-password-123",
+                "role": "member",
+                "can_collect": False,
+                "can_edit_leads": True,
+            },
+            headers=admin_headers,
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        self.assertFalse(created.json()["can_collect"])
+        self.assertTrue(created.json()["can_edit_leads"])
+        editor_id = created.json()["id"]
+        self.client.post("/api/auth/logout", headers=admin_headers)
+
+        login = self.login("lead-editor", "lead-editor-password-123")
+        headers = {"X-CSRF-Token": login["csrf_token"]}
+        changed = self.client.post(
+            "/api/auth/change-password",
+            json={"current_password": "lead-editor-password-123", "new_password": "lead-editor-password-456"},
+            headers=headers,
+        )
+        self.assertEqual(changed.status_code, 200, changed.text)
+        denied_round = self.client.post(
+            "/api/rounds",
+            json={"keywords": ["测试"], "pages": 1, "max_creators": 1, "start": False},
+            headers=headers,
+        )
+        self.assertEqual(denied_round.status_code, 403)
+        created_lead = self.client.post(
+            "/api/leads",
+            json={"platform": "xhs", "nickname": "线索编辑者提供的线索"},
+            headers=headers,
+        )
+        self.assertEqual(created_lead.status_code, 200, created_lead.text)
+        lead_id = created_lead.json()["id"]
+        updated = self.client.patch(
+            f"/api/leads/{lead_id}",
+            json={"nickname": "更新后的线索"},
+            headers=headers,
+        )
+        self.assertEqual(updated.status_code, 200, updated.text)
+        assigned = self.client.post(
+            f"/api/leads/{lead_id}/assign",
+            json={"owner_user_id": editor_id},
+            headers=headers,
+        )
+        self.assertEqual(assigned.status_code, 200, assigned.text)
+        matched = self.client.post(f"/api/leads/{lead_id}/match", headers=headers)
+        self.assertEqual(matched.status_code, 200, matched.text)
+        bulk = self.client.post(
+            "/api/leads/bulk",
+            json={"items": [{"platform": "xhs", "nickname": "批量线索"}]},
+            headers=headers,
+        )
+        self.assertEqual(bulk.status_code, 200, bulk.text)
+        lead_export = self.client.get("/api/leads/export?format=csv")
+        self.assertEqual(lead_export.status_code, 200)
+        lead_header = lead_export.content.decode("utf-8-sig").splitlines()[0]
+        self.assertNotIn("来源轮次", lead_header)
+        self.assertNotIn("匹配轮次", lead_header)
+        creators_export = self.client.get("/api/creators/export?format=csv")
+        self.assertEqual(creators_export.status_code, 200)
+        creators_header = creators_export.content.decode("utf-8-sig").splitlines()[0]
+        self.assertNotIn("数据轮次", creators_header)
+        denied_convert = self.client.post(
+            f"/api/leads/{lead_id}/convert",
+            json={},
+            headers=headers,
+        )
+        self.assertEqual(denied_convert.status_code, 403)
+        self.client.post("/api/auth/logout", headers=headers)
+
+        admin = self.login("admin-test", "admin-password-123")
+        admin_headers = {"X-CSRF-Token": admin["csrf_token"]}
+        revoked = self.client.patch(
+            f"/api/users/{editor_id}",
+            json={"can_edit_leads": False},
+            headers=admin_headers,
+        )
+        self.assertEqual(revoked.status_code, 200, revoked.text)
+        self.assertFalse(revoked.json()["can_edit_leads"])
+        self.client.post("/api/auth/logout", headers=admin_headers)
+
+        login = self.login("lead-editor", "lead-editor-password-456")
+        headers = {"X-CSRF-Token": login["csrf_token"]}
+        denied_lead = self.client.post(
+            "/api/leads",
+            json={"platform": "xhs", "nickname": "无权限线索"},
+            headers=headers,
+        )
+        self.assertEqual(denied_lead.status_code, 403)
+
     def test_self_service_restrictions(self) -> None:
         login = self.login("admin-test", "admin-password-123")
         headers = {"X-CSRF-Token": login["csrf_token"]}
@@ -217,7 +315,7 @@ class AuthApiTests(unittest.TestCase):
         admin_id = next(user["id"] for user in users if user["username"] == "admin-test")
         reset = self.client.post(
             f"/api/users/{admin_id}/reset-password",
-            json={"new_password": "123456"},
+            json={"new_password": "123456789012"},
             headers=headers,
         )
         self.assertEqual(reset.status_code, 400, reset.text)
@@ -306,14 +404,14 @@ class AuthApiTests(unittest.TestCase):
         )
         reset = self.client.post(
             f"/api/users/{member_id}/reset-password",
-            json={"new_password": "new-pass"},
+            json={"new_password": "new-password-123"},
             headers=admin_headers,
         )
         self.assertEqual(reset.status_code, 200, reset.text)
         self.assertEqual(member_client.get("/api/rounds").status_code, 401)
         relogin = member_client.post(
             "/api/auth/login",
-            json={"username": "member-test", "password": "new-pass"},
+            json={"username": "member-test", "password": "new-password-123"},
         ).json()
         self.assertTrue(relogin["user"]["must_change_password"])
         headers = {"X-CSRF-Token": relogin["csrf_token"]}
@@ -321,7 +419,7 @@ class AuthApiTests(unittest.TestCase):
         self.assertEqual(
             member_client.post(
                 "/api/auth/change-password",
-                json={"current_password": "new-pass", "new_password": "new-pass-2"},
+                json={"current_password": "new-password-123", "new_password": "new-password-123-2"},
                 headers=headers,
             ).status_code,
             200,

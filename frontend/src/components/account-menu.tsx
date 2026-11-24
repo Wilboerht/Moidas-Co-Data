@@ -2,7 +2,7 @@ import { useState, type FormEvent } from "react";
 import { ChevronUp, KeyRound, LogOut, UserRound } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "@/shared/auth-context";
-import { MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH } from "@/shared/constants";
+import { MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH, passwordLength } from "@/shared/constants";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -36,7 +36,7 @@ export function AccountMenu() {
 
   const submitPassword = async (event: FormEvent) => {
     event.preventDefault();
-    if (newPassword.length < MIN_PASSWORD_LENGTH) {
+    if (passwordLength(newPassword) < MIN_PASSWORD_LENGTH) {
       setError(`密码至少需要 ${MIN_PASSWORD_LENGTH} 个字符`);
       return;
     }
@@ -147,7 +147,7 @@ export function AccountMenu() {
                 disabled={
                   submitting ||
                   !currentPassword ||
-                  newPassword.length < MIN_PASSWORD_LENGTH ||
+                  passwordLength(newPassword) < MIN_PASSWORD_LENGTH ||
                   newPassword !== confirmPassword
                 }
               >

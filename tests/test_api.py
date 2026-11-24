@@ -146,6 +146,9 @@ class ApiTests(unittest.TestCase):
             "owner_user_id",
             "owner_username",
             "claimed_at",
+            "cooperation_status",
+            "cooperation_status_label",
+            "cooperation_updated_at",
             "cooperation_platform",
             "raw_title",
             "remark",
@@ -280,6 +283,65 @@ class ApiTests(unittest.TestCase):
         self.assertIsNone(released.json()["owner_user_id"])
         self.assertEqual(released.json()["owner_username"], "")
 
+    def test_round_fields_hidden_without_collect_permission(self) -> None:
+        with Database(self.settings.output_dir) as db:
+            db.create_user("viewer", hash_password("viewer-password-123"), role="member")
+        created_lead = self.client.post(
+            "/api/leads",
+            json={
+                "platform": "xhs",
+                "nickname": "轮次线索",
+                "source_round_id": self.round_id,
+            },
+        )
+        self.assertEqual(created_lead.status_code, 200, created_lead.text)
+        lead_id = created_lead.json()["id"]
+        self.client.post("/api/auth/logout")
+        login = self.client.post(
+            "/api/auth/login",
+            json={"username": "viewer", "password": "viewer-password-123"},
+        )
+        self.assertEqual(login.status_code, 200, login.text)
+
+        rounds = self.client.get("/api/rounds").json()
+        self.assertTrue(rounds)
+        self.assertTrue(all(item["name"] == "" for item in rounds))
+        self.assertTrue(all(item["job"] is None for item in rounds))
+        self.assertIsNone(self.client.get("/api/jobs/latest").json())
+        self.assertIsNone(self.client.get("/api/jobs/active").json())
+        self.assertIsNone(self.client.get(f"/api/rounds/{self.round_id}/job").json())
+
+        creators = self.client.get("/api/creators").json()
+        self.assertEqual(creators["items"][0]["round_name"], "")
+        self.assertEqual(creators["items"][0]["data_round"], "")
+        detail = self.client.get(f"/api/rounds/{self.round_id}/creators/xhs/u1").json()
+        self.assertEqual(detail["round_name"], "")
+        self.assertEqual(detail["data_round"], "")
+
+        lead = self.client.get(f"/api/leads/{lead_id}").json()
+        self.assertEqual(lead["source_round_name"], "")
+        self.assertTrue(lead["rounds"])
+        self.assertEqual(lead["rounds"][0]["round_name"], "")
+        listed = self.client.get("/api/leads").json()
+        self.assertEqual(listed["items"][0]["source_round_name"], "")
+
+        dashboard = self.client.get(f"/api/dashboard?round_id={self.round_id}").json()
+        self.assertIsNone(dashboard["round"])
+        self.assertNotIn("cost", dashboard["metrics"])
+        self.assertEqual(dashboard["counts"]["rounds"], 0)
+        viewer_settings = self.client.get("/api/settings").json()
+        self.assertEqual(viewer_settings["platforms"], [])
+        self.assertEqual(viewer_settings["providers"], [])
+        self.assertFalse(viewer_settings["token_configured"])
+        self.assertEqual(self.client.get("/api/keywords").status_code, 403)
+        self.assertEqual(self.client.get("/api/leads/facets").json()["rounds"], [])
+
+        self.assertEqual(self.client.get(f"/api/rounds/{self.round_id}/calls").status_code, 403)
+        self.assertEqual(self.client.get(f"/api/rounds/{self.round_id}/log").status_code, 403)
+        self.assertEqual(
+            self.client.get(f"/api/rounds/{self.round_id}/export").status_code, 403
+        )
+
     def test_lead_owner_authorization(self) -> None:
         created_user = self.client.post(
             "/api/users",
@@ -288,6 +350,7 @@ class ApiTests(unittest.TestCase):
                 "password": "lead-password-123",
                 "role": "member",
                 "can_collect": True,
+                "can_edit_leads": True,
             },
         )
         self.assertEqual(created_user.status_code, 200, created_user.text)
@@ -513,6 +576,7 @@ class ApiTests(unittest.TestCase):
         ).json()
         self.assertEqual(facets["platforms"][0]["value"], "xhs")
         self.assertIn("statuses", facets)
+        self.assertIn("cooperation_statuses", facets)
         self.assertIn("tiers", facets)
         self.assertIn("labels", facets)
 
@@ -521,6 +585,9 @@ class ApiTests(unittest.TestCase):
         self.assertIn("pending", codes)
         self.assertIn("adopted", codes)
         self.assertNotIn("recommended", codes)
+        cooperation_codes = {item["code"] for item in meta["cooperation_statuses"]}
+        self.assertIn("not_contacted", cooperation_codes)
+        self.assertIn("completed", cooperation_codes)
 
     def test_fts_search(self) -> None:
         found = self.client.get(
@@ -574,10 +641,14 @@ class ApiTests(unittest.TestCase):
         dashboard = self.client.get(f"/api/dashboard?round_id={self.round_id}").json()
         self.assertEqual(dashboard["metrics"]["creators"], 1)
         self.assertEqual(dashboard["metrics"]["enriched"], 1)
+        self.assertIn("cooperation_counts", dashboard)
+        self.assertIn("cooperation_metrics", dashboard)
+        self.assertIn("cooperation_stale_days", dashboard)
 
         all_dashboard = self.client.get("/api/dashboard").json()
         self.assertIsNone(all_dashboard["round"])
         self.assertEqual(all_dashboard["metrics"]["creators"], 1)
+        self.assertIn("cooperation_counts", all_dashboard)
 
         queue = self.client.get(
             f"/api/dashboard/queue?round_id={self.round_id}&scope=all"
@@ -609,6 +680,8 @@ class ApiTests(unittest.TestCase):
         self.assertIn("昵称", text)
         self.assertIn("主页URL", text)
         self.assertIn("账号ID", text)
+        self.assertIn("合作状态", text)
+        self.assertIn("合作更新时间", text)
 
         xlsx_response = self.client.get(f"/api/rounds/{self.round_id}/export?format=xlsx")
         self.assertEqual(xlsx_response.status_code, 200)
@@ -826,36 +899,261 @@ class ApiTests(unittest.TestCase):
         response = self.client.patch(
             f"/api/rounds/{new_round}/creators/xhs/u1",
             json={
-                "cooperation_status": "adopted",
-                "expected_cooperation_status": "pending",
+                "status": "adopted",
+                "expected_status": "pending",
             },
         )
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["cooperation_status"], "adopted")
-        self.assertEqual(response.json()["round_status"], "pending")
+        payload = response.json()
+        self.assertEqual(payload["cooperation_status"], "not_contacted")
+        self.assertEqual(payload["round_status"], "adopted")
+        self.assertTrue(payload["cooperation_history"])
+        self.assertEqual(
+            payload["cooperation_history"][0]["to_status"], "not_contacted"
+        )
+        self.assertTrue(payload["cooperation_history"][0]["auto"])
 
-        payload = self.client.get("/api/creators?platform=xhs").json()
-        self.assertEqual(payload["items"][0]["status"], "adopted")
-        self.assertEqual(payload["items"][0]["round_status"], "pending")
-        self.assertTrue(payload["items"][0]["updated_at"])
+        all_payload = self.client.get("/api/creators?platform=xhs").json()
+        self.assertEqual(all_payload["items"][0]["status"], "adopted")
+        self.assertEqual(
+            all_payload["items"][0]["cooperation_status"], "not_contacted"
+        )
+        self.assertTrue(all_payload["items"][0]["updated_at"])
         dashboard = self.client.get("/api/dashboard").json()
         self.assertEqual(dashboard["metrics"]["adopted"], 1)
+        self.assertEqual(dashboard["cooperation_counts"]["not_contacted"], 1)
+
+        updated = self.client.patch(
+            "/api/creators/xhs/u1/cooperation",
+            json={"status": "contacted", "expected_status": "not_contacted"},
+        )
+        self.assertEqual(updated.status_code, 200, updated.text)
+        self.assertEqual(updated.json()["cooperation_status"], "contacted")
+        self.assertEqual(updated.json()["cooperation_status_label"], "已联系")
+
+        filtered = self.client.get(
+            "/api/creators?platform=xhs&cooperation=contacted"
+        ).json()
+        self.assertEqual(filtered["total"], 1)
+        none_filtered = self.client.get(
+            "/api/creators?platform=xhs&cooperation=none"
+        ).json()
+        self.assertEqual(none_filtered["total"], 0)
 
         conflict = self.client.post(
-            f"/api/rounds/{new_round}/creators/batch",
+            "/api/creators/cooperation/batch",
             json={
+                "status": "cooperating",
                 "items": [{
                     "platform": "xhs",
                     "user_id": "u1",
-                    "expected_cooperation_updated_at": "stale-version",
+                    "expected_status": "not_contacted",
                 }],
-                "cooperation_status": "rejected",
             },
         )
         self.assertEqual(conflict.status_code, 200, conflict.text)
         self.assertEqual(conflict.json()["changed"], 0)
         self.assertEqual(len(conflict.json()["conflicts"]), 1)
+        self.assertEqual(
+            self.client.get("/api/creators?platform=xhs").json()["items"][0][
+                "cooperation_status"
+            ],
+            "contacted",
+        )
+
+        invalid = self.client.patch(
+            "/api/creators/xhs/u1/cooperation",
+            json={"status": "adopted"},
+        )
+        self.assertEqual(invalid.status_code, 400, invalid.text)
+
+        cleared = self.client.patch(
+            "/api/creators/xhs/u1/cooperation",
+            json={"status": ""},
+        )
+        self.assertEqual(cleared.status_code, 409, cleared.text)
+        self.assertEqual(
+            self.client.get("/api/creators?platform=xhs").json()["items"][0][
+                "cooperation_status"
+            ],
+            "contacted",
+        )
+        cancelled = self.client.patch(
+            "/api/creators/xhs/u1/cooperation",
+            json={"status": "cancelled"},
+        )
+        self.assertEqual(cancelled.status_code, 200, cancelled.text)
+        self.assertEqual(cancelled.json()["cooperation_status"], "cancelled")
         self.assertEqual(self.client.get("/api/dashboard").json()["metrics"]["adopted"], 1)
+
+    def test_cooperation_case_lifecycle_attachments_works_and_rounds(self) -> None:
+        adopted = self.client.patch(
+            f"/api/rounds/{self.round_id}/creators/xhs/u1",
+            json={"status": "adopted"},
+        )
+        self.assertEqual(adopted.status_code, 200, adopted.text)
+        detail = self.client.get(
+            f"/api/rounds/{self.round_id}/creators/xhs/u1"
+        ).json()
+        self.assertEqual(detail["cooperation_count"], 1)
+        self.assertEqual(len(detail["cooperation_cases"]), 1)
+        case_id = detail["cooperation_cases"][0]["id"]
+
+        status = self.client.post(
+            f"/api/cooperation-cases/{case_id}/status",
+            json={"status": "contacted", "note": "已加微信"},
+        )
+        self.assertEqual(status.status_code, 200, status.text)
+        self.assertEqual(status.json()["case"]["status"], "contacted")
+
+        note = self.client.post(
+            f"/api/cooperation-cases/{case_id}/notes",
+            json={"note": "对方希望先看报价"},
+        )
+        self.assertEqual(note.status_code, 200, note.text)
+
+        summary = self.client.patch(
+            f"/api/cooperation-cases/{case_id}",
+            json={"summary": "图文合作，报价待确认"},
+        )
+        self.assertEqual(summary.status_code, 200, summary.text)
+
+        upload = self.client.post(
+            f"/api/cooperation-cases/{case_id}/attachments",
+            data={"category": "quote", "description": "报价截图"},
+            files={"file": ("quote.txt", b"quote evidence", "text/plain")},
+        )
+        self.assertEqual(upload.status_code, 200, upload.text)
+        attachment = upload.json()["attachments"][0]
+        downloaded = self.client.get(attachment["download_url"])
+        self.assertEqual(downloaded.status_code, 200)
+        self.assertEqual(downloaded.content, b"quote evidence")
+
+        work = self.client.post(
+            f"/api/cooperation-cases/{case_id}/works",
+            json={
+                "platform": "xhs",
+                "url": "https://example.com/work/1",
+                "title": "合作笔记",
+            },
+        )
+        self.assertEqual(work.status_code, 200, work.text)
+        work_id = work.json()["works"][0]["id"]
+        updated_work = self.client.patch(
+            f"/api/cooperation-works/{work_id}",
+            json={
+                "platform": "xhs",
+                "url": "https://example.com/work/1",
+                "title": "合作笔记（已更新）",
+            },
+        )
+        self.assertEqual(updated_work.status_code, 200, updated_work.text)
+        self.assertEqual(
+            updated_work.json()["works"][0]["title"], "合作笔记（已更新）"
+        )
+
+        before_complete = self.client.get(
+            f"/api/cooperation-cases/{case_id}"
+        ).json()
+        completed = self.client.post(
+            f"/api/cooperation-cases/{case_id}/complete",
+            json={
+                "note": "已发布并结算",
+                "expected_updated_at": before_complete["case"]["updated_at"],
+                "works": [
+                    {
+                        "platform": "xhs",
+                        "url": "https://example.com/work/2",
+                        "title": "结案作品",
+                    }
+                ],
+            },
+        )
+        self.assertEqual(completed.status_code, 200, completed.text)
+        self.assertEqual(completed.json()["case"]["status"], "completed")
+        self.assertEqual(completed.json()["summary"]["cooperation_count"], 1)
+        self.assertTrue(completed.json()["summary"]["cooperation_last_completed_at"])
+        evidence = self.client.get(f"/api/cooperation-cases/{case_id}/export")
+        self.assertEqual(evidence.status_code, 200, evidence.text)
+        self.assertTrue(evidence.content.startswith(b"PK"))
+
+        second = self.client.post(
+            "/api/cooperation-cases",
+            json={"platform": "xhs", "user_id": "u1"},
+        )
+        self.assertEqual(second.status_code, 200, second.text)
+        second_id = second.json()["case"]["id"]
+        self.assertEqual(second.json()["case"]["seq"], 2)
+        self.assertEqual(second.json()["case"]["status"], "contacted")
+        conflict = self.client.post(
+            "/api/cooperation-cases",
+            json={"platform": "xhs", "user_id": "u1"},
+        )
+        self.assertEqual(conflict.status_code, 409, conflict.text)
+        self.assertEqual(
+            self.client.get(f"/api/cooperation-cases/{second_id}").status_code,
+            200,
+        )
+
+    def test_cooperation_status_requires_adopted_creator(self) -> None:
+        rejected = self.client.patch(
+            "/api/creators/xhs/u1/cooperation",
+            json={"status": "contacted"},
+        )
+        self.assertEqual(rejected.status_code, 409, rejected.text)
+        self.assertIn("只有已采用", rejected.json()["detail"])
+        with Database(self.settings.output_dir) as db:
+            self.assertFalse(db.get_creator("xhs", "u1")["cooperation_status"])
+
+        adopted = self.client.patch(
+            f"/api/rounds/{self.round_id}/creators/xhs/u1",
+            json={"status": "adopted"},
+        )
+        self.assertEqual(adopted.status_code, 200, adopted.text)
+        self.assertEqual(adopted.json()["cooperation_status"], "not_contacted")
+        updated = self.client.patch(
+            "/api/creators/xhs/u1/cooperation",
+            json={"status": "contacted"},
+        )
+        self.assertEqual(updated.status_code, 200, updated.text)
+
+    def test_cooperation_history_and_stale_filter(self) -> None:
+        self.client.patch(
+            f"/api/rounds/{self.round_id}/creators/xhs/u1",
+            json={"status": "adopted"},
+        )
+        updated = self.client.patch(
+            "/api/creators/xhs/u1/cooperation",
+            json={"status": "contacted"},
+        )
+        self.assertEqual(updated.status_code, 200, updated.text)
+        detail = self.client.get(
+            f"/api/rounds/{self.round_id}/creators/xhs/u1"
+        ).json()
+        history = detail["cooperation_history"]
+        self.assertTrue(history)
+        self.assertEqual(history[0]["to_status"], "contacted")
+        self.assertEqual(history[0]["actor_username"], "test-admin")
+        self.assertTrue(any(item["auto"] for item in history))
+
+        with Database(self.settings.output_dir) as db:
+            db._conn.execute(
+                "UPDATE creators SET cooperation_updated_at = ? "
+                "WHERE platform = 'xhs' AND user_id = 'u1'",
+                ("2000-01-01T00:00:00.000+00:00",),
+            )
+            db._conn.commit()
+
+        stale = self.client.get(
+            "/api/creators?platform=xhs&cooperation=contacted"
+            "&cooperation_stale_days=7"
+        ).json()
+        self.assertEqual(stale["total"], 1)
+        fresh = self.client.get(
+            "/api/creators?platform=xhs&cooperation=not_contacted"
+            "&cooperation_stale_days=7"
+        ).json()
+        self.assertEqual(fresh["total"], 0)
 
     def test_create_round_without_start(self) -> None:
         response = self.client.post(

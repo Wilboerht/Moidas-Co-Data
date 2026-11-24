@@ -45,7 +45,7 @@ if errorlevel 1 (
 )
 pushd frontend
 if not exist "node_modules" (
-    call npm install
+    call npm ci
     if errorlevel 1 (
         popd
         echo [ERROR] npm install failed.

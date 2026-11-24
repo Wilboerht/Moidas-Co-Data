@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -14,6 +15,7 @@ from codata.config import Settings
 from codata.db import Database
 from codata.leads import convert_lead
 from codata.normalize import normalize_user_info
+from codata.platforms import Price
 from helpers import user_payload
 
 
@@ -127,6 +129,60 @@ class LeadTests(unittest.TestCase):
         facets = self.db.lead_facets()
         self.assertTrue(any(item["value"] == "weibo" for item in facets["platforms"]))
         self.assertTrue(any(item["value"] == "discarded" for item in facets["statuses"]))
+
+    def test_conversion_reuses_matched_internal_id(self) -> None:
+        self.db.add_creator_round(self.round_id, "xhs", "u1", account_id="alias")
+        lead_id = self.db.create_lead(
+            platform="xhs", account_id="alias", source_round_id=self.round_id
+        )
+        self.db._conn.execute(
+            "UPDATE leads SET matched_platform = 'xhs', matched_user_id = 'u1', "
+            "matched_round_id = ? WHERE id = ?",
+            (self.round_id, lead_id),
+        )
+        self.db._conn.commit()
+        result = convert_lead(self.db, self.settings, lead_id, fetch=False)
+        self.assertEqual(result["lead"]["status"], "converted")
+        self.assertEqual(result["lead"]["converted_user_id"], "u1")
+
+    def test_conversion_normalization_failure_records_cost_and_attempt(self) -> None:
+        lead_id = self.db.create_lead(
+            platform="xhs",
+            account_id="5f1e5057000000000100429d",
+            source_round_id=self.round_id,
+        )
+        provider = SimpleNamespace(
+            provider_id="fake",
+            platform="xhs",
+            user_price=Price(1, "token"),
+            user_path="/user",
+            client=SimpleNamespace(last_attempts=1, last_cost=1),
+            user_cost_tokens=1,
+            search_price=Price(1, "token"),
+            search_path="/search",
+            search_cost_tokens=1,
+        )
+        provider.user = lambda *args: {"data": {}}
+        provider.normalize_user = lambda *args: (_ for _ in ()).throw(
+            ValueError("bad payload")
+        )
+        provider.close = lambda: None
+        option = object()
+        registry = SimpleNamespace(cheapest_user=lambda platform: option)
+        with (
+            patch("codata.lead_identity.load_registry", return_value=registry),
+            patch("codata.lead_identity.build_provider", return_value=provider),
+        ):
+            with self.assertRaisesRegex(ValueError, "bad payload"):
+                convert_lead(self.db, self.settings, lead_id)
+        call = self.db._conn.execute("SELECT * FROM api_calls").fetchone()
+        self.assertIsNotNone(call)
+        self.assertEqual(call["cost"], 1)
+        self.assertEqual(call["status"], "ok")
+        attempt = self.db.lead_attempts(lead_id)[0]
+        self.assertEqual(attempt["status"], "error")
+        self.assertEqual(attempt["error"], "bad payload")
+        self.assertEqual(attempt["cost"], 1)
 
 
 if __name__ == "__main__":

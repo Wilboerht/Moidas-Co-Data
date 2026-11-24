@@ -4,7 +4,7 @@ import { Ban, CircleCheck, Eye, EyeOff, KeyRound, LogOut, MoreHorizontal, Shield
 import { toast } from "sonner";
 import { api } from "@/shared/api";
 import { useAuth } from "@/shared/auth-context";
-import { MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH } from "@/shared/constants";
+import { MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH, passwordLength } from "@/shared/constants";
 import { fmtDateTime } from "@/shared/format";
 import type { AuthUser } from "@/shared/types";
 import { ErrorState, Page, PageHeader, Section } from "@/components/page";
@@ -84,6 +84,7 @@ export function UsersPage() {
   const [showPassword, setShowPassword] = useState(false);
   const [role, setRole] = useState("member");
   const [canCollect, setCanCollect] = useState(false);
+  const [canEditLeads, setCanEditLeads] = useState(false);
   const [newPassword, setNewPassword] = useState("");
   const [newPasswordConfirm, setNewPasswordConfirm] = useState("");
   const [showNewPassword, setShowNewPassword] = useState(false);
@@ -104,6 +105,7 @@ export function UsersPage() {
     setShowPassword(false);
     setRole("member");
     setCanCollect(false);
+    setCanEditLeads(false);
     setError("");
   };
 
@@ -132,6 +134,7 @@ export function UsersPage() {
         password,
         role,
         can_collect: role === "admin" ? false : canCollect,
+        can_edit_leads: role === "admin" ? false : canEditLeads,
       }),
     onSuccess: async () => {
       toast.success("用户已创建，首次登录需要修改密码");
@@ -143,7 +146,7 @@ export function UsersPage() {
   });
 
   const updateMutation = useMutation({
-    mutationFn: ({ id, payload }: { id: number; payload: { role?: string; disabled?: boolean; can_collect?: boolean } }) =>
+    mutationFn: ({ id, payload }: { id: number; payload: { role?: string; disabled?: boolean; can_collect?: boolean; can_edit_leads?: boolean } }) =>
       api.updateUser(id, payload),
     onSuccess: async () => {
       toast.success("用户已更新");
@@ -212,12 +215,13 @@ export function UsersPage() {
         }
         contentClassName="px-0"
       >
-        <Table className="min-w-[760px]">
+        <Table className="min-w-[880px]">
           <TableHeader>
             <TableRow>
               <TableHead>用户名</TableHead>
               <TableHead className="w-[100px] text-center">角色</TableHead>
               <TableHead className="w-[110px] text-center">采集权限</TableHead>
+              <TableHead className="w-[110px] text-center">线索权限</TableHead>
               <TableHead className="w-[110px] text-center">状态</TableHead>
               <TableHead className="w-[180px]">最近登录</TableHead>
               <TableHead className="w-[180px]">创建时间</TableHead>
@@ -228,12 +232,12 @@ export function UsersPage() {
             {usersQuery.isLoading ? (
               Array.from({ length: 4 }).map((_, index) => (
                 <TableRow key={index}>
-                  <TableCell colSpan={7}><Skeleton className="h-6 w-full" /></TableCell>
+                  <TableCell colSpan={8}><Skeleton className="h-6 w-full" /></TableCell>
                 </TableRow>
               ))
             ) : usersQuery.error ? (
               <TableRow>
-                <TableCell colSpan={7} className="p-3">
+                <TableCell colSpan={8} className="p-3">
                   <ErrorState
                     message={usersQuery.error instanceof Error ? usersQuery.error.message : "加载用户失败"}
                   />
@@ -241,7 +245,7 @@ export function UsersPage() {
               </TableRow>
             ) : users.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={7} className="h-24 text-center text-muted-foreground">暂无用户</TableCell>
+                <TableCell colSpan={8} className="h-24 text-center text-muted-foreground">暂无用户</TableCell>
               </TableRow>
             ) : (
               users.map((item) => (
@@ -262,6 +266,11 @@ export function UsersPage() {
                   <TableCell className="text-center">
                     <Badge variant="outline" className="font-normal">
                       {item.role === "admin" ? "不受限" : item.can_collect ? "允许" : "仅查看"}
+                    </Badge>
+                  </TableCell>
+                  <TableCell className="text-center">
+                    <Badge variant="outline" className="font-normal">
+                      {item.role === "admin" ? "不受限" : item.can_edit_leads ? "允许" : "仅查看"}
                     </Badge>
                   </TableCell>
                   <TableCell className="text-center">
@@ -317,6 +326,26 @@ export function UsersPage() {
                         >
                           {item.can_collect ? <UserX /> : <UserCheck />}
                           {item.can_collect ? "取消采集权限" : "允许发起采集"}
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          disabled={item.role === "admin"}
+                          onClick={() =>
+                            setConfirm({
+                              title: item.can_edit_leads ? "取消线索权限？" : "允许维护线索？",
+                              description: item.can_edit_leads
+                                ? `${item.username} 将不能再新增或编辑线索，已有线索不受影响。`
+                                : `${item.username} 将可以新增和编辑线索。`,
+                              variant: item.can_edit_leads ? "destructive" : "default",
+                              action: () =>
+                                updateMutation.mutate({
+                                  id: item.id,
+                                  payload: { can_edit_leads: !item.can_edit_leads },
+                                }),
+                            })
+                          }
+                        >
+                          {item.can_edit_leads ? <UserX /> : <UserCheck />}
+                          {item.can_edit_leads ? "取消线索权限" : "允许维护线索"}
                         </DropdownMenuItem>
                         <DropdownMenuItem
                           disabled={item.id === user.id}
@@ -412,7 +441,7 @@ export function UsersPage() {
               if (
                 createMutation.isPending ||
                 username.trim().length < 2 ||
-                password.length < MIN_PASSWORD_LENGTH ||
+                passwordLength(password) < MIN_PASSWORD_LENGTH ||
                 password !== passwordConfirm
               ) {
                 return;
@@ -508,6 +537,22 @@ export function UsersPage() {
                   disabled={role === "admin"}
                 />
               </div>
+              <div className="flex items-center justify-between gap-4 border-t pt-4">
+                <div className="space-y-1">
+                  <Label htmlFor="create-can-edit-leads">允许维护线索</Label>
+                  <p className="text-xs text-muted-foreground">
+                    {role === "admin"
+                      ? "管理员默认可以维护线索，无需单独设置。"
+                      : "成员开启后才能新增和编辑线索。"}
+                  </p>
+                </div>
+                <Switch
+                  id="create-can-edit-leads"
+                  checked={role === "admin" ? true : canEditLeads}
+                  onCheckedChange={setCanEditLeads}
+                  disabled={role === "admin"}
+                />
+              </div>
               {error ? <p className="text-sm text-destructive" role="alert">{error}</p> : null}
             </div>
             <DialogFooter>
@@ -519,7 +564,7 @@ export function UsersPage() {
                 disabled={
                   createMutation.isPending ||
                   username.trim().length < 2 ||
-                  password.length < MIN_PASSWORD_LENGTH ||
+                  passwordLength(password) < MIN_PASSWORD_LENGTH ||
                   password !== passwordConfirm
                 }
               >
@@ -546,7 +591,7 @@ export function UsersPage() {
               event.preventDefault();
               if (
                 resetMutation.isPending ||
-                newPassword.length < MIN_PASSWORD_LENGTH ||
+                passwordLength(newPassword) < MIN_PASSWORD_LENGTH ||
                 newPassword !== newPasswordConfirm
               ) {
                 return;
@@ -612,7 +657,7 @@ export function UsersPage() {
                 type="submit"
                 disabled={
                   resetMutation.isPending ||
-                  newPassword.length < MIN_PASSWORD_LENGTH ||
+                  passwordLength(newPassword) < MIN_PASSWORD_LENGTH ||
                   newPassword !== newPasswordConfirm
                 }
               >

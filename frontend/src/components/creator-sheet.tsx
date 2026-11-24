@@ -6,8 +6,13 @@ import { api } from "@/shared/api";
 import { fmtDate, fmtDateTime, fmtNumber, safeHttpUrl, shorten } from "@/shared/format";
 import { useAuth } from "@/shared/auth-context";
 import { useRound } from "@/shared/round-context";
-import type { CreatorDetail, StatusDef } from "@/shared/types";
+import type {
+  CooperationStatusDef,
+  CreatorDetail,
+  StatusDef,
+} from "@/shared/types";
 import { Badge } from "@/components/ui/badge";
+import { CooperationRecords } from "@/components/cooperation-cases";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -44,16 +49,20 @@ export function CreatorSheet({
   roundId,
   detailKey,
   statuses,
+  cooperationStatuses,
   onClose,
   onCancelSwitch,
 }: {
   roundId: number;
   detailKey: string;
   statuses: StatusDef[];
+  cooperationStatuses: CooperationStatusDef[];
   onClose: () => void;
   onCancelSwitch?: (roundId: number) => void;
 }) {
   const queryClient = useQueryClient();
+  const { user } = useAuth();
+  const canCollect = user?.role === "admin" || Boolean(user?.can_collect);
   const { refreshRounds } = useRound();
   const dirtyRef = useRef(false);
   const [activeRoundId, setActiveRoundId] = useState(roundId);
@@ -89,7 +98,7 @@ export function CreatorSheet({
 
   return (
     <Sheet open onOpenChange={(open) => { if (!open) requestClose(); }}>
-      <SheetContent className="w-full gap-0 p-0 data-[side=right]:sm:max-w-lg">
+      <SheetContent className="w-full gap-0 p-0 data-[side=right]:sm:max-w-2xl">
         <SheetHeader className="shrink-0 border-b px-4 py-4 pr-12">
           <div className="flex items-start gap-3">
             {detail.data?.avatar ? (
@@ -144,6 +153,7 @@ export function CreatorSheet({
             roundId={activeRoundId}
             detail={detail.data}
             statuses={statuses}
+            cooperationStatuses={cooperationStatuses}
             onSaved={async (updated) => {
               await queryClient.invalidateQueries({ queryKey: ["creators"] });
               await queryClient.invalidateQueries({ queryKey: ["facets"] });
@@ -165,7 +175,7 @@ export function CreatorSheet({
           <AlertDialogContent>
             <AlertDialogHeader>
               <AlertDialogTitle>放弃未保存的修改？</AlertDialogTitle>
-              <AlertDialogDescription>采用状态、匹配方向、人工标签或备注尚未保存。</AlertDialogDescription>
+              <AlertDialogDescription>采用状态、合作状态、匹配方向、人工标签或备注尚未保存。</AlertDialogDescription>
             </AlertDialogHeader>
             <AlertDialogFooter>
               <AlertDialogCancel>继续编辑</AlertDialogCancel>
@@ -185,8 +195,14 @@ export function CreatorSheet({
         <AlertDialog open={switchConfirmOpen} onOpenChange={setSwitchConfirmOpen}>
           <AlertDialogContent>
             <AlertDialogHeader>
-              <AlertDialogTitle>放弃当前修改并切换轮次？</AlertDialogTitle>
-              <AlertDialogDescription>当前轮次有未保存的标注。继续编辑可返回原轮次，切换后这些修改不会保留。</AlertDialogDescription>
+              <AlertDialogTitle>
+                {canCollect ? "放弃当前修改并切换轮次？" : "放弃当前修改并切换达人？"}
+              </AlertDialogTitle>
+              <AlertDialogDescription>
+                {canCollect
+                  ? "当前轮次有未保存的标注。继续编辑可返回原轮次，切换后这些修改不会保留。"
+                  : "当前资料有未保存的标注。继续编辑可返回原资料，切换后这些修改不会保留。"}
+              </AlertDialogDescription>
             </AlertDialogHeader>
             <AlertDialogFooter>
               <AlertDialogCancel
@@ -195,7 +211,7 @@ export function CreatorSheet({
                   onCancelSwitch?.(activeRoundId);
                 }}
               >
-                返回原轮次
+                返回原{canCollect ? "轮次" : "资料"}
               </AlertDialogCancel>
               <AlertDialogAction
                 variant="destructive"
@@ -219,12 +235,14 @@ function CreatorDetailForm({
   roundId,
   detail,
   statuses,
+  cooperationStatuses,
   onSaved,
   onDirtyChange,
 }: {
   roundId: number;
   detail: CreatorDetail;
   statuses: StatusDef[];
+  cooperationStatuses: CooperationStatusDef[];
   onSaved: (detail: CreatorDetail) => Promise<void>;
   onDirtyChange: (dirty: boolean) => void;
 }) {
@@ -235,6 +253,7 @@ function CreatorDetailForm({
   const [descExpanded, setDescExpanded] = useState(false);
   const [pendingOwner, setPendingOwner] = useState<{ userId: number | null; username: string } | null>(null);
   const { user } = useAuth();
+  const canCollect = user?.role === "admin" || Boolean(user?.can_collect);
   const canEdit = true;
   const queryClient = useQueryClient();
   const loadedKey = useRef("");
@@ -250,11 +269,12 @@ function CreatorDetailForm({
     setDescExpanded(false);
   }, [detail]);
 
-  const dirty =
+  const reviewDirty =
     status !== (detail.status || "pending") ||
     direction !== (detail.match_direction || "") ||
     tags !== (detail.tags_manual || "") ||
     remark !== (detail.remark || "");
+  const dirty = reviewDirty;
 
   useEffect(() => {
     onDirtyChange(dirty);
@@ -270,18 +290,31 @@ function CreatorDetailForm({
   const mutation = useMutation({
     mutationFn: () => {
       if (!detail) throw new Error("达人资料未加载");
-      return api.updateCreator(roundId, detail.platform, detail.user_id, {
-        status,
-        match_direction: direction,
-        tags_manual: tags,
-        remark,
-        expected_status: detail.status,
-        expected_updated_at: detail.updated_at || undefined,
-      });
+      const payload: {
+        status?: string;
+        match_direction?: string;
+        tags_manual?: string;
+        remark?: string;
+        expected_status?: string;
+        expected_updated_at?: string;
+      } = {};
+      if (reviewDirty) {
+        payload.status = status;
+        payload.match_direction = direction;
+        payload.tags_manual = tags;
+        payload.remark = remark;
+        payload.expected_status = detail.status;
+        payload.expected_updated_at = detail.updated_at || undefined;
+      }
+      return api.updateCreator(roundId, detail.platform, detail.user_id, payload);
     },
     onSuccess: async (updated) => {
+      setStatus(updated.status || "pending");
+      setDirection(updated.match_direction || "");
+      setTags(updated.tags_manual || "");
+      setRemark(updated.remark || "");
       await onSaved(updated);
-      toast.success("已保存备注");
+      toast.success("已保存标注");
     },
     onError: async (error) => {
       toast.error(error instanceof Error ? error.message : "保存失败");
@@ -324,6 +357,7 @@ function CreatorDetailForm({
       username: detail.owner_username || `用户 ${detail.owner_user_id}`,
       role: "",
       can_collect: 0,
+      can_edit_leads: 0,
     });
   }
 
@@ -375,10 +409,9 @@ function CreatorDetailForm({
     detail.data_round && detail.data_round !== detail.round_name
       ? detail.data_round
       : "";
-  const cooperationStatusLabel = statuses.find((item) => item.code === detail.cooperation_status)?.label ?? detail.cooperation_status;
   const concreteMetadata: [string, string][] = [
-    ["主档合作状态", cooperationStatusLabel],
-    ["最新轮次审核", detail.round_status_label],
+    ["审核状态", detail.round_status_label],
+    ["合作更新时间", detail.cooperation_updated_at ? fmtDateTime(detail.cooperation_updated_at) : ""],
     ["粉丝层级", detail.fans_tier],
     ["账号 ID", detail.account_id],
     ["小红书号", detail.red_id],
@@ -394,7 +427,11 @@ function CreatorDetailForm({
     ["自动标签", autoTags.join("、")],
     ["来源标签", sourceLabels.join("、")],
     ["原始标题", detail.raw_title],
-  ].filter((entry): entry is [string, string] => Boolean(entry[1]?.trim()));
+  ].filter(
+    (entry): entry is [string, string] =>
+      Boolean(entry[1]?.trim()) &&
+      (canCollect || (entry[0] !== "当前轮次" && entry[0] !== "来源轮次")),
+  );
   const copyValue = async (value: string) => {
     try {
       await navigator.clipboard.writeText(value);
@@ -514,6 +551,31 @@ function CreatorDetailForm({
           </p>
         ) : null}
       </div>
+
+      <CooperationRecords
+        platform={detail.platform}
+        userId={detail.user_id}
+        creatorStatus={detail.status}
+        statuses={cooperationStatuses}
+        cases={detail.cooperation_cases ?? []}
+        summary={
+          detail.cooperation_summary ?? {
+            cooperation_status: detail.cooperation_status || "",
+            cooperation_updated_at: detail.cooperation_updated_at || "",
+            cooperation_count: detail.cooperation_count || 0,
+            cooperation_last_completed_at: detail.cooperation_last_completed_at || "",
+            cooperation_case_id: detail.cooperation_case_id,
+          }
+        }
+        onChanged={async () => {
+          await queryClient.invalidateQueries({
+            queryKey: ["creator", roundId, detail.platform, detail.user_id],
+          });
+          await queryClient.invalidateQueries({ queryKey: ["creators"] });
+          await queryClient.invalidateQueries({ queryKey: ["facets"] });
+          await queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+        }}
+      />
 
       {sourceKeywords.length > 0 ? (
         <div className="space-y-2">
@@ -744,8 +806,8 @@ function CreatorDetailForm({
           <AlertDialogTitle>调整跟进人？</AlertDialogTitle>
           <AlertDialogDescription>
             {pendingOwner?.userId == null
-              ? `将结束 ${detail.owner_username || "当前跟进人"} 对这位达人的跟进，所有轮次生效；不限制编辑。`
-              : `将这位达人的跟进人从 ${detail.owner_username || "未分配"} 转交给 ${pendingOwner?.username}，所有轮次生效；不限制编辑。`}
+              ? `将结束 ${detail.owner_username || "当前跟进人"} 对这位达人的跟进${canCollect ? "，所有轮次生效" : ""}；不限制编辑。`
+              : `将这位达人的跟进人从 ${detail.owner_username || "未分配"} 转交给 ${pendingOwner?.username}${canCollect ? "，所有轮次生效" : ""}；不限制编辑。`}
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>
