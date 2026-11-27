@@ -158,6 +158,8 @@ def is_probable_user_id(platform: str, value: str) -> bool:
         return False
     if code == "xhs":
         return bool(re.fullmatch(r"[0-9a-fA-F]{24}", text))
+    if code == "douyin" and text.upper().startswith("MS4WLJAB"):
+        return bool(re.fullmatch(r"[A-Za-z0-9_-]{20,200}", text))
     if code in _DIGIT_ID_PLATFORMS:
         return text.isdigit() and len(text) >= 5
     return False

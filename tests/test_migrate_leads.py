@@ -63,6 +63,7 @@ class MigrateLeadsTests(unittest.TestCase):
         self.assertIsNotNone(lead)
         self.assertEqual(lead["owner_user_id"], 1)
         self.assertEqual(lead["status"], "converted")
+        self.assertEqual(lead["identity_status"], "verified")
         rounds = self.db.lead_rounds(int(lead["id"]))
         self.assertEqual({row["round_id"] for row in rounds}, {self.round_a, self.round_b})
 
@@ -72,6 +73,20 @@ class MigrateLeadsTests(unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(preserved)
         self.assertEqual(migrate(self.db, apply=True)["created"], 0)
+
+    def test_migration_moves_cooperation_history(self) -> None:
+        self._import(self.round_a, "import:legacy6", "real6", "达人六")
+        self.db.update_review(self.round_a, "xhs", "import:legacy6", status="adopted")
+        self.db.update_cooperation("xhs", "import:legacy6", "negotiating")
+        report = migrate(self.db, apply=True)
+        self.assertEqual(report["created"], 1)
+        cases = self.db.cooperation_cases("xhs", "real6")
+        self.assertEqual(len(cases), 1)
+        self.assertEqual(cases[0]["status"], "negotiating")
+        self.assertEqual(
+            self.db.get_creator("xhs", "real6")["cooperation_status"], "negotiating"
+        )
+        self.assertIsNone(self.db.get_creator("xhs", "import:legacy6"))
 
     def test_migration_remaps_lead_references(self) -> None:
         self._import(self.round_a, "import:legacy3", "real3", "达人丙")

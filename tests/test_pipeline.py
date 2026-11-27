@@ -141,6 +141,48 @@ class PipelineTests(unittest.TestCase):
                 round_id, job_id=job_id
             )
 
+    def test_partial_search_failure_preserves_previous_snapshot(self) -> None:
+        from codata.client import ProviderError
+
+        class PartialAPI(FakeAPI):
+            def __init__(self, fail_keyword: str | None = None) -> None:
+                super().__init__()
+                self.fail_keyword = fail_keyword
+
+            def xhs_search(self, keyword: str, page: int = 1):
+                self.search_calls += 1
+                if keyword == self.fail_keyword:
+                    raise ProviderError(None, "temporary", retryable=True)
+                user_id = "u1" if keyword == "咖啡" else "u2"
+                note_id = "n1" if user_id == "u1" else "n3"
+                return search_payload(
+                    [search_item(note_id, user_id, user_id)]
+                )
+
+        round_id = self.db.create_round(
+            ["咖啡", "护肤"], max_creators=None, category="测试"
+        )
+        first = PartialAPI()
+        first_summary = Pipeline(self.settings, self.db, api=first).run_round(round_id)
+        first_run_id = self.db.get_round(round_id)["latest_run_id"]
+        before = {row["user_id"] for row in self.db.creator_table(round_id)}
+
+        second = PartialAPI("护肤")
+        summary = Pipeline(self.settings, self.db, api=second).run_round(round_id)
+
+        self.assertEqual(before, {"u1", "u2"})
+        self.assertEqual(
+            {row["user_id"] for row in self.db.creator_table(round_id)}, before
+        )
+        self.assertEqual(self.db.get_round(round_id)["latest_run_id"], first_run_id)
+        self.assertFalse(summary["snapshot_updated"])
+        self.assertEqual(summary["search_failed_calls"], 1)
+        self.assertEqual(second.user_calls, [])
+        self.assertIn("保留上一快照", self.db.latest_job(round_id)["stage"])
+        self.assertEqual(
+            self.db.round_summary(round_id)["notes"], first_summary["notes"]
+        )
+
     def test_pruned_enriched_creator_is_not_fetched_again(self) -> None:
         first = FakeAPI()
         round_id = self._round(2)

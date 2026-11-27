@@ -90,13 +90,20 @@ export function EmptyState({
   );
 }
 
-export function ErrorState({ message }: { message: string }) {
+export function ErrorState({
+  message,
+  action,
+}: {
+  message: string;
+  action?: ReactNode;
+}) {
   return (
     <div
       role="alert"
       className="border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive"
     >
       {message}
+      {action ? <div className="mt-2">{action}</div> : null}
     </div>
   );
 }

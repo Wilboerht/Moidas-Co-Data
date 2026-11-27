@@ -195,6 +195,54 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual(rows[1]["account_id"], "dup1")
         self.assertTrue((applied.get("indexes") or {}).get("account"))
 
+    def test_dedupe_merges_handle_identity_and_events(self) -> None:
+        for name in (
+            "uq_leads_identity_account",
+            "uq_leads_identity_handle",
+            "uq_leads_identity_profile",
+        ):
+            self.db._conn.execute(f"DROP INDEX IF EXISTS {name}")
+        primary_id = self.db.create_lead(
+            platform="xhs", nickname="主线索", account_id="dedupe1"
+        )
+        cursor = self.db._conn.execute(
+            """
+            INSERT INTO leads (platform, nickname, account_id, platform_handle,
+                profile_url, raw_title, source, status, legacy_user_id, raw_json,
+                created_at, updated_at)
+            VALUES ('xhs', '重复线索', 'dedupe1', 'red_handle', '', '',
+                    'manual', 'unverified', '', '{}', ?, ?)
+            """,
+            (utc_now(), utc_now()),
+        )
+        duplicate_id = int(cursor.lastrowid)
+        self.db._conn.commit()
+        self.db.apply_lead_verification(
+            duplicate_id,
+            user_id="dedupe1",
+            handle="red_handle",
+            identity_status="verified",
+            confidence="account_id",
+            provider="dataflow",
+        )
+        self.db.add_lead_identity_event(
+            duplicate_id,
+            "verify_verified",
+            "verified",
+            new_user_id="dedupe1",
+            new_handle="red_handle",
+            provider="dataflow",
+            confidence="account_id",
+        )
+        report = self.db.dedupe_leads(apply=True)
+        self.assertGreaterEqual(report["groups"], 1)
+        primary = self.db.get_lead(primary_id)
+        self.assertEqual(primary["platform_handle"], "red_handle")
+        self.assertEqual(primary["identity_status"], "verified")
+        self.assertEqual(self.db.get_lead(duplicate_id)["status"], "duplicate")
+        events = self.db.lead_identity_events(primary_id)
+        self.assertTrue(any(item["event_type"] == "verify_verified" for item in events))
+
     def test_identity_health_reports_missing_indexes(self) -> None:
         health = self.db.lead_identity_health()
         self.assertTrue(health["account_index"])
@@ -407,6 +455,112 @@ class MatchingTests(unittest.TestCase):
         lead = self.db.get_lead(lead_id)
         self.assertEqual(lead["matched_user_id"], "u7")
         self.assertEqual(lead["match_confidence"], "legacy_user_id")
+        self.assertEqual(lead["identity_status"], "unverified")
+
+    def test_account_match_beats_newer_handle_match(self) -> None:
+        self.db.upsert_creator(normalize_user_info(user_payload("acct1", "账号本人")))
+        self.db.add_creator_round(self.round_id, "xhs", "acct1")
+        newer_round = self.db.create_round(
+            ["测试"],
+            pages=1,
+            max_creators=None,
+            name="MATCH-TEST-2",
+            category="测试",
+            categories={"测试": "测试"},
+        )
+        self.db.upsert_creator_basic(
+            {
+                "platform": "xhs",
+                "user_id": "uA",
+                "nickname": "同号达人",
+                "red_id": "red_acct1",
+            }
+        )
+        self.db.add_creator_round(newer_round, "xhs", "uA")
+        lead_id = self.db.create_lead(
+            platform="xhs",
+            nickname="冲突线索",
+            account_id="acct1",
+            platform_handle="red_acct1",
+        )
+        stats = match_lead_against_creators(self.db, lead_id)
+        self.assertEqual(stats["matched"], 1)
+        lead = self.db.get_lead(lead_id)
+        self.assertEqual(lead["matched_user_id"], "acct1")
+        self.assertEqual(lead["account_id"], "acct1")
+        self.assertEqual(lead["match_confidence"], "account_id")
+
+    def test_verified_lead_is_not_relinked_to_conflicting_creator(self) -> None:
+        self._creator("u1", "达人一号")
+        lead_id = self.db.create_lead(
+            platform="xhs",
+            nickname="已校验线索",
+            account_id="real9",
+            platform_handle="red_u1",
+        )
+        self.db.apply_lead_verification(
+            lead_id,
+            user_id="real9",
+            handle="red_u1",
+            identity_status="verified",
+            confidence="account_id",
+            provider="dataflow",
+        )
+        stats = match_lead_against_creators(self.db, lead_id)
+        self.assertEqual(stats["matched"], 0)
+        self.assertEqual(stats["skipped"], 1)
+        lead = self.db.get_lead(lead_id)
+        self.assertEqual(lead["account_id"], "real9")
+        self.assertFalse(lead["matched_user_id"])
+        self.assertEqual(lead["identity_provider"], "dataflow")
+
+    def test_verified_lead_links_creator_with_matching_account(self) -> None:
+        self._creator("real9", "达人九号")
+        lead_id = self.db.create_lead(
+            platform="xhs",
+            nickname="已校验线索",
+            account_id="real9",
+            platform_handle="red_real9",
+        )
+        self.db.apply_lead_verification(
+            lead_id,
+            user_id="real9",
+            handle="red_real9",
+            identity_status="verified",
+            confidence="account_id",
+            provider="dataflow",
+        )
+        stats = match_lead_against_creators(self.db, lead_id)
+        self.assertEqual(stats["matched"], 1)
+        lead = self.db.get_lead(lead_id)
+        self.assertEqual(lead["matched_user_id"], "real9")
+        self.assertEqual(lead["identity_status"], "verified")
+        self.assertEqual(lead["identity_provider"], "dataflow")
+
+    def test_weak_local_match_keeps_identity_unverified(self) -> None:
+        self._creator("u7", "历史达人")
+        lead_id = self.db.create_lead(
+            platform="xhs",
+            nickname="历史线索",
+            legacy_user_id="u7",
+        )
+        match_lead_against_creators(self.db, lead_id)
+        lead = self.db.get_lead(lead_id)
+        self.assertEqual(lead["matched_user_id"], "u7")
+        self.assertEqual(lead["identity_status"], "unverified")
+
+    def test_editing_lead_identity_clears_stale_match(self) -> None:
+        self._creator("u7", "历史达人")
+        lead_id = self.db.create_lead(
+            platform="xhs", nickname="线索", account_id="u7"
+        )
+        match_round_leads(self.db, self.round_id)
+        self.assertEqual(self.db.get_lead(lead_id)["matched_user_id"], "u7")
+        self.db.update_lead(lead_id, account_id="u8")
+        lead = self.db.get_lead(lead_id)
+        self.assertFalse(lead["matched_user_id"])
+        self.assertIsNone(lead["matched_round_id"])
+        self.assertEqual(lead["identity_status"], "unverified")
 
 
 if __name__ == "__main__":

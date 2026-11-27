@@ -10,6 +10,7 @@ WorkingDirectory=/opt/codata
 EnvironmentFile=/opt/codata/.env
 Environment=CODATA_ROOT=/opt/codata
 Environment=CODATA_ENV_FILE=/opt/codata/data/runtime.env
+Environment=CODATA_EMAIL_KEY_FILE=/etc/codata/email.key
 ExecStart=/opt/codata/.venv/bin/codata-web --host 127.0.0.1 --port 8501
 Restart=always
 RestartSec=3

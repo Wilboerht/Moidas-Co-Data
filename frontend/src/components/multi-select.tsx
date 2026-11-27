@@ -91,7 +91,13 @@ export function MultiSelect({
               variant="ghost"
               size="sm"
               className="h-7 px-2 text-xs"
-              onClick={() => onChange(options.map((item) => item.value))}
+              onClick={() =>
+                onChange(
+                  Array.from(
+                    new Set([...value, ...filtered.map((item) => item.value)]),
+                  ),
+                )
+              }
             >
               全选
             </Button>

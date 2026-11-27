@@ -86,6 +86,11 @@ export function AccountMenu() {
             <p className="text-xs font-normal text-muted-foreground">
               {user.role === "admin" ? "管理员" : "成员"}
             </p>
+            {user.role !== "admin" && !user.can_edit_leads ? (
+              <p className="text-[11px] font-normal text-muted-foreground">
+                线索只读
+              </p>
+            ) : null}
           </DropdownMenuLabel>
           <DropdownMenuSeparator />
           <DropdownMenuItem onSelect={() => { setPasswordOpen(true); setError(""); }}>

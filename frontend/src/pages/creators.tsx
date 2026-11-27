@@ -110,6 +110,19 @@ const ALL_COLUMNS = [
   ["sample_interactions", "样本互动"],
 ] as const;
 
+const COOPERATION_COLUMNS = new Set([
+  "nickname",
+  "status",
+  "cooperation_status",
+  "cooperation_updated_at",
+  "cooperation_platform",
+  "owner_username",
+  "remark",
+  "tags",
+  "top_title",
+  "fans",
+]);
+
 const CORE_COLUMNS = new Set([
   "nickname",
   "fans",
@@ -131,6 +144,7 @@ const DEFAULT_VISIBILITY = Object.fromEntries(
 
 const SORT_OPTIONS = [
   { value: "fans", label: "粉丝数" },
+  { value: "ratio", label: "待处理优先" },
   { value: "interaction", label: "互动量" },
   { value: "sample_likes", label: "样本点赞" },
   { value: "sample_average", label: "样本篇均互动" },
@@ -380,6 +394,10 @@ export function CreatorsPage() {
   }, [roundFilter, platform, debouncedSearch, statusFilter, cooperationFilter, cooperationStaleDays, tierFilter, directionFilter, sourceFilter, sourceMode, labelFilter, ownerFilter, minFans, maxFans, onlyUnenriched, needsAction]);
 
   useEffect(() => {
+    setPage(1);
+  }, [sort, order]);
+
+  useEffect(() => {
     if (syncingFromUrlRef.current) {
       if (debouncedSearch === (params.get("search") ?? "")) syncingFromUrlRef.current = false;
       return;
@@ -434,93 +452,88 @@ export function CreatorsPage() {
   const batchMutation = useMutation({
     mutationFn: async () => {
       const selectedItems = Object.values(selected);
-      const groups = new Map<number, BatchUpdatePayload["items"]>();
       const hasReviewChange =
         (roundFilter !== null && batchReviewStatus !== "none") ||
         batchDirectionMode !== "keep" ||
         batchRemarkMode !== "keep" ||
         batchTagsMode !== "keep" ||
         (user?.role === "admin" && batchOwner !== "keep");
-      if (hasReviewChange) {
-        for (const item of selectedItems) {
-          const targetRound = item.round_id ?? roundFilter ?? rounds[0]?.id;
-          if (targetRound == null) continue;
-          const rows = groups.get(targetRound) ?? [];
-          rows.push({
-            platform: item.platform,
-            user_id: item.user_id,
-            expected_updated_at: item.updated_at || undefined,
-            expected_status: item.round_status,
-          });
-          groups.set(targetRound, rows);
-        }
-      }
-      const reviewResults = hasReviewChange
-        ? await Promise.all(
-            [...groups.entries()].flatMap(([targetRound, items]) =>
-              chunk(items).map(async (part) => {
-                try {
-                  return await api.batchUpdate(targetRound, {
-                    items: part,
-                    status:
-                      roundFilter !== null && batchReviewStatus !== "none"
-                        ? batchReviewStatus
-                        : null,
-                    match_direction: editedValue(batchDirectionMode, batchDirection),
-                    tags_manual: editedValue(batchTagsMode, batchTags),
-                    remark: editedValue(batchRemarkMode, batchRemark),
-                    set_owner: user?.role === "admin" && batchOwner !== "keep",
-                    owner_user_id:
-                      batchOwner === "unassigned"
-                        ? null
-                        : batchOwner !== "keep"
-                          ? Number(batchOwner)
-                          : undefined,
-                  });
-                } catch (error) {
-                  return {
-                    changed: 0,
-                    conflicts: [],
-                    error: error instanceof Error ? error.message : "批量更新失败",
-                  };
-                }
-              }),
-            ),
-          )
-        : [];
+      const wantsCooperation = batchCooperationStatus !== "keep";
       const cooperationItems = batchCooperationTargets(
         selectedItems, roundFilter, batchReviewStatus,
       );
-      const cooperationResults =
-        batchCooperationStatus !== "keep"
-          ? await Promise.all(
-              chunk(cooperationItems).map(async (part) => {
-                try {
-                  return await api.batchUpdateCooperation({
-                    status: batchCooperationStatus,
-                    items: part.map((item) => ({
-                      platform: item.platform,
-                      user_id: item.user_id,
-                      expected_status: item.cooperation_status || "",
-                      expected_updated_at: item.cooperation_updated_at || undefined,
-                    })),
-                  });
-                } catch (error) {
-                  return {
-                    changed: 0,
-                    conflicts: [],
-                    claimed: 0,
-                    error: error instanceof Error ? error.message : "合作状态更新失败",
-                  };
-                }
-              }),
-            )
-          : [];
-      const results = [...reviewResults, ...cooperationResults];
+      const cooperationKeys = new Set(cooperationItems.map((item) => item.key));
+      const groups = new Map<number, { review: Creator[]; combined: Creator[] }>();
+      for (const item of selectedItems) {
+        const targetRound = item.round_id ?? roundFilter ?? rounds[0]?.id;
+        if (targetRound == null) continue;
+        const group = groups.get(targetRound) ?? { review: [], combined: [] };
+        const combined = wantsCooperation && cooperationKeys.has(item.key);
+        if (combined) group.combined.push(item);
+        else if (hasReviewChange) group.review.push(item);
+        if (combined || hasReviewChange) groups.set(targetRound, group);
+      }
+      const submit = async (
+        targetRound: number,
+        items: Creator[],
+        withReview: boolean,
+        withCooperation: boolean,
+      ) => {
+        const payloadItems: BatchUpdatePayload["items"] = items.map((item) => ({
+          platform: item.platform,
+          user_id: item.user_id,
+          expected_updated_at: item.updated_at || undefined,
+          expected_status: item.round_status,
+          ...(withCooperation
+            ? {
+                expected_cooperation_status: item.cooperation_status || "",
+                expected_cooperation_updated_at: item.cooperation_updated_at || undefined,
+              }
+            : {}),
+        }));
+        try {
+          const result = await api.batchUpdate(targetRound, {
+            items: payloadItems,
+            status:
+              withReview && roundFilter !== null && batchReviewStatus !== "none"
+                ? batchReviewStatus
+                : null,
+            cooperation_status: withCooperation ? batchCooperationStatus : null,
+            match_direction: withReview ? editedValue(batchDirectionMode, batchDirection) : null,
+            tags_manual: withReview ? editedValue(batchTagsMode, batchTags) : null,
+            remark: withReview ? editedValue(batchRemarkMode, batchRemark) : null,
+            set_owner: withReview && user?.role === "admin" && batchOwner !== "keep",
+            owner_user_id:
+              withReview && batchOwner === "unassigned"
+                ? null
+                : withReview && batchOwner !== "keep"
+                  ? Number(batchOwner)
+                  : undefined,
+          });
+          return { ...result, review: withReview, cooperation: withCooperation };
+        } catch (error) {
+          return {
+            changed: 0,
+            conflicts: [],
+            review: withReview,
+            cooperation: withCooperation,
+            error: error instanceof Error ? error.message : "批量更新失败",
+          };
+        }
+      };
+      const requests = [...groups.entries()].flatMap(([targetRound, group]) => [
+        ...chunk(group.review).map((part) => submit(targetRound, part, true, false)),
+        ...chunk(group.combined).map((part) => submit(targetRound, part, hasReviewChange, true)),
+      ]);
+      const results = await Promise.all(requests);
       return {
         changed: results.reduce((sum, item) => sum + item.changed, 0),
-        reviewChanged: reviewResults.reduce((sum, item) => sum + item.changed, 0),
-        cooperationChanged: cooperationResults.reduce((sum, item) => sum + item.changed, 0),
+        reviewChanged: results.reduce(
+          (sum, item) => sum + (item.review ? item.changed : 0), 0,
+        ),
+        cooperationChanged: results.reduce(
+          (sum, item) => sum + (item.cooperation ? item.changed : 0), 0,
+        ),
         cooperationSkipped: selectedItems.length - cooperationItems.length,
         conflicts: results.flatMap((item) => item.conflicts),
         errors: results.flatMap((item) => "error" in item && item.error ? [item.error] : []),
@@ -775,6 +788,21 @@ export function CreatorsPage() {
           ? selectedOwner?.username ?? `用户 ${ownerFilter}`
           : "";
 
+  const applyColumnPreset = (preset: "review" | "cooperation" | "all") => {
+    setVisibleColumns(
+      Object.fromEntries(
+        ALL_COLUMNS.map(([key]) => [
+          key,
+          preset === "all"
+            ? true
+            : preset === "review"
+              ? CORE_COLUMNS.has(key)
+              : COOPERATION_COLUMNS.has(key),
+        ]),
+      ) as Record<string, boolean>,
+    );
+  };
+
   const togglePageSelection = () => {
     setSelected((current) => {
       if (pageAllSelected) {
@@ -828,41 +856,8 @@ export function CreatorsPage() {
           />
         );
       case "cooperation_status":
-        if (!item.cooperation_status) {
-          if (item.status !== "adopted") {
-            return <span className="text-muted-foreground">—</span>;
-          }
-          return (
-            <InlineCooperationStatusSelect
-              item={item}
-              statuses={cooperationStatuses}
-              pending={
-                cooperationMutation.isPending &&
-                cooperationMutation.variables?.item.key === item.key
-              }
-              onChange={(status) => cooperationMutation.mutate({ item, status })}
-            />
-          );
-        }
-        if (TERMINAL_COOPERATION_CODES.has(item.cooperation_status)) {
-          return (
-            <button
-              type="button"
-              className="inline-flex items-center gap-1 text-left"
-              onClick={() => openCreator(item)}
-              title="查看合作记录"
-            >
-              <CooperationStatusBadge
-                status={item.cooperation_status}
-                label={item.cooperation_status_label}
-              />
-              {item.cooperation_count > 1 ? (
-                <span className="text-[11px] text-muted-foreground">
-                  {item.cooperation_count} 次
-                </span>
-              ) : null}
-            </button>
-          );
+        if (!item.cooperation_status && item.status !== "adopted") {
+          return <span className="text-muted-foreground">—</span>;
         }
         return (
           <InlineCooperationStatusSelect
@@ -941,7 +936,10 @@ export function CreatorsPage() {
     return (
       <Page>
         <PageHeader title="达人库" />
-        <ErrorState message={bootstrapError} />
+        <ErrorState
+          message={bootstrapError}
+          action={<Button variant="outline" size="sm" onClick={() => void refreshRounds()}>重试</Button>}
+        />
       </Page>
     );
   }
@@ -1346,6 +1344,24 @@ export function CreatorsPage() {
                   emptyText="暂无可显示列"
                 />
               </div>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button variant="outline" size="sm" className="h-8">
+                    列视图
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start">
+                  <DropdownMenuItem onSelect={() => applyColumnPreset("review")}>
+                    审核视图
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onSelect={() => applyColumnPreset("cooperation")}>
+                    合作视图
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onSelect={() => applyColumnPreset("all")}>
+                    全部列
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
             </div>
             <div className="hidden flex-wrap items-center gap-2 md:flex">
               <Button variant="outline" size="sm" onClick={() => runExport("csv", "filtered")}>
@@ -1379,9 +1395,9 @@ export function CreatorsPage() {
             {selectedCount > 0 ? (
               <>
                 <span className="text-sm text-muted-foreground">已选 {selectedCount} 位</span>
-                <Button size="sm" variant="outline" onClick={() => claimMutation.mutate()} disabled={claimMutation.isPending}>
+                <Button size="sm" variant="outline" onClick={() => claimMutation.mutate()} disabled={claimMutation.isPending} title="把这些达人设为我的跟进人，不改变采用状态">
                   <UserCheck />
-                  {claimMutation.isPending ? "设置中…" : "批量跟进"}
+                  {claimMutation.isPending ? "设置中…" : "认领为我的跟进人"}
                 </Button>
                 <Button size="sm" onClick={() => setBatchOpen(true)}>
                   批量修改
@@ -1399,7 +1415,10 @@ export function CreatorsPage() {
             {Array.from({ length: 6 }).map((_, index) => <Skeleton key={index} className="h-9 w-full" />)}
           </div>
         ) : creatorsQuery.error ? (
-          <ErrorState message={creatorsQuery.error instanceof Error ? creatorsQuery.error.message : "加载达人失败"} />
+          <ErrorState
+                    message={creatorsQuery.error instanceof Error ? creatorsQuery.error.message : "加载达人失败"}
+                    action={<Button variant="outline" size="sm" onClick={() => void creatorsQuery.refetch()}>重试</Button>}
+                  />
         ) : (
           <div className="space-y-3">
             <Table className="min-w-[1320px]">
@@ -1438,12 +1457,43 @@ export function CreatorsPage() {
                   {items.length === 0 ? (
                     <TableRow>
                       <TableCell colSpan={visibleKeys.length} className="h-28 text-center text-muted-foreground">
-                        当前条件下没有达人
+                        <span className="mr-2">当前条件下没有达人</span>
+                        {activeFilters > 0 ? (
+                          <Button variant="link" size="sm" onClick={clearFilters}>
+                            清除筛选
+                          </Button>
+                        ) : null}
                       </TableCell>
                     </TableRow>
                   ) : (
                     items.map((item) => (
-                      <TableRow key={item.key}>
+                      <TableRow
+                        key={item.key}
+                        tabIndex={0}
+                        className="cursor-pointer hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                        onClick={(event) => {
+                          if (
+                            (event.target as HTMLElement).closest(
+                              "button, a, input, select, textarea, [role='checkbox'], [role='combobox']",
+                            )
+                          ) {
+                            return;
+                          }
+                          openCreator(item);
+                        }}
+                        onKeyDown={(event) => {
+                          if (event.key !== "Enter" && event.key !== " ") return;
+                          if (
+                            (event.target as HTMLElement).closest(
+                              "button, a, input, select, textarea",
+                            )
+                          ) {
+                            return;
+                          }
+                          event.preventDefault();
+                          openCreator(item);
+                        }}
+                      >
                         <TableCell className="sticky left-0 z-10 min-w-[240px] bg-background">
                           <div className="flex items-center gap-2">
                             <Checkbox
@@ -1454,12 +1504,7 @@ export function CreatorsPage() {
                             <button
                               type="button"
                               className="truncate text-left font-medium underline-offset-4 hover:underline"
-                              onClick={() => {
-                                const next = new URLSearchParams(params);
-                                next.set("creator", item.key);
-                                if (item.round_id != null) next.set("creator_round", String(item.round_id));
-                                setParams(next, { replace: true });
-                              }}
+                              onClick={() => openCreator(item)}
                             >
                               {item.nickname || "(未补全)"}
                             </button>
@@ -1503,7 +1548,7 @@ export function CreatorsPage() {
       </Card>
 
       <Dialog open={batchOpen} onOpenChange={(open) => { if (!open) requestBatchClose(); }}>
-        <DialogContent>
+        <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>批量修改 {selectedCount} 位达人</DialogTitle>
             <DialogDescription>

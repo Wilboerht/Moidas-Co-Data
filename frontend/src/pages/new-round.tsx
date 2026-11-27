@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import { api } from "@/shared/api";
 import { fmtNumber } from "@/shared/format";
 import { useAuth } from "@/shared/auth-context";
+import { useUnsavedGuard } from "@/shared/use-unsaved-guard";
 import { useRound } from "@/shared/round-context";
 import type { Keyword } from "@/shared/types";
 import { ErrorState, Page, PageHeader, Section } from "@/components/page";
@@ -54,15 +55,7 @@ export function NewRoundPage() {
     pages !== 1 || maxCreators !== 20 || platform !== "xhs" || provider !== "auto",
   );
 
-  useEffect(() => {
-    if (!hasUnsavedChanges || creating) return;
-    const warn = (event: BeforeUnloadEvent) => {
-      event.preventDefault();
-      event.returnValue = "";
-    };
-    window.addEventListener("beforeunload", warn);
-    return () => window.removeEventListener("beforeunload", warn);
-  }, [hasUnsavedChanges, creating]);
+  useUnsavedGuard(hasUnsavedChanges && !creating, "采集参数尚未提交，确定离开当前页面？");
 
   useEffect(() => {
     if (roundId === null && rounds.length > 0) {
@@ -106,9 +99,9 @@ export function NewRoundPage() {
         : words.some((word) => word.length > 50)
           ? "单个关键词最多 50 个字符"
           : !vertical.trim()
-            ? "请填写轮次定位"
+            ? "请填写垂类"
             : vertical.trim().length > 40
-              ? "轮次定位最多 40 个字符"
+              ? "垂类最多 40 个字符"
               : roundName.trim().length > 100
                 ? "轮次名称最多 100 个字符"
                 : pages < 1 || pages > 20
@@ -162,7 +155,7 @@ export function NewRoundPage() {
       await refreshRounds();
       await queryClient.invalidateQueries({ queryKey: ["keywords"] });
       setRoundId(result.round.id);
-      toast.success("采集任务已创建");
+      toast.success("采集轮次已创建");
       navigate(`/tasks/${result.round.id}`);
     } catch (err) {
       const message = err instanceof Error ? err.message : "创建失败";

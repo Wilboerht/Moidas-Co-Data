@@ -29,6 +29,13 @@ describe("bulk lead parsing", () => {
     expect(result.items[0].account_id).toBe("user1");
   });
 
+  it("supports a single platform-account header", () => {
+    const result = parseLeadText("账号\nhandle1", platforms, "xhs");
+    expect(result.invalid).toEqual([]);
+    expect(result.items[0].platform_handle).toBe("handle1");
+    expect(result.items[0].nickname).toBe("");
+  });
+
   it("rejects an unknown platform instead of silently using the default", () => {
     const result = parseLeadText(
       "平台,昵称,账号ID\nunknown,达人,u1",

@@ -8,6 +8,16 @@ import type {
   BatchUpdatePayload,
   CreateRoundPayload,
   CooperationCaseDetail,
+  CooperationSummary,
+  CreatorEmail,
+  EmailAccount,
+  EmailAccountInput,
+  EmailCampaign,
+  EmailCampaignDetail,
+  EmailRecipient,
+  EmailSuppression,
+  EmailTarget,
+  EmailWorkerStatus,
   CooperationWorkPayload,
   CreatorDetail,
   CreatorListResponse,
@@ -143,12 +153,12 @@ export const api = {
       }),
     }),
   getUsers: () => request<AuthUser[]>("/users"),
-  createUser: (payload: { username: string; password: string; role: string; can_collect: boolean; can_edit_leads: boolean }) =>
+  createUser: (payload: { username: string; password: string; role: string; can_collect: boolean; can_edit_leads: boolean; can_send_email: boolean }) =>
     request<AuthUser>("/users", {
       method: "POST",
       body: JSON.stringify(payload),
     }),
-  updateUser: (userId: number, payload: { role?: string; disabled?: boolean; can_collect?: boolean; can_edit_leads?: boolean }) =>
+  updateUser: (userId: number, payload: { role?: string; disabled?: boolean; can_collect?: boolean; can_edit_leads?: boolean; can_send_email?: boolean }) =>
     request<AuthUser>(`/users/${userId}`, {
       method: "PATCH",
       body: JSON.stringify(payload),
@@ -166,6 +176,8 @@ export const api = {
   getRounds: (includeArchived = false) =>
     request<Round[]>(`/rounds${includeArchived ? "?include_archived=true" : ""}`),
   getRound: (roundId: number) => request<Round>(`/rounds/${roundId}`),
+  getRoundJobs: (roundId: number) =>
+    request<{ items: Job[] }>(`/rounds/${roundId}/jobs`),
   archiveRound: (roundId: number) =>
     request<Round>(`/rounds/${roundId}/archive`, { method: "POST" }),
   restoreRound: (roundId: number) =>
@@ -285,6 +297,27 @@ export const api = {
     }),
   getCooperationCase: (caseId: number) =>
     request<CooperationCaseDetail>(`/cooperation-cases/${caseId}`),
+  deleteCooperationCase: (caseId: number) =>
+    request<{
+      deleted: boolean;
+      case_id: number;
+      platform: string;
+      user_id: string;
+      seq: number;
+      status: string;
+      summary: CooperationSummary;
+      impact: {
+        events: number;
+        works: number;
+        active_works: number;
+        attachments: number;
+        active_attachments: number;
+      };
+      backup: string;
+    }>(`/cooperation-cases/${caseId}`, {
+      method: "DELETE",
+      body: JSON.stringify({ confirm: true }),
+    }),
   createCooperationCase: (payload: {
     platform: string;
     user_id: string;
@@ -576,6 +609,171 @@ export const api = {
         body: JSON.stringify({ token, verify: true }),
       },
     ),
+  getEmailAccounts: () => request<{ items: EmailAccount[] }>("/email/accounts"),
+  createEmailAccount: (payload: EmailAccountInput) =>
+    request<EmailAccount>("/email/accounts", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  updateEmailAccount: (accountId: number, payload: Partial<EmailAccountInput>) =>
+    request<EmailAccount>(`/email/accounts/${accountId}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
+  deleteEmailAccount: (accountId: number) =>
+    request<{ deleted: boolean }>(`/email/accounts/${accountId}`, {
+      method: "DELETE",
+    }),
+  testEmailAccount: (accountId: number, sendTestTo = "") =>
+    request<{ ok: boolean; sent_test: boolean }>(
+      `/email/accounts/${accountId}/test`,
+      { method: "POST", body: JSON.stringify({ send_test_to: sendTestTo }) },
+    ),
+  resumePausedEmailCampaigns: (accountId: number) =>
+    request<{ resumed: number }>(
+      `/email/accounts/${accountId}/resume-paused`,
+      { method: "POST" },
+    ),
+  getEmailWorkerStatus: () =>
+    request<EmailWorkerStatus>("/email/worker-status"),
+  getCreatorEmails: (platform: string, userId: string) =>
+    request<{ items: CreatorEmail[] }>(
+      `/creators/${encodeURIComponent(platform)}/${encodeURIComponent(userId)}/emails`,
+    ),
+  addCreatorEmail: (
+    platform: string,
+    userId: string,
+    payload: { email: string; label?: string; is_primary?: boolean },
+  ) =>
+    request<CreatorEmail>(
+      `/creators/${encodeURIComponent(platform)}/${encodeURIComponent(userId)}/emails`,
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
+  deleteCreatorEmail: (emailId: number) =>
+    request<{ deleted: boolean }>(`/email/creator-emails/${emailId}`, {
+      method: "DELETE",
+    }),
+  setPrimaryCreatorEmail: (emailId: number) =>
+    request<CreatorEmail>(`/email/creator-emails/${emailId}/primary`, {
+      method: "POST",
+    }),
+  getEmailTargets: (query: {
+    search?: string;
+    platform?: string;
+    roundId?: number | null;
+    owner?: string;
+    hasEmail?: boolean | null;
+    page?: number;
+    pageSize?: number;
+  }) => {
+    const params = new URLSearchParams();
+    if (query.search) params.set("search", query.search);
+    if (query.platform) params.set("platform", query.platform);
+    if (query.roundId) params.set("round_id", String(query.roundId));
+    if (query.owner && query.owner !== "all") params.set("owner", query.owner);
+    if (query.hasEmail !== null && query.hasEmail !== undefined) {
+      params.set("has_email", String(query.hasEmail));
+    }
+    params.set("page", String(query.page ?? 1));
+    params.set("page_size", String(query.pageSize ?? 50));
+    return request<{
+      items: EmailTarget[];
+      total: number;
+      page: number;
+      page_size: number;
+    }>(`/email/targets?${params.toString()}`);
+  },
+  previewEmailCampaign: (payload: {
+    subject: string;
+    body: string;
+    platform?: string;
+    user_id?: string;
+  }) =>
+    request<{ subject: string; body: string; context: Record<string, string> }>(
+      "/email/campaigns/preview",
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
+  listEmailCampaigns: () =>
+    request<{ items: EmailCampaign[] }>("/email/campaigns"),
+  createEmailCampaign: (payload: {
+    name: string;
+    account_id: number;
+    subject: string;
+    body: string;
+    scheduled_start?: string | null;
+    schedule?: boolean;
+    timezone: string;
+    window_start: string;
+    window_end: string;
+    weekdays: number[];
+    interval_seconds: number;
+    jitter_seconds: number;
+    daily_limit: number;
+    auto_mark_contacted: boolean;
+    recipients: { platform: string; user_id: string; email: string; nickname?: string }[];
+  }) =>
+    request<EmailCampaign>("/email/campaigns", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  getEmailCampaign: (campaignId: number, params?: { status?: string; page?: number; pageSize?: number }) => {
+    const search = new URLSearchParams();
+    if (params?.status) search.set("status", params.status);
+    search.set("page", String(params?.page ?? 1));
+    search.set("page_size", String(params?.pageSize ?? 100));
+    return request<EmailCampaignDetail>(
+      `/email/campaigns/${campaignId}?${search.toString()}`,
+    );
+  },
+  scheduleEmailCampaign: (
+    campaignId: number,
+    payload: {
+      scheduled_start?: string | null;
+      timezone: string;
+      window_start: string;
+      window_end: string;
+      weekdays: number[];
+      interval_seconds: number;
+      jitter_seconds: number;
+      daily_limit: number;
+    },
+  ) =>
+    request<EmailCampaign>(`/email/campaigns/${campaignId}/schedule`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  pauseEmailCampaign: (campaignId: number) =>
+    request<EmailCampaign>(`/email/campaigns/${campaignId}/pause`, {
+      method: "POST",
+    }),
+  resumeEmailCampaign: (campaignId: number) =>
+    request<EmailCampaign>(`/email/campaigns/${campaignId}/resume`, {
+      method: "POST",
+    }),
+  retryFailedEmailRecipients: (campaignId: number) =>
+    request<EmailCampaign & { retried: number }>(
+      `/email/campaigns/${campaignId}/retry-failed`,
+      { method: "POST" },
+    ),
+  cancelEmailCampaign: (campaignId: number) =>
+    request<EmailCampaign>(`/email/campaigns/${campaignId}/cancel`, {
+      method: "POST",
+    }),
+  deleteEmailCampaign: (campaignId: number) =>
+    request<{ deleted: boolean }>(`/email/campaigns/${campaignId}`, {
+      method: "DELETE",
+    }),
+  getEmailSuppressions: () =>
+    request<{ items: EmailSuppression[] }>("/email/suppressions"),
+  addEmailSuppression: (payload: { email: string; reason?: string }) =>
+    request<EmailSuppression>("/email/suppressions", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  deleteEmailSuppression: (suppressionId: number) =>
+    request<{ deleted: boolean }>(`/email/suppressions/${suppressionId}`, {
+      method: "DELETE",
+    }),
   getBalance: (provider = "dataflow") =>
     request<Balance>(`/balance?provider=${encodeURIComponent(provider)}`),
 };

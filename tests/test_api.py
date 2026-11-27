@@ -307,6 +307,20 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(rounds)
         self.assertTrue(all(item["name"] == "" for item in rounds))
         self.assertTrue(all(item["job"] is None for item in rounds))
+        for item in rounds:
+            for field in (
+                "keywords",
+                "provider",
+                "cost_tokens",
+                "category",
+                "pages",
+                "max_creators",
+            ):
+                self.assertNotIn(field, item)
+        self.assertEqual(self.client.get("/api/balance").status_code, 403)
+        self.assertEqual(
+            self.client.get("/api/rounds?include_archived=true").status_code, 403
+        )
         self.assertIsNone(self.client.get("/api/jobs/latest").json())
         self.assertIsNone(self.client.get("/api/jobs/active").json())
         self.assertIsNone(self.client.get(f"/api/rounds/{self.round_id}/job").json())
@@ -412,6 +426,49 @@ class ApiTests(unittest.TestCase):
         )
         self.assertEqual(assigned.status_code, 200, assigned.text)
         self.assertEqual(assigned.json()["owner_user_id"], member_id)
+
+    def test_lead_verify_and_convert_require_lead_edit_permission(self) -> None:
+        with Database(self.settings.output_dir) as db:
+            db.create_user(
+                "collector-only",
+                hash_password("collector-password-123"),
+                role="member",
+                can_collect=True,
+                can_edit_leads=False,
+            )
+        lead = self.client.post(
+            "/api/leads",
+            json={
+                "platform": "xhs",
+                "nickname": "权限测试线索",
+                "account_id": "u1",
+                "source_round_id": self.round_id,
+            },
+        )
+        self.assertEqual(lead.status_code, 200, lead.text)
+        lead_id = lead.json()["id"]
+
+        self.client.post("/api/auth/logout")
+        login = self.client.post(
+            "/api/auth/login",
+            json={"username": "collector-only", "password": "collector-password-123"},
+        )
+        self.assertEqual(login.status_code, 200, login.text)
+        headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+        verify = self.client.post(
+            f"/api/leads/{lead_id}/verify",
+            json={"apply": False},
+            headers=headers,
+        )
+        self.assertEqual(verify.status_code, 403, verify.text)
+        self.assertIn("维护线索", verify.json()["detail"])
+        convert = self.client.post(
+            f"/api/leads/{lead_id}/convert",
+            json={"fetch": False},
+            headers=headers,
+        )
+        self.assertEqual(convert.status_code, 403, convert.text)
+        self.assertIn("维护线索", convert.json()["detail"])
 
     def test_lead_create_assign_and_convert(self) -> None:
         created = self.client.post(
@@ -621,6 +678,63 @@ class ApiTests(unittest.TestCase):
         finally:
             stream.close()
             stream_db.close()
+
+    def test_lead_export_uses_read_snapshot(self) -> None:
+        with Database(self.settings.output_dir) as db:
+            first_id = db.create_lead(platform="xhs", nickname="线索甲")
+            second_id = db.create_lead(platform="xhs", nickname="线索乙")
+        stream_db = Database(self.settings.output_dir)
+        stream = api_server._iter_lead_export_rows(
+            stream_db,
+            None,
+            None,
+            None,
+            [],
+            None,
+            None,
+            sort="created_at",
+            order="asc",
+            page_size=1,
+        )
+        try:
+            first = next(stream)
+            with Database(self.settings.output_dir) as db:
+                new_id = db.create_lead(platform="xhs", nickname="导出期间新增")
+            remaining = [first, *list(stream)]
+            self.assertEqual(
+                {item["id"] for item in remaining}, {first_id, second_id}
+            )
+            self.assertNotIn(new_id, {item["id"] for item in remaining})
+        finally:
+            stream.close()
+            stream_db.close()
+
+    def test_blank_leads_are_rejected(self) -> None:
+        blank = {
+            "platform": "xhs",
+            "nickname": "",
+            "account_id": "",
+            "platform_handle": "",
+            "profile_url": "",
+        }
+        self.assertEqual(self.client.post("/api/leads", json=blank).status_code, 400)
+        created = self.client.post(
+            "/api/leads", json={**blank, "nickname": "有效线索"}
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        self.assertEqual(
+            self.client.patch(
+                f"/api/leads/{created.json()['id']}", json=blank
+            ).status_code,
+            400,
+        )
+        bulk = self.client.post(
+            "/api/leads/bulk",
+            json={"items": [blank, {**blank, "nickname": "批量有效"}]},
+        )
+        self.assertEqual(bulk.status_code, 200, bulk.text)
+        self.assertEqual(bulk.json()["created"], 1)
+        self.assertEqual(len(bulk.json()["errors"]), 1)
 
     def test_filtered_export(self) -> None:
         self.client.patch(
@@ -1094,6 +1208,584 @@ class ApiTests(unittest.TestCase):
             self.client.get(f"/api/cooperation-cases/{second_id}").status_code,
             200,
         )
+
+    def test_delete_cooperation_case_cleans_up_and_resets_summary(self) -> None:
+        adopted = self.client.patch(
+            f"/api/rounds/{self.round_id}/creators/xhs/u1",
+            json={"status": "adopted"},
+        )
+        self.assertEqual(adopted.status_code, 200, adopted.text)
+        detail = self.client.get(
+            f"/api/rounds/{self.round_id}/creators/xhs/u1"
+        ).json()
+        case_id = detail["cooperation_cases"][0]["id"]
+
+        upload = self.client.post(
+            f"/api/cooperation-cases/{case_id}/attachments",
+            data={"category": "other"},
+            files={"file": ("evidence.txt", b"evidence", "text/plain")},
+        )
+        self.assertEqual(upload.status_code, 200, upload.text)
+        attachment = upload.json()["attachments"][0]
+        case_dir = self.settings.output_dir / "cooperation_attachments" / str(case_id)
+        self.assertTrue(case_dir.is_dir())
+
+        missing_confirm = self.client.request(
+            "DELETE",
+            f"/api/cooperation-cases/{case_id}",
+            json={"confirm": False},
+        )
+        self.assertEqual(missing_confirm.status_code, 400, missing_confirm.text)
+
+        deleted = self.client.request(
+            "DELETE",
+            f"/api/cooperation-cases/{case_id}",
+            json={"confirm": True},
+        )
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        body = deleted.json()
+        self.assertTrue(body["deleted"])
+        self.assertEqual(body["impact"]["attachments"], 1)
+        self.assertEqual(body["summary"]["cooperation_count"], 0)
+        self.assertFalse(body["summary"]["cooperation_status"])
+        self.assertTrue(Path(body["backup"]).is_file())
+
+        self.assertEqual(
+            self.client.get(f"/api/cooperation-cases/{case_id}").status_code, 404
+        )
+        self.assertEqual(
+            self.client.get(attachment["download_url"]).status_code, 404
+        )
+        self.assertFalse(case_dir.exists())
+        refreshed = self.client.get(
+            f"/api/rounds/{self.round_id}/creators/xhs/u1"
+        ).json()
+        self.assertEqual(refreshed["cooperation_cases"], [])
+        self.assertEqual(refreshed["cooperation_count"], 0)
+        self.assertFalse(refreshed["cooperation_status"])
+
+        pending = self.client.patch(
+            f"/api/rounds/{self.round_id}/creators/xhs/u1",
+            json={"status": "pending"},
+        )
+        self.assertEqual(pending.status_code, 200, pending.text)
+        readopted = self.client.patch(
+            f"/api/rounds/{self.round_id}/creators/xhs/u1",
+            json={"status": "adopted"},
+        )
+        self.assertEqual(readopted.status_code, 200, readopted.text)
+        self.assertEqual(readopted.json()["cooperation_cases"], [])
+        self.assertFalse(readopted.json()["cooperation_status"])
+
+        restarted = self.client.post(
+            "/api/cooperation-cases",
+            json={"platform": "xhs", "user_id": "u1"},
+        )
+        self.assertEqual(restarted.status_code, 200, restarted.text)
+        self.assertEqual(restarted.json()["case"]["seq"], 1)
+
+    def test_attachment_delete_removes_file_from_disk(self) -> None:
+        adopted = self.client.patch(
+            f"/api/rounds/{self.round_id}/creators/xhs/u1",
+            json={"status": "adopted"},
+        )
+        self.assertEqual(adopted.status_code, 200, adopted.text)
+        detail = self.client.get(
+            f"/api/rounds/{self.round_id}/creators/xhs/u1"
+        ).json()
+        case_id = detail["cooperation_cases"][0]["id"]
+        upload = self.client.post(
+            f"/api/cooperation-cases/{case_id}/attachments",
+            data={"category": "other"},
+            files={"file": ("quote.txt", b"evidence", "text/plain")},
+        )
+        self.assertEqual(upload.status_code, 200, upload.text)
+        attachment = upload.json()["attachments"][0]
+        case_dir = self.settings.output_dir / "cooperation_attachments" / str(case_id)
+        stored = list(case_dir.glob("*"))
+        self.assertEqual(len(stored), 1)
+        deleted = self.client.delete(
+            f"/api/cooperation-attachments/{attachment['id']}"
+        )
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertEqual(deleted.json()["attachments"], [])
+        self.assertFalse(stored[0].exists())
+        self.assertEqual(
+            self.client.get(attachment["download_url"]).status_code, 404
+        )
+
+    def test_round_jobs_endpoint_lists_runs(self) -> None:
+        with Database(self.settings.output_dir) as db:
+            job_id = db.claim_job(self.round_id)
+            db.finish_job(
+                job_id,
+                self.round_id,
+                status="done",
+                stage="完成",
+                cost=3,
+                round_cost=3,
+            )
+        response = self.client.get(f"/api/rounds/{self.round_id}/jobs")
+        self.assertEqual(response.status_code, 200, response.text)
+        items = response.json()["items"]
+        self.assertEqual(items[0]["id"], job_id)
+        self.assertEqual(items[0]["status"], "done")
+        self.assertNotIn("pid", items[0])
+
+    def test_email_campaigns_targets_and_suppressions(self) -> None:
+        import tempfile as _tempfile
+
+        key_tmp = _tempfile.TemporaryDirectory()
+        old_key = os.environ.get("CODATA_EMAIL_KEY_FILE")
+        os.environ["CODATA_EMAIL_KEY_FILE"] = str(Path(key_tmp.name) / "email.key")
+        try:
+            account = self.client.post(
+                "/api/email/accounts",
+                json={
+                    "scope": "personal",
+                    "label": "发件",
+                    "from_name": "运营",
+                    "from_email": "ops@example.com",
+                    "host": "smtp.example.com",
+                    "port": 587,
+                    "username": "ops@example.com",
+                    "password": "secret",
+                },
+            )
+            self.assertEqual(account.status_code, 200, account.text)
+            account_id = account.json()["id"]
+            self.assertEqual(account.json()["min_interval_seconds"], 60)
+            status = self.client.get("/api/email/worker-status")
+            self.assertEqual(status.status_code, 200, status.text)
+            self.assertIn("stale", status.json())
+            self.assertTrue(status.json()["stale"])
+            adopted = self.client.patch(
+                f"/api/rounds/{self.round_id}/creators/xhs/u1",
+                json={"status": "adopted"},
+            )
+            self.assertEqual(adopted.status_code, 200, adopted.text)
+            email = self.client.post(
+                "/api/creators/xhs/u1/emails",
+                json={"email": "creator@example.com", "is_primary": True},
+            )
+            self.assertEqual(email.status_code, 200, email.text)
+
+            targets = self.client.get(
+                "/api/email/targets?platform=xhs&search=u1"
+            ).json()
+            self.assertEqual(targets["total"], 1)
+            self.assertEqual(targets["items"][0]["email"], "creator@example.com")
+
+            preview = self.client.post(
+                "/api/email/campaigns/preview",
+                json={
+                    "subject": "Hi {{nickname}}",
+                    "body": "{{platform}} {{user_id}}",
+                    "platform": "xhs",
+                    "user_id": "u1",
+                },
+            )
+            self.assertEqual(preview.status_code, 200, preview.text)
+            self.assertIn("咖啡师", preview.json()["subject"])
+
+            invalid = self.client.post(
+                "/api/email/campaigns",
+                json={
+                    "name": "无效任务",
+                    "account_id": account_id,
+                    "subject": "合作邀请",
+                    "body": "你好",
+                    "recipients": [
+                        {
+                            "platform": "xhs",
+                            "user_id": "u1",
+                            "email": "partial@example.com",
+                        },
+                        {
+                            "platform": "xhs",
+                            "user_id": "missing",
+                            "email": "bad-email",
+                        },
+                    ],
+                },
+            )
+            self.assertEqual(invalid.status_code, 400, invalid.text)
+            with Database(self.settings.output_dir) as db:
+                self.assertEqual(
+                    db._conn.execute(
+                        "SELECT COUNT(*) AS n FROM email_campaigns"
+                    ).fetchone()["n"],
+                    0,
+                )
+                self.assertNotIn(
+                    "partial@example.com",
+                    [item["email_normalized"] for item in db.creator_emails("xhs", "u1")],
+                )
+            unknown = self.client.post(
+                "/api/email/campaigns",
+                json={
+                    "name": "未知变量",
+                    "account_id": account_id,
+                    "subject": "Hi {{unknown}}",
+                    "body": "你好",
+                    "recipients": [
+                        {
+                            "platform": "xhs",
+                            "user_id": "u1",
+                            "email": "creator@example.com",
+                        }
+                    ],
+                },
+            )
+            self.assertEqual(unknown.status_code, 400, unknown.text)
+
+            created = self.client.post(
+                "/api/email/campaigns",
+                json={
+                    "name": "首轮外联",
+                    "account_id": account_id,
+                    "subject": "合作邀请 {{nickname}}",
+                    "body": "你好 {{nickname}}",
+                    "recipients": [
+                        {
+                            "platform": "xhs",
+                            "user_id": "u1",
+                            "email": "creator@example.com",
+                        }
+                    ],
+                },
+            )
+            self.assertEqual(created.status_code, 200, created.text)
+            campaign = created.json()
+            campaign_id = campaign["id"]
+            self.assertEqual(campaign["status"], "draft")
+            self.assertEqual(campaign["recipients"], 1)
+            self.assertEqual(campaign["skipped"], [])
+
+            scheduled = self.client.post(
+                f"/api/email/campaigns/{campaign_id}/schedule",
+                json={
+                    "scheduled_start": "2030-01-01T09:00:00+08:00",
+                    "timezone": "Asia/Shanghai",
+                    "window_start": "09:00",
+                    "window_end": "18:00",
+                    "weekdays": [1, 2, 3, 4, 5],
+                    "interval_seconds": 60,
+                    "jitter_seconds": 30,
+                    "daily_limit": 20,
+                },
+            )
+            self.assertEqual(scheduled.status_code, 200, scheduled.text)
+            self.assertEqual(scheduled.json()["status"], "scheduled")
+
+            paused = self.client.post(f"/api/email/campaigns/{campaign_id}/pause")
+            self.assertEqual(paused.status_code, 200, paused.text)
+            self.assertEqual(paused.json()["status"], "paused")
+            account_row = next(
+                item
+                for item in self.client.get("/api/email/accounts").json()["items"]
+                if item["id"] == account_id
+            )
+            self.assertEqual(account_row["paused_campaigns"], 1)
+            bulk_resume = self.client.post(
+                f"/api/email/accounts/{account_id}/resume-paused"
+            )
+            self.assertEqual(bulk_resume.status_code, 200, bulk_resume.text)
+            self.assertEqual(bulk_resume.json()["resumed"], 1)
+            resumed = self.client.get(f"/api/email/campaigns/{campaign_id}")
+            self.assertEqual(resumed.status_code, 200, resumed.text)
+            self.assertEqual(resumed.json()["campaign"]["status"], "scheduled")
+            retried = self.client.post(
+                f"/api/email/campaigns/{campaign_id}/retry-failed"
+            )
+            self.assertEqual(retried.status_code, 200, retried.text)
+            self.assertEqual(retried.json()["retried"], 0)
+
+            detail = self.client.get(f"/api/email/campaigns/{campaign_id}")
+            self.assertEqual(detail.status_code, 200, detail.text)
+            self.assertEqual(detail.json()["total"], 1)
+            self.assertEqual(detail.json()["recipients"][0]["status"], "pending")
+            listed = self.client.get("/api/email/campaigns").json()["items"]
+            self.assertEqual([item["id"] for item in listed], [campaign_id])
+
+            cancelled = self.client.post(
+                f"/api/email/campaigns/{campaign_id}/cancel"
+            )
+            self.assertEqual(cancelled.status_code, 200, cancelled.text)
+            self.assertEqual(cancelled.json()["status"], "cancelled")
+            self.assertEqual(
+                self.client.delete(f"/api/email/campaigns/{campaign_id}").status_code,
+                400,
+            )
+
+            atomic = self.client.post(
+                "/api/email/campaigns",
+                json={
+                    "name": "一次创建并计划",
+                    "account_id": account_id,
+                    "subject": "合作邀请 {{nickname}}",
+                    "body": "你好 {{nickname}}",
+                    "schedule": True,
+                    "scheduled_start": "2030-01-01T09:00:00+08:00",
+                    "timezone": "Asia/Shanghai",
+                    "window_start": "09:00",
+                    "window_end": "18:00",
+                    "weekdays": [1, 2, 3, 4, 5],
+                    "recipients": [
+                        {
+                            "platform": "xhs",
+                            "user_id": "u1",
+                            "email": "creator@example.com",
+                        }
+                    ],
+                },
+            )
+            self.assertEqual(atomic.status_code, 200, atomic.text)
+            self.assertEqual(atomic.json()["status"], "scheduled")
+            self.assertEqual(
+                atomic.json()["scheduled_start"], "2030-01-01T09:00:00+08:00"
+            )
+            self.assertEqual(
+                self.client.post(
+                    f"/api/email/campaigns/{atomic.json()['id']}/cancel"
+                ).status_code,
+                200,
+            )
+
+            suppression = self.client.post(
+                "/api/email/suppressions",
+                json={"email": "creator@example.com", "reason": "主动退订"},
+            )
+            self.assertEqual(suppression.status_code, 200, suppression.text)
+            suppression_id = suppression.json()["id"]
+            self.assertEqual(
+                self.client.get("/api/email/targets?platform=xhs").json()["total"],
+                0,
+            )
+            self.assertEqual(
+                self.client.delete(
+                    f"/api/email/suppressions/{suppression_id}"
+                ).status_code,
+                200,
+            )
+            self.assertEqual(
+                self.client.get("/api/email/targets?platform=xhs").json()["total"],
+                1,
+            )
+            with Database(self.settings.output_dir) as db:
+                token = db.create_email_unsubscribe_token(
+                    email="unsub@example.com",
+                    creator_platform="xhs",
+                    creator_user_id="u1",
+                    campaign_id=campaign_id,
+                    recipient_id=1,
+                )
+            anonymous = TestClient(api_server.app, base_url="http://127.0.0.1")
+            page = anonymous.get(f"/api/email/unsubscribe?token={token}")
+            self.assertEqual(page.status_code, 200, page.text)
+            self.assertIn("确认退订", page.text)
+            confirm = anonymous.post(f"/api/email/unsubscribe?token={token}")
+            self.assertEqual(confirm.status_code, 200, confirm.text)
+            self.assertIn("已退订", confirm.text)
+            with Database(self.settings.output_dir) as db:
+                self.assertIsNotNone(
+                    db._conn.execute(
+                        "SELECT 1 FROM email_suppressions "
+                        "WHERE email_normalized = 'unsub@example.com'"
+                    ).fetchone()
+                )
+                self.assertTrue(
+                    db.get_email_unsubscribe_token(token)["already_used"]
+                )
+        finally:
+            if old_key is None:
+                os.environ.pop("CODATA_EMAIL_KEY_FILE", None)
+            else:
+                os.environ["CODATA_EMAIL_KEY_FILE"] = old_key
+            key_tmp.cleanup()
+
+    def test_email_accounts_and_creator_emails(self) -> None:
+        import tempfile as _tempfile
+        from unittest.mock import patch as _patch
+
+        key_tmp = _tempfile.TemporaryDirectory()
+        old_key = os.environ.get("CODATA_EMAIL_KEY_FILE")
+        os.environ["CODATA_EMAIL_KEY_FILE"] = str(Path(key_tmp.name) / "email.key")
+        try:
+            created = self.client.post(
+                "/api/email/accounts",
+                json={
+                    "scope": "personal",
+                    "label": "我的邮箱",
+                    "from_name": "运营",
+                    "from_email": "ops@example.com",
+                    "host": "smtp.example.com",
+                    "port": 587,
+                    "security": "starttls",
+                    "username": "ops@example.com",
+                    "password": "secret",
+                },
+            )
+            self.assertEqual(created.status_code, 200, created.text)
+            account = created.json()
+            account_id = account["id"]
+            self.assertTrue(account["has_password"])
+            self.assertTrue(account["can_manage"])
+            self.assertNotIn("password", account)
+            self.assertNotIn("password_encrypted", account)
+
+            listed = self.client.get("/api/email/accounts").json()["items"]
+            self.assertEqual([item["id"] for item in listed], [account_id])
+
+            updated = self.client.patch(
+                f"/api/email/accounts/{account_id}",
+                json={"label": "新名称", "daily_limit": 30},
+            )
+            self.assertEqual(updated.status_code, 200, updated.text)
+            self.assertEqual(updated.json()["label"], "新名称")
+
+            with _patch(
+                "codata.api_server.test_smtp",
+                return_value={"ok": True, "sent_test": False},
+            ):
+                tested = self.client.post(
+                    f"/api/email/accounts/{account_id}/test",
+                    json={},
+                )
+            self.assertEqual(tested.status_code, 200, tested.text)
+            self.assertTrue(tested.json()["ok"])
+
+            email_row = self.client.post(
+                "/api/creators/xhs/u1/emails",
+                json={"email": "Creator@Example.com", "is_primary": True},
+            )
+            self.assertEqual(email_row.status_code, 200, email_row.text)
+            email_id = email_row.json()["id"]
+            emails = self.client.get("/api/creators/xhs/u1/emails").json()["items"]
+            self.assertEqual(emails[0]["email_normalized"], "creator@example.com")
+            primary = self.client.post(
+                f"/api/email/creator-emails/{email_id}/primary"
+            )
+            self.assertEqual(primary.status_code, 200, primary.text)
+            deleted = self.client.delete(f"/api/email/creator-emails/{email_id}")
+            self.assertEqual(deleted.status_code, 200, deleted.text)
+            self.assertEqual(
+                self.client.get("/api/creators/xhs/u1/emails").json()["items"], []
+            )
+
+            shared = self.client.post(
+                "/api/email/accounts",
+                json={
+                    "scope": "shared",
+                    "label": "公司邮箱",
+                    "from_name": "公司",
+                    "from_email": "team@example.com",
+                    "host": "smtp.example.com",
+                    "port": 465,
+                    "security": "ssl",
+                    "username": "team@example.com",
+                    "password": "secret",
+                },
+            )
+            self.assertEqual(shared.status_code, 200, shared.text)
+            shared_id = shared.json()["id"]
+
+            with Database(self.settings.output_dir) as db:
+                member_id = db.create_user(
+                    "sender-no-email",
+                    hash_password("test-password-123"),
+                    role="member",
+                    can_send_email=False,
+                )
+            login = self.client.post(
+                "/api/auth/login",
+                json={"username": "sender-no-email", "password": "test-password-123"},
+            )
+            self.assertEqual(login.status_code, 200, login.text)
+            headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+            self.client.cookies.clear()
+            self.client.post(
+                "/api/auth/login",
+                json={"username": "sender-no-email", "password": "test-password-123"},
+            )
+            self.assertEqual(
+                self.client.get("/api/email/accounts").status_code, 403
+            )
+
+            self.client.cookies.clear()
+            admin_login = self.client.post(
+                "/api/auth/login",
+                json={"username": "test-admin", "password": "test-password-123"},
+            )
+            self.client.headers.update(
+                {"X-CSRF-Token": admin_login.json()["csrf_token"]}
+            )
+            self.client.patch(
+                f"/api/users/{member_id}",
+                json={"can_send_email": True},
+            )
+            self.client.cookies.clear()
+            member_login = self.client.post(
+                "/api/auth/login",
+                json={"username": "sender-no-email", "password": "test-password-123"},
+            )
+            member_headers = {"X-CSRF-Token": member_login.json()["csrf_token"]}
+            with _patch(
+                "codata.api_server.test_smtp",
+                return_value={"ok": True, "sent_test": True},
+            ):
+                allowed_test = self.client.post(
+                    f"/api/email/accounts/{shared_id}/test",
+                    json={"send_test_to": "team@example.com"},
+                    headers=member_headers,
+                )
+            self.assertEqual(allowed_test.status_code, 200, allowed_test.text)
+            blocked_test = self.client.post(
+                f"/api/email/accounts/{shared_id}/test",
+                json={"send_test_to": "someone@example.com"},
+                headers=member_headers,
+            )
+            self.assertEqual(blocked_test.status_code, 403, blocked_test.text)
+            plaintext = self.client.post(
+                "/api/email/accounts",
+                json={
+                    "scope": "shared",
+                    "from_name": "公司",
+                    "from_email": "team@example.com",
+                    "host": "smtp.example.com",
+                    "port": 25,
+                    "security": "none",
+                    "username": "team@example.com",
+                    "password": "secret",
+                },
+                headers=member_headers,
+            )
+            self.assertEqual(plaintext.status_code, 400, plaintext.text)
+            visible = self.client.get("/api/email/accounts", headers=member_headers)
+            self.assertEqual(visible.status_code, 200, visible.text)
+            self.assertEqual(
+                [item["id"] for item in visible.json()["items"]], [shared_id]
+            )
+            forbidden = self.client.post(
+                "/api/email/accounts",
+                json={
+                    "scope": "shared",
+                    "from_name": "公司",
+                    "from_email": "team@example.com",
+                    "host": "smtp.example.com",
+                    "port": 587,
+                    "username": "team@example.com",
+                    "password": "secret",
+                },
+                headers=member_headers,
+            )
+            self.assertEqual(forbidden.status_code, 403, forbidden.text)
+        finally:
+            if old_key is None:
+                os.environ.pop("CODATA_EMAIL_KEY_FILE", None)
+            else:
+                os.environ["CODATA_EMAIL_KEY_FILE"] = old_key
+            key_tmp.cleanup()
 
     def test_cooperation_status_requires_adopted_creator(self) -> None:
         rejected = self.client.patch(

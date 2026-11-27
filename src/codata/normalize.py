@@ -322,13 +322,13 @@ def normalize_rnote_user(payload: Any, user_id: str = "") -> dict[str, Any]:
     result = first_dict(data.get("result"), data.get("user"), data.get("user_info"), data)
     stats = first_dict(result.get("note_num_stat"), data.get("note_num_stat"))
     resolved_id = first_str(
-        user_id,
         result.get("user_id"),
         result.get("userid"),
         result.get("userId"),
         data.get("user_id"),
         data.get("userid"),
         data.get("userId"),
+        user_id,
     )
     liked = as_optional_int(
         first_not_none(

@@ -404,11 +404,11 @@ def normalize_xhs_user(payload: Any, user_id: str = "") -> dict[str, Any]:
     user = _nested_user(payload)
     merged = {**data, **user}
     resolved = first_str(
-        user_id,
         merged.get("user_id"),
         merged.get("userid"),
         merged.get("userId"),
         merged.get("id"),
+        user_id,
     )
     avatar = _avatar(merged, merged)
     return {
@@ -535,7 +535,6 @@ def normalize_douyin_user(payload: Any, user_id: str = "") -> dict[str, Any]:
     user = _nested_user(payload)
     merged = {**data, **user}
     resolved = first_str(
-        user_id,
         merged.get("sec_uid"),
         merged.get("secUid"),
         merged.get("uid"),
@@ -543,6 +542,7 @@ def normalize_douyin_user(payload: Any, user_id: str = "") -> dict[str, Any]:
         merged.get("userId"),
         merged.get("unique_id"),
         merged.get("uniqueId"),
+        user_id,
     )
     liked = as_optional_int(
         _first_present(
@@ -623,7 +623,7 @@ def normalize_bilibili_user(payload: Any, user_id: str = "") -> dict[str, Any]:
     user = _nested_user(payload)
     stat = data.get("stat") if isinstance(data.get("stat"), dict) else {}
     merged = {**stat, **data, **user}
-    resolved = first_str(user_id, merged.get("mid"), merged.get("user_id"), merged.get("id"))
+    resolved = first_str(merged.get("mid"), merged.get("user_id"), merged.get("id"), user_id)
     liked = as_optional_int(
         _first_present(merged, "like_count", "liked", "total_favorited")
     )
@@ -664,10 +664,10 @@ def normalize_zhihu_user(payload: Any, user_id: str = "") -> dict[str, Any]:
     user = _nested_user(payload)
     merged = {**data, **user}
     resolved = first_str(
-        user_id,
         merged.get("author_id"),
         merged.get("user_id"),
         merged.get("id"),
+        user_id,
     )
     answered = as_optional_int(merged.get("answer_count"))
     articles = as_optional_int(merged.get("article_count"))

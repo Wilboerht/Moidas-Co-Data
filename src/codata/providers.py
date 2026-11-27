@@ -127,6 +127,11 @@ class LegacyDataFlowProvider(Provider):
     def __init__(self, api: Any, platform: str = "xhs") -> None:
         self.api = api
         self.platform = platform
+        cost = int(getattr(api, "xhs_cost", XHS_COST))
+        self.search_cost_tokens = cost
+        self.user_cost_tokens = cost
+        self.search_price = Price(Decimal(cost), "token")
+        self.user_price = Price(Decimal(cost), "token")
 
     def search(self, keyword: str, page: int, state: dict[str, str]) -> SearchResponse:
         payload = self.api.xhs_search(keyword, page)

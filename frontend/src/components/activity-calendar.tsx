@@ -432,7 +432,7 @@ export function ActivityCalendar({
                 <Tooltip key={value}>
                   <TooltipTrigger asChild>{button}</TooltipTrigger>
                   <TooltipContent side="bottom" className="max-w-xs">
-                    审核状态、标签、跟进等修改的次数；批量审核按涉及人数累计。
+                    采用状态、标签、跟进等修改的次数；批量审核按涉及人数累计。
                   </TooltipContent>
                 </Tooltip>
               );

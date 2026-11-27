@@ -1,15 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Copy, ExternalLink, Info, LoaderCircle, UserCheck } from "lucide-react";
+import { Copy, ExternalLink, Info, LoaderCircle, Plus, Trash2, UserCheck } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/shared/api";
 import { fmtDate, fmtDateTime, fmtNumber, safeHttpUrl, shorten } from "@/shared/format";
 import { useAuth } from "@/shared/auth-context";
+import { useUnsavedGuard } from "@/shared/use-unsaved-guard";
 import { useRound } from "@/shared/round-context";
 import type {
   CooperationStatusDef,
   CreatorDetail,
   StatusDef,
+  CreatorEmail,
 } from "@/shared/types";
 import { Badge } from "@/components/ui/badge";
 import { CooperationRecords } from "@/components/cooperation-cases";
@@ -118,6 +120,11 @@ export function CreatorSheet({
                   {detail.data?.platform_label || platform}
                   {` · ${enrichmentLabel}`}
                 </span>
+                {canCollect && detail.data?.round_name ? (
+                  <span className="rounded bg-muted px-1.5 py-0.5 text-[11px] text-foreground">
+                    当前轮次：{detail.data.round_name}
+                  </span>
+                ) : null}
                 {profileHref ? (
                   <a
                     href={profileHref}
@@ -143,9 +150,14 @@ export function CreatorSheet({
           </div>
         ) : detail.error ? (
           <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
-            <p className="text-sm text-destructive">
-              {detail.error instanceof Error ? detail.error.message : "加载详情失败"}
-            </p>
+            <div className="space-y-2">
+              <p className="text-sm text-destructive">
+                {detail.error instanceof Error ? detail.error.message : "加载详情失败"}
+              </p>
+              <Button variant="outline" size="sm" onClick={() => void detail.refetch()}>
+                重试
+              </Button>
+            </div>
           </div>
         ) : detail.data ? (
           <CreatorDetailForm
@@ -254,8 +266,52 @@ function CreatorDetailForm({
   const [pendingOwner, setPendingOwner] = useState<{ userId: number | null; username: string } | null>(null);
   const { user } = useAuth();
   const canCollect = user?.role === "admin" || Boolean(user?.can_collect);
-  const canEdit = true;
+  const canSendEmail = user?.role === "admin" || Boolean(user?.can_send_email);
   const queryClient = useQueryClient();
+  const [newEmail, setNewEmail] = useState("");
+  const emailsQuery = useQuery({
+    queryKey: ["creator-emails", detail.platform, detail.user_id],
+    queryFn: () => api.getCreatorEmails(detail.platform, detail.user_id),
+    enabled: canSendEmail,
+  });
+  const addEmailMutation = useMutation({
+    mutationFn: () =>
+      api.addCreatorEmail(detail.platform, detail.user_id, {
+        email: newEmail.trim(),
+        is_primary: (emailsQuery.data?.items.length ?? 0) === 0,
+      }),
+    onSuccess: async () => {
+      setNewEmail("");
+      toast.success("邮箱已添加");
+      await queryClient.invalidateQueries({
+        queryKey: ["creator-emails", detail.platform, detail.user_id],
+      });
+    },
+    onError: (error) =>
+      toast.error(error instanceof Error ? error.message : "添加邮箱失败"),
+  });
+  const deleteEmailMutation = useMutation({
+    mutationFn: (emailId: number) => api.deleteCreatorEmail(emailId),
+    onSuccess: async () => {
+      toast.success("邮箱已删除");
+      await queryClient.invalidateQueries({
+        queryKey: ["creator-emails", detail.platform, detail.user_id],
+      });
+    },
+    onError: (error) =>
+      toast.error(error instanceof Error ? error.message : "删除邮箱失败"),
+  });
+  const primaryEmailMutation = useMutation({
+    mutationFn: (emailId: number) => api.setPrimaryCreatorEmail(emailId),
+    onSuccess: async () => {
+      toast.success("已设为主邮箱");
+      await queryClient.invalidateQueries({
+        queryKey: ["creator-emails", detail.platform, detail.user_id],
+      });
+    },
+    onError: (error) =>
+      toast.error(error instanceof Error ? error.message : "设置失败"),
+  });
   const loadedKey = useRef("");
 
   useEffect(() => {
@@ -278,14 +334,8 @@ function CreatorDetailForm({
 
   useEffect(() => {
     onDirtyChange(dirty);
-    if (!dirty) return;
-    const warn = (event: BeforeUnloadEvent) => {
-      event.preventDefault();
-      event.returnValue = "";
-    };
-    window.addEventListener("beforeunload", warn);
-    return () => window.removeEventListener("beforeunload", warn);
   }, [dirty, onDirtyChange]);
+  useUnsavedGuard(dirty, "有未保存的标注，确定离开当前页面？");
 
   const mutation = useMutation({
     mutationFn: () => {
@@ -410,7 +460,7 @@ function CreatorDetailForm({
       ? detail.data_round
       : "";
   const concreteMetadata: [string, string][] = [
-    ["审核状态", detail.round_status_label],
+    ["采用状态", detail.round_status_label],
     ["合作更新时间", detail.cooperation_updated_at ? fmtDateTime(detail.cooperation_updated_at) : ""],
     ["粉丝层级", detail.fans_tier],
     ["账号 ID", detail.account_id],
@@ -444,7 +494,7 @@ function CreatorDetailForm({
   return (
     <>
     <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
-    <div className="space-y-6">
+    <div className="space-y-4">
       <div className="grid grid-cols-2 gap-px border bg-border sm:grid-cols-4">
         {metrics.map(([label, value]) => (
           <div key={label} className="space-y-1 bg-background p-3">
@@ -453,23 +503,6 @@ function CreatorDetailForm({
           </div>
         ))}
       </div>
-
-      {detail.desc ? (
-        <div className="space-y-1">
-          <p className={cn("text-sm text-muted-foreground", !descExpanded && "line-clamp-3")}>
-            {detail.desc}
-          </p>
-          {detail.desc.length > 120 ? (
-            <button
-              type="button"
-              onClick={() => setDescExpanded((value) => !value)}
-              className="text-xs text-muted-foreground underline underline-offset-4 hover:text-foreground"
-            >
-              {descExpanded ? "收起" : "展开"}
-            </button>
-          ) : null}
-        </div>
-      ) : null}
 
       <div className="space-y-2">
         <div className="flex flex-wrap items-center justify-between gap-3 border bg-muted/20 px-3 py-2.5">
@@ -552,6 +585,159 @@ function CreatorDetailForm({
         ) : null}
       </div>
 
+      {canSendEmail ? (
+        <section className="space-y-2 border-t pt-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="text-sm font-semibold">联系邮箱</h3>
+            <span className="text-xs text-muted-foreground">用于自动发件</span>
+          </div>
+          {emailsQuery.isLoading ? (
+            <Skeleton className="h-10 w-full" />
+          ) : emailsQuery.error ? (
+            <p className="text-sm text-destructive">
+              {emailsQuery.error instanceof Error
+                ? emailsQuery.error.message
+                : "加载邮箱失败"}
+            </p>
+          ) : (emailsQuery.data?.items.length ?? 0) === 0 ? (
+            <p className="text-sm text-muted-foreground">暂无邮箱。</p>
+          ) : (
+            <ul className="space-y-1.5">
+              {(emailsQuery.data?.items ?? []).map((email: CreatorEmail) => (
+                <li
+                  key={email.id}
+                  className="flex flex-wrap items-center justify-between gap-2 rounded border bg-background px-2 py-1.5 text-xs"
+                >
+                  <span className="flex items-center gap-2">
+                    <span className="font-medium">{email.email}</span>
+                    {email.is_primary ? (
+                      <Badge variant="outline" className="font-normal">主邮箱</Badge>
+                    ) : (
+                      <Button
+                        size="xs"
+                        variant="ghost"
+                        onClick={() => primaryEmailMutation.mutate(email.id)}
+                        disabled={primaryEmailMutation.isPending}
+                      >
+                        设为主邮箱
+                      </Button>
+                    )}
+                  </span>
+                  <Button
+                    size="icon-sm"
+                    variant="ghost"
+                    aria-label="删除邮箱"
+                    onClick={() => {
+                      if (window.confirm(`删除邮箱 ${email.email}？已发记录会保留。`)) {
+                        deleteEmailMutation.mutate(email.id);
+                      }
+                    }}
+                    disabled={deleteEmailMutation.isPending}
+                  >
+                    <Trash2 />
+                  </Button>
+                </li>
+              ))}
+            </ul>
+          )}
+          <div className="flex items-start gap-2">
+            <Input
+              type="email"
+              value={newEmail}
+              onChange={(event) => setNewEmail(event.target.value)}
+              placeholder="添加达人邮箱"
+              className="h-8 text-xs"
+              aria-label="添加达人邮箱"
+            />
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => addEmailMutation.mutate()}
+              disabled={addEmailMutation.isPending || !newEmail.trim()}
+            >
+              {addEmailMutation.isPending ? (
+                <LoaderCircle className="animate-spin" />
+              ) : (
+                <Plus />
+              )}
+              添加
+            </Button>
+          </div>
+        </section>
+      ) : null}
+
+      <section className="space-y-3">
+        <div className="space-y-1">
+          <h3 className="text-sm font-semibold">人工标注</h3>
+          <p className="text-xs text-muted-foreground">
+            采用状态按轮次记录；采用后自动进入合作跟进（未联系）。合作状态跨轮次，不随轮次重置；跟进人只表示责任归属。
+          </p>
+        </div>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div className="space-y-2">
+            <Label htmlFor="creator-status">采用状态</Label>
+            <Select
+              value={status}
+              onValueChange={(value) => {
+                setStatus(value);
+                if (mutation.isError) mutation.reset();
+              }}
+              disabled={mutation.isPending}
+            >
+              <SelectTrigger id="creator-status" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {statuses.map((item) => (
+                  <SelectItem key={item.code} value={item.code}>{item.label}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="creator-direction">匹配方向</Label>
+            <Input
+              id="creator-direction"
+              value={direction}
+              disabled={mutation.isPending}
+              onChange={(event) => {
+                setDirection(event.target.value);
+                if (mutation.isError) mutation.reset();
+              }}
+              autoComplete="off"
+            />
+          </div>
+          <div className="space-y-2 sm:col-span-2">
+            <Label htmlFor="creator-tags">人工标签</Label>
+            <Input
+              id="creator-tags"
+              value={tags}
+              disabled={mutation.isPending}
+              onChange={(event) => {
+                setTags(event.target.value);
+                if (mutation.isError) mutation.reset();
+              }}
+              placeholder="多个标签用逗号分隔"
+              autoComplete="off"
+            />
+          </div>
+          <div className="space-y-2 sm:col-span-2">
+            <Label htmlFor="creator-remark">备注</Label>
+            <Textarea
+              id="creator-remark"
+              value={remark}
+              disabled={mutation.isPending}
+              onChange={(event) => {
+                setRemark(event.target.value);
+                if (mutation.isError) mutation.reset();
+              }}
+              rows={3}
+            />
+          </div>
+        </div>
+      </section>
+
+
       <CooperationRecords
         platform={detail.platform}
         userId={detail.user_id}
@@ -576,6 +762,7 @@ function CreatorDetailForm({
           await queryClient.invalidateQueries({ queryKey: ["dashboard"] });
         }}
       />
+
 
       {sourceKeywords.length > 0 ? (
         <div className="space-y-2">
@@ -623,6 +810,24 @@ function CreatorDetailForm({
         </section>
       ) : null}
 
+      {detail.desc ? (
+        <div className="space-y-1">
+          <p className={cn("text-sm text-muted-foreground", !descExpanded && "line-clamp-3")}>
+            {detail.desc}
+          </p>
+          {detail.desc.length > 120 ? (
+            <button
+              type="button"
+              onClick={() => setDescExpanded((value) => !value)}
+              className="text-xs text-muted-foreground underline underline-offset-4 hover:text-foreground"
+            >
+              {descExpanded ? "收起" : "展开"}
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+
+
       <section className="space-y-3">
         <h3 className="text-sm font-semibold">基础资料</h3>
         {concreteMetadata.length > 0 ? (
@@ -652,77 +857,6 @@ function CreatorDetailForm({
         ) : (
           <p className="text-sm text-muted-foreground">暂无更多资料</p>
         )}
-      </section>
-
-      <section className="space-y-3 border-t pt-4">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <h3 className="text-sm font-semibold">人工标注</h3>
-          <p className="text-xs text-muted-foreground">
-            跟进人仅表示当前跟进人，不限制编辑；未分配时首次保存标注或状态会自动归你跟进。
-          </p>
-        </div>
-        <div className="grid gap-3 sm:grid-cols-2">
-          <div className="space-y-2">
-            <Label htmlFor="creator-status">采用状态</Label>
-            <Select
-              value={status}
-              onValueChange={(value) => {
-                setStatus(value);
-                if (mutation.isError) mutation.reset();
-              }}
-              disabled={!canEdit || mutation.isPending}
-            >
-              <SelectTrigger id="creator-status" className="w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {statuses.map((item) => (
-                  <SelectItem key={item.code} value={item.code}>{item.label}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="creator-direction">匹配方向</Label>
-            <Input
-              id="creator-direction"
-              value={direction}
-              disabled={!canEdit || mutation.isPending}
-              onChange={(event) => {
-                setDirection(event.target.value);
-                if (mutation.isError) mutation.reset();
-              }}
-              autoComplete="off"
-            />
-          </div>
-          <div className="space-y-2 sm:col-span-2">
-            <Label htmlFor="creator-tags">人工标签</Label>
-            <Input
-              id="creator-tags"
-              value={tags}
-              disabled={!canEdit || mutation.isPending}
-              onChange={(event) => {
-                setTags(event.target.value);
-                if (mutation.isError) mutation.reset();
-              }}
-              placeholder="多个标签用逗号分隔"
-              autoComplete="off"
-            />
-          </div>
-          <div className="space-y-2 sm:col-span-2">
-            <Label htmlFor="creator-remark">备注</Label>
-            <Textarea
-              id="creator-remark"
-              value={remark}
-              disabled={!canEdit || mutation.isPending}
-              onChange={(event) => {
-                setRemark(event.target.value);
-                if (mutation.isError) mutation.reset();
-              }}
-              rows={3}
-            />
-          </div>
-        </div>
       </section>
 
       <details className="group border-t pt-4">
@@ -787,7 +921,7 @@ function CreatorDetailForm({
         <Button
           className="shrink-0"
           onClick={() => mutation.mutate()}
-          disabled={!canEdit || !dirty || mutation.isPending}
+          disabled={!dirty || mutation.isPending}
         >
           {mutation.isPending ? (
             <>

@@ -76,6 +76,14 @@ function useDebounced<T>(value: T, delay = 300) {
 
 const DEFAULT_STATUS_FILTER = ["unverified", "verifying"];
 
+export function hasQuickConvertIdentity(
+  lead: Pick<Lead, "status" | "account_id" | "platform_handle" | "profile_url">,
+) {
+  return lead.status !== "converted" && Boolean(
+    lead.account_id.trim() || lead.platform_handle.trim() || lead.profile_url.trim()
+  );
+}
+
 export function LeadsPage() {
   const { user } = useAuth();
   const canCollect = user?.role === "admin" || Boolean(user?.can_collect);
@@ -114,6 +122,7 @@ export function LeadsPage() {
     return Number.isFinite(value) && value > 0 ? value : null;
   });
   const [createOpen, setCreateOpen] = useState(false);
+  const [quickConvertTarget, setQuickConvertTarget] = useState<Lead | null>(null);
   const [bulkOpen, setBulkOpen] = useState(false);
   const leadStatuses = meta?.lead_statuses ?? [];
   const leadSources = meta?.lead_sources ?? [];
@@ -219,12 +228,7 @@ export function LeadsPage() {
   const assignableOwners = user?.role === "admin" ? owners : owners.filter((item) => item.id === user?.id);
   const total = leadsQuery.data?.total ?? 0;
   const hasQuickConvertAction =
-    canCollect &&
-    (leadsQuery.data?.items ?? []).some(
-      (lead) =>
-        lead.status !== "converted" &&
-        Boolean(lead.account_id.trim() || lead.profile_url.trim()),
-    );
+    canCollect && (leadsQuery.data?.items ?? []).some(hasQuickConvertIdentity);
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   useEffect(() => {
     if (leadsQuery.data && page > totalPages) setPage(totalPages);
@@ -265,7 +269,7 @@ export function LeadsPage() {
         fetch: true,
       }),
     onSuccess: async (_result, lead) => {
-      toast.success(`已将「${lead.nickname || `线索 #${lead.id}`}」转为达人并补全资料`);
+      toast.success(`已将「${lead.nickname || `线索 #${lead.id}`}」转为达人（待采用）并补全资料，请到达人库审核`);
       await refresh();
     },
     onError: (error, lead) => {
@@ -284,12 +288,16 @@ export function LeadsPage() {
   const quickConvertState = (lead: Lead) => {
     const visible = Boolean(
       canCollect &&
+        canEditLeads &&
         (lead.account_id.trim() ||
           lead.platform_handle.trim() ||
           lead.profile_url.trim()) &&
         lead.status !== "converted",
     );
     if (!visible) return { visible, disabled: true, reason: "" };
+    if (quickConvertMutation.isPending) {
+      return { visible, disabled: true, reason: "正在转换其他线索，请稍候" };
+    }
     if (lead.status !== "unverified" && lead.status !== "verifying") {
       return {
         visible,
@@ -385,6 +393,12 @@ export function LeadsPage() {
             : "线索唯一索引未启用。"}
           请运行 <code className="rounded bg-amber-100 px-1 py-0.5 font-mono text-xs">uv run codata-admin leads-dedupe --apply</code>
           后重启面板。
+        </div>
+      ) : null}
+
+      {!canEditLeads ? (
+        <div className="border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+          当前账号为线索只读：可以查看和导出；新增、编辑和转化请联系管理员或线索负责人。
         </div>
       ) : null}
 
@@ -512,15 +526,31 @@ export function LeadsPage() {
           </div>
         ) : leadsQuery.error ? (
           <div className="p-4">
-            <ErrorState message={leadsQuery.error instanceof Error ? leadsQuery.error.message : "加载线索失败"} />
+            <ErrorState
+              message={leadsQuery.error instanceof Error ? leadsQuery.error.message : "加载线索失败"}
+              action={
+                <Button variant="outline" size="sm" onClick={() => void leadsQuery.refetch()}>
+                  重试
+                </Button>
+              }
+            />
           </div>
         ) : empty ? (
           <EmptyState
-            title="没有线索"
+            title={hasCustomFilters ? "当前筛选没有线索" : "没有线索"}
             description={
-              canEditLeads
-                ? "可以从导入、手动录入或客户链接开始收集线索。"
-                : "管理员录入线索后会显示在这里。"
+              hasCustomFilters
+                ? "调整搜索或筛选条件后再试。"
+                : canEditLeads
+                  ? "可以从导入、手动录入或客户链接开始收集线索。"
+                  : "管理员录入线索后会显示在这里。"
+            }
+            actions={
+              hasCustomFilters ? (
+                <Button variant="outline" size="sm" onClick={resetFilters}>
+                  清除筛选
+                </Button>
+              ) : undefined
             }
           />
         ) : (
@@ -529,10 +559,10 @@ export function LeadsPage() {
               <TableRow>
                 <TableHead>线索</TableHead>
                 <TableHead>平台</TableHead>
-                <TableHead>账号 / 主页</TableHead>
+                <TableHead>账号 / 校验</TableHead>
                 <TableHead>来源</TableHead>
-                <TableHead>负责人</TableHead>
-                <TableHead>状态</TableHead>
+                <TableHead><span title="线索负责人只影响编辑和转化权限">负责人</span></TableHead>
+                <TableHead>线索状态</TableHead>
                 {hasQuickConvertAction ? <TableHead>操作</TableHead> : null}
                 <TableHead>更新时间</TableHead>
               </TableRow>
@@ -581,7 +611,7 @@ export function LeadsPage() {
                       {lead.platform_handle || lead.account_id || lead.profile_url || "—"}
                     </div>
                     <div className="truncate text-[11px] font-sans">
-                      {lead.identity_status_label}
+                      账号校验：{lead.identity_status_label}
                       {lead.identity_confidence
                         ? ` · ${IDENTITY_CONFIDENCE_LABELS[lead.identity_confidence] ?? lead.identity_confidence}`
                         : ""}
@@ -597,7 +627,7 @@ export function LeadsPage() {
                       <LeadQuickConvertButton
                         {...quickConvertState(lead)}
                         converting={convertingLeadId === lead.id}
-                        onClick={() => quickConvertMutation.mutate(lead)}
+                        onClick={() => setQuickConvertTarget(lead)}
                       />
                     </TableCell>
                   ) : null}
@@ -619,6 +649,37 @@ export function LeadsPage() {
           onClose={() => setSelectedLeadId(null)}
         />
       ) : null}
+
+      <AlertDialog
+        open={quickConvertTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setQuickConvertTarget(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>转为达人并补全资料？</AlertDialogTitle>
+            <AlertDialogDescription>
+              将把「{quickConvertTarget?.nickname || `线索 #${quickConvertTarget?.id ?? ""}`}」转为达人（待采用），
+              自动选择当前最便宜的服务商并抓取主页资料，可能产生费用。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={quickConvertMutation.isPending}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={quickConvertMutation.isPending}
+              onClick={(event) => {
+                event.preventDefault();
+                if (!quickConvertTarget) return;
+                quickConvertMutation.mutate(quickConvertTarget);
+                setQuickConvertTarget(null);
+              }}
+            >
+              确认转换
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <BulkLeadDialog
         open={bulkOpen}

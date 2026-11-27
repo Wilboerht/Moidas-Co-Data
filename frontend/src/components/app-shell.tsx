@@ -5,6 +5,7 @@ import {
   LayoutDashboard,
   ContactRound,
   ListChecks,
+  Mail,
   Settings,
   Tags,
   UserCog,
@@ -12,6 +13,7 @@ import {
 } from "lucide-react";
 import logo from "@/assets/logo.svg";
 import { AccountMenu } from "@/components/account-menu";
+import { HelpButton } from "@/components/help-dialog";
 import { Breadcrumb, BreadcrumbItem, BreadcrumbLink, BreadcrumbList, BreadcrumbPage, BreadcrumbSeparator } from "@/components/ui/breadcrumb";
 import { ThinkingOrb } from "@/components/dissolve/thinking-orb";
 import { roundOrbState } from "@/components/round-status-orb";
@@ -43,7 +45,8 @@ const NAV_ITEMS = [
   { href: "/", label: "工作台", icon: LayoutDashboard },
   { href: "/creators", label: "达人库", icon: Users },
   { href: "/leads", label: "线索库", icon: ContactRound },
-  { href: "/tasks", label: "采集任务", icon: ListChecks },
+  { href: "/tasks", label: "采集轮次", icon: ListChecks },
+  { href: "/email", label: "自动发件", icon: Mail },
   { href: "/keywords", label: "关键词", icon: Tags },
 ];
 
@@ -63,13 +66,14 @@ const TITLES: Record<string, string> = {
   "/creators": "达人库",
   "/leads": "线索库",
   "/new": "新建采集",
-  "/tasks": "采集任务",
+  "/tasks": "采集轮次",
   "/keywords": "关键词",
+  "/email": "自动发件",
   "/settings": "设置",
 };
 
 function titleForPath(pathname: string) {
-  if (pathname.startsWith("/tasks/")) return "任务详情";
+  if (pathname.startsWith("/tasks/")) return "轮次详情";
   return TITLES[pathname] ?? "工作台";
 }
 
@@ -97,11 +101,16 @@ function AppSidebar() {
   const runtimeStatus = error ? "系统异常" : loading ? "连接中" : "运行正常";
   const runtimeTone = error ? "bg-destructive" : loading ? "bg-amber-500" : "bg-emerald-500";
   const canCollect = user?.role === "admin" || Boolean(user?.can_collect);
+  const canSendEmail = user?.role === "admin" || Boolean(user?.can_send_email);
   const navItems = (
     user?.role === "admin"
       ? [...NAV_ITEMS, { href: "/users", label: "用户", icon: UserCog }]
       : NAV_ITEMS
-  ).filter((item) => canCollect || (item.href !== "/tasks" && item.href !== "/keywords"));
+  ).filter((item) => {
+    if (item.href === "/tasks" || item.href === "/keywords") return canCollect;
+    if (item.href === "/email") return canSendEmail;
+    return true;
+  });
   const systemItems = user?.role === "admin" ? SYSTEM_ITEMS : [];
 
   return (
@@ -255,8 +264,8 @@ export function AppShell() {
   const statusDescription = statusJob
     ? `采集状态：${statusText}${statusJob.stage ? ` · ${statusJob.stage}` : ""}${
         statusRound ? ` · ${statusRound.name}` : ""
-      }。${activeCount > 1 ? "点击查看全部任务。" : "点击查看任务详情。"}`
-    : "当前没有运行中的采集任务。点击查看采集记录。";
+      }。${activeCount > 1 ? "点击查看全部运行。" : "点击查看轮次详情。"}`
+    : "当前没有运行中的采集轮次。点击查看采集轮次。";
   const statusHref =
     statusJob?.round_id && activeCount <= 1 ? `/tasks/${statusJob.round_id}` : "/tasks";
   const orbState = roundOrbState(status);
@@ -282,6 +291,13 @@ export function AppShell() {
     const roundName = rounds.find((item) => item.id === latestJob.round_id)?.name;
     const suffix = roundName ? ` · ${roundName}` : "";
     if (latestJob.status === "done") {
+      if (latestJob.stage?.includes("保留上一快照")) {
+        toast.warning(`采集未完整，已保留上一快照${suffix}`, {
+          description: `${latestJob.stage} · 花费 ${fmtNumber(latestJob.cost)} token`,
+          duration: 8000,
+        });
+        return;
+      }
       toast.success(`采集完成${suffix}`, {
         description: `处理 ${latestJob.progress_done} / ${latestJob.progress_total} · 花费 ${fmtNumber(latestJob.cost)} token`,
         duration: 6000,
@@ -324,7 +340,7 @@ export function AppShell() {
                 <>
                   <BreadcrumbItem>
                     <BreadcrumbLink asChild>
-                      <Link to="/tasks">采集任务</Link>
+                      <Link to="/tasks">采集轮次</Link>
                     </BreadcrumbLink>
                   </BreadcrumbItem>
                   <BreadcrumbSeparator />
@@ -341,6 +357,7 @@ export function AppShell() {
           </Breadcrumb>
           <span className="text-sm font-medium text-[#1C316A] md:hidden">Moidas</span>
           <div className="ml-auto flex items-center gap-3">
+            <HelpButton canCollect={canCollect} />
             {canCollect ? (
               <Tooltip>
                 <TooltipTrigger asChild>

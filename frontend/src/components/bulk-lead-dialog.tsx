@@ -183,7 +183,7 @@ export function parseLeadText(
         const field = COLUMN_ALIASES[headerKey(cell)];
         if (field && next[field] === undefined) next[field] = cellIndex;
       });
-      if (Object.keys(next).length >= 2) headerMap = next;
+      if (Object.keys(next).length >= 1) headerMap = next;
       return;
     }
 

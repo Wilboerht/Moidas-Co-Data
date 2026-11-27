@@ -44,7 +44,12 @@ class Pipeline:
             self.provider.close()
 
     @staticmethod
-    def estimate(keyword_count: int, pages: int, max_creators: int | None) -> dict[str, int]:
+    def estimate(
+        keyword_count: int,
+        pages: int,
+        max_creators: int | None,
+        unit_cost: int = XHS_COST,
+    ) -> dict[str, int]:
         if keyword_count <= 0:
             return {"search_calls": 0, "user_calls": 0, "total_calls": 0, "tokens": 0}
         search_calls = max(0, keyword_count) * max(1, pages)
@@ -53,7 +58,7 @@ class Pipeline:
             "search_calls": search_calls,
             "user_calls": max(0, user_calls),
             "total_calls": search_calls + max(0, user_calls),
-            "tokens": (search_calls + max(0, user_calls)) * XHS_COST,
+            "tokens": (search_calls + max(0, user_calls)) * int(unit_cost),
         }
 
     def estimate_for(
@@ -244,6 +249,9 @@ class Pipeline:
 
         done = 0
         failures = 0
+        search_failures = 0
+        consecutive_failures = 0
+        pending_hits: list[tuple[Any, ...]] = []
         for row in keywords:
             word = row["word"]
             keyword_pages = int(row.get("pages") or pages)
@@ -266,8 +274,10 @@ class Pipeline:
                     )
                 except ProviderError as exc:
                     failures += 1
+                    search_failures += 1
+                    consecutive_failures += 1
                     print(f"[search] {word} 第 {page} 页失败: {exc}")
-                    if _fatal_provider_error(exc) or failures >= 5:
+                    if _fatal_provider_error(exc) or consecutive_failures >= 5:
                         raise
                     break
                 if not isinstance(response, SearchResponse):
@@ -287,16 +297,18 @@ class Pipeline:
                             self.db.upsert_creator_basic(author, commit=False)
                         self.db.upsert_note(note, commit=False)
                         if note.get("author_id"):
-                            self.db.add_note_hit(
-                                round_id,
-                                note["platform"],
-                                note["note_id"],
-                                word,
-                                page,
-                                rank,
-                                commit=False,
+                            pending_hits.append(
+                                (
+                                    round_id,
+                                    note["platform"],
+                                    note["note_id"],
+                                    word,
+                                    page,
+                                    rank,
+                                )
                             )
                 done += 1
+                consecutive_failures = 0
                 self.db.update_job(job_id, progress_done=done)
                 print(f"[search] {word} 第 {page} 页: {len(items)} 条")
                 if response.has_more is False or not items:
@@ -305,21 +317,27 @@ class Pipeline:
         if done == 0 and keywords:
             raise RuntimeError("所有搜索页均失败，未采集到任何数据")
 
-        stats = self.db.round_author_stats(round_id)
+        if not search_failures:
+            with self.db.transaction():
+                for hit in pending_hits:
+                    self.db.add_note_hit(*hit, run_id=job_id, commit=False)
+
+        stats = self.db.round_author_stats(round_id, run_id=job_id)
         to_fetch: list[dict[str, Any]] = []
-        for entry in stats:
-            if max_creators is not None and len(to_fetch) >= max_creators:
-                break
-            if not refresh_users and self.db.creator_is_fresh(
-                entry["platform"], entry["user_id"], self.settings.cache_days
-            ):
-                continue
-            to_fetch.append(entry)
+        if not search_failures:
+            for entry in stats:
+                if max_creators is not None and len(to_fetch) >= max_creators:
+                    break
+                if not refresh_users and self.db.creator_is_fresh(
+                    entry["platform"], entry["user_id"], self.settings.cache_days
+                ):
+                    continue
+                to_fetch.append(entry)
 
         total_progress = done + len(to_fetch)
         self.db.update_job(
             job_id,
-            stage="补全达人",
+            stage="补全达人" if not search_failures else "搜索未完整，保留上一快照",
             progress_done=done,
             progress_total=total_progress,
         )
@@ -349,27 +367,37 @@ class Pipeline:
                     creator["user_id"] = user_id
                 self.db.upsert_creator(creator)
                 enriched += 1
+                consecutive_failures = 0
                 print(f"[user] {creator.get('nickname') or user_id}: 粉丝 {creator.get('fans')}")
             except ProviderError as exc:
                 failures += 1
+                consecutive_failures += 1
                 print(f"[user] {user_id} 失败: {exc}")
-                if _fatal_provider_error(exc) or failures >= 5:
+                if _fatal_provider_error(exc) or consecutive_failures >= 5:
                     raise
             except ValueError as exc:
                 failures += 1
+                consecutive_failures += 1
                 print(f"[user] {user_id} 资料格式异常: {exc}")
-                if failures >= 5:
+                if consecutive_failures >= 5:
                     raise
             done += 1
             self.db.update_job(job_id, progress_done=done)
 
-        rows = self.db.refresh_creator_rounds(round_id)
-        if max_creators is not None:
-            self.db.prune_round_creators(round_id, max_creators)
-            self.db.cleanup_orphans()
+        self._check_active(job_id)
+        snapshot_updated = search_failures == 0
+        if snapshot_updated:
+            self.db.prune_snapshot_creators(round_id, job_id)
+            rows = self.db.refresh_creator_rounds(round_id, run_id=job_id)
+            if max_creators is not None:
+                self.db.prune_round_creators(round_id, max_creators)
+                self.db.cleanup_orphans()
+                rows = self.db.round_metrics(round_id)["creators"]
+        else:
             rows = self.db.round_metrics(round_id)["creators"]
         lead_matches = {"matched": 0, "updated": 0, "ambiguous": 0}
         if getattr(self.settings, "lead_match_enabled", True):
+            self._check_active(job_id)
             try:
                 lead_matches = match_round_leads(self.db, round_id)
             except Exception as exc:
@@ -383,9 +411,17 @@ class Pipeline:
                     )
                 except Exception:
                     pass
+        self._check_active(job_id)
         round_cost = self.db.sum_round_cost(round_id)
         job_cost = self.db.sum_job_cost(job_id)
-        stage = "完成" if not failures else f"完成（失败 {failures} 次）"
+        if not failures:
+            stage = "完成"
+        elif not snapshot_updated:
+            stage = f"完成（搜索失败 {search_failures} 次，保留上一快照）"
+        else:
+            stage = f"完成（失败 {failures} 次）"
+        if snapshot_updated:
+            self.db.update_round(round_id, latest_run_id=job_id)
         if not self.db.finish_job(
             job_id,
             round_id,
@@ -411,6 +447,8 @@ class Pipeline:
             "creators": rows,
             "enriched": enriched,
             "failed_calls": failures,
+            "search_failed_calls": search_failures,
+            "snapshot_updated": snapshot_updated,
             "failed_cost_estimate": self.db.sum_failed_estimate(job_id),
             "cost_tokens": round_cost,
             "job_cost_tokens": job_cost,

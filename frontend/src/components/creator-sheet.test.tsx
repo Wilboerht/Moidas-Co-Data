@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter } from "react-router-dom";
+import { createMemoryRouter, RouterProvider } from "react-router-dom";
 import { vi } from "vitest";
 import { CreatorSheet } from "./creator-sheet";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -91,15 +91,20 @@ describe("CreatorSheet", () => {
     render(
       <TooltipProvider>
         <QueryClientProvider client={queryClient}>
-        <MemoryRouter>
-          <CreatorSheet
-            roundId={1}
-            detailKey="xhs|u1"
-            statuses={[{ code: "pending", label: "待审核", color: "", order: 1 }]}
-            cooperationStatuses={[]}
-            onClose={onClose}
-          />
-        </MemoryRouter>
+        <RouterProvider
+          router={createMemoryRouter([{
+            path: "*",
+            element: (
+              <CreatorSheet
+                roundId={1}
+                detailKey="xhs|u1"
+                statuses={[{ code: "pending", label: "待审核", color: "", order: 1 }]}
+                cooperationStatuses={[]}
+                onClose={onClose}
+              />
+            ),
+          }])}
+        />
         </QueryClientProvider>
       </TooltipProvider>,
     );
@@ -148,20 +153,25 @@ describe("CreatorSheet", () => {
     render(
       <TooltipProvider>
         <QueryClientProvider client={queryClient}>
-          <MemoryRouter>
-            <CreatorSheet
-              roundId={1}
-              detailKey="xhs|u1"
-              statuses={[
-                { code: "pending", label: "待审核", color: "", order: 1 },
-                { code: "adopted", label: "已采用", color: "", order: 2 },
-              ]}
-              cooperationStatuses={[
-                { code: "not_contacted", label: "未联系", color: "", order: 1 },
-              ]}
-              onClose={vi.fn()}
-            />
-          </MemoryRouter>
+          <RouterProvider
+            router={createMemoryRouter([{
+              path: "*",
+              element: (
+                <CreatorSheet
+                  roundId={1}
+                  detailKey="xhs|u1"
+                  statuses={[
+                    { code: "pending", label: "待审核", color: "", order: 1 },
+                    { code: "adopted", label: "已采用", color: "", order: 2 },
+                  ]}
+                  cooperationStatuses={[
+                    { code: "not_contacted", label: "未联系", color: "", order: 1 },
+                  ]}
+                  onClose={vi.fn()}
+                />
+              ),
+            }])}
+          />
         </QueryClientProvider>
       </TooltipProvider>,
     );

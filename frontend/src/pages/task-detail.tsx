@@ -7,7 +7,7 @@ import { api } from "@/shared/api";
 import { fmtDateTime, fmtDuration, fmtNumber } from "@/shared/format";
 import { useAuth } from "@/shared/auth-context";
 import { useRound } from "@/shared/round-context";
-import type { ApiCall, Round, RoundImpact } from "@/shared/types";
+import type { ApiCall, Job, Round, RoundImpact } from "@/shared/types";
 import { ErrorState, Page, PageHeader, Section } from "@/components/page";
 import {
   AlertDialog,
@@ -156,6 +156,16 @@ export function TaskDetailPage() {
     },
   });
 
+  const jobsQuery = useQuery({
+    queryKey: ["round-jobs", roundId],
+    queryFn: () => (roundId === null ? { items: [] as Job[] } : api.getRoundJobs(roundId)),
+    enabled: roundId !== null,
+    refetchInterval: () => {
+      const status = taskQuery.data?.job?.status;
+      return status === "running" || status === "pending" ? 2500 : false;
+    },
+  });
+
   const start = async () => {
     if (roundId === null) return;
     if (!canCollect) {
@@ -272,7 +282,7 @@ export function TaskDetailPage() {
     return (
       <Page>
         <BackLink />
-        <PageHeader title="任务详情" />
+        <PageHeader title="轮次详情" />
         <ErrorState message="任务不存在，请从采集记录中重新选择。" />
       </Page>
     );
@@ -468,6 +478,54 @@ export function TaskDetailPage() {
                   ? `日志加载失败：${logQuery.error instanceof Error ? logQuery.error.message : "未知错误"}`
                   : logQuery.data?.content || "暂无日志"}
             </pre>
+          </Section>
+
+          <Section
+            title="运行记录"
+            description="同一轮次每次重新运行都会生成一条记录；统计以最新一次成功运行为准。"
+          >
+            {jobsQuery.isLoading ? (
+              <Skeleton className="h-24 w-full" />
+            ) : jobsQuery.error ? (
+              <ErrorState
+                message={
+                  jobsQuery.error instanceof Error
+                    ? jobsQuery.error.message
+                    : "加载运行记录失败"
+                }
+                action={
+                  <Button variant="outline" size="sm" onClick={() => void jobsQuery.refetch()}>
+                    重试
+                  </Button>
+                }
+              />
+            ) : (jobsQuery.data?.items.length ?? 0) === 0 ? (
+              <p className="text-sm text-muted-foreground">还没有运行记录。</p>
+            ) : (
+              <div className="divide-y">
+                {(jobsQuery.data?.items ?? []).map((item) => (
+                  <div
+                    key={item.id}
+                    className="flex flex-wrap items-center justify-between gap-2 py-2 text-sm"
+                  >
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-medium">运行 #{item.id}</span>
+                      <StatusBadge status={item.status} label={item.status_label} />
+                      {item.id === job?.id ? <Badge variant="outline">当前展示</Badge> : null}
+                      <span className="text-xs text-muted-foreground">
+                        {item.stage || "—"} · 开始 {fmtDateTime(item.started_at ?? item.created_at)}
+                        {item.finished_at
+                          ? ` · 用时 ${fmtDuration(item.started_at ?? item.created_at, item.finished_at)}`
+                          : ""}
+                      </span>
+                    </div>
+                    <span className="text-xs text-muted-foreground tabular-nums">
+                      花费 {fmtNumber(item.cost)} token · 进度 {item.progress_done}/{item.progress_total}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
           </Section>
 
           <Section title="最近接口调用" description="最近 30 次请求。" contentClassName="px-0">
@@ -746,7 +804,7 @@ export function TaskDetailPage() {
             <div className="space-y-3 text-sm">
               <div className="grid grid-cols-2 gap-2 border p-3">
                 <span>达人-轮次：{fmtNumber(impact.creators)}</span>
-                <span>已审核：{fmtNumber(impact.creators_reviewed)}</span>
+                <span>已标注：{fmtNumber(impact.creators_reviewed)}</span>
                 <span>笔记：{fmtNumber(impact.notes)}</span>
                 <span>关联线索：{fmtNumber(impact.leads)}</span>
                 <span>已转线索：{fmtNumber(impact.leads_converted)}</span>
@@ -758,7 +816,9 @@ export function TaskDetailPage() {
                 <p className="border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900">
                   {impact.jobs_active > 0
                     ? "该轮次仍有运行中的任务，请先取消。"
-                    : "该轮次仍关联线索，不能永久删除；请使用归档。"}
+                    : impact.live_process
+                      ? "上一任务进程仍在退出，请稍后再试。"
+                      : "该轮次仍关联线索，不能永久删除；请使用归档。"}
                 </p>
               ) : (
                 <>

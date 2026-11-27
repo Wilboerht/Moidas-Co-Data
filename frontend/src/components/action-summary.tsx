@@ -43,7 +43,7 @@ export function ActionSummary({ roundId }: { roundId: number | null }) {
           </CardTitle>
           <p
             className="text-xs text-muted-foreground"
-            title="待处理 = 待审核 + 未分配的备选达人"
+            title="待处理 = 待处理达人 + 未分配的备选达人"
           >
             {counts ? (
               <span className="font-medium text-primary">去处理</span>

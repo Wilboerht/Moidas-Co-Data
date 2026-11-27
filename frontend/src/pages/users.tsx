@@ -85,6 +85,7 @@ export function UsersPage() {
   const [role, setRole] = useState("member");
   const [canCollect, setCanCollect] = useState(false);
   const [canEditLeads, setCanEditLeads] = useState(false);
+  const [canSendEmail, setCanSendEmail] = useState(false);
   const [newPassword, setNewPassword] = useState("");
   const [newPasswordConfirm, setNewPasswordConfirm] = useState("");
   const [showNewPassword, setShowNewPassword] = useState(false);
@@ -106,6 +107,7 @@ export function UsersPage() {
     setRole("member");
     setCanCollect(false);
     setCanEditLeads(false);
+    setCanSendEmail(false);
     setError("");
   };
 
@@ -135,6 +137,7 @@ export function UsersPage() {
         role,
         can_collect: role === "admin" ? false : canCollect,
         can_edit_leads: role === "admin" ? false : canEditLeads,
+        can_send_email: role === "admin" ? false : canSendEmail,
       }),
     onSuccess: async () => {
       toast.success("用户已创建，首次登录需要修改密码");
@@ -146,7 +149,7 @@ export function UsersPage() {
   });
 
   const updateMutation = useMutation({
-    mutationFn: ({ id, payload }: { id: number; payload: { role?: string; disabled?: boolean; can_collect?: boolean; can_edit_leads?: boolean } }) =>
+    mutationFn: ({ id, payload }: { id: number; payload: { role?: string; disabled?: boolean; can_collect?: boolean; can_edit_leads?: boolean; can_send_email?: boolean } }) =>
       api.updateUser(id, payload),
     onSuccess: async () => {
       toast.success("用户已更新");
@@ -222,6 +225,7 @@ export function UsersPage() {
               <TableHead className="w-[100px] text-center">角色</TableHead>
               <TableHead className="w-[110px] text-center">采集权限</TableHead>
               <TableHead className="w-[110px] text-center">线索权限</TableHead>
+              <TableHead className="w-[110px] text-center">自动发件</TableHead>
               <TableHead className="w-[110px] text-center">状态</TableHead>
               <TableHead className="w-[180px]">最近登录</TableHead>
               <TableHead className="w-[180px]">创建时间</TableHead>
@@ -232,12 +236,12 @@ export function UsersPage() {
             {usersQuery.isLoading ? (
               Array.from({ length: 4 }).map((_, index) => (
                 <TableRow key={index}>
-                  <TableCell colSpan={8}><Skeleton className="h-6 w-full" /></TableCell>
+                  <TableCell colSpan={9}><Skeleton className="h-6 w-full" /></TableCell>
                 </TableRow>
               ))
             ) : usersQuery.error ? (
               <TableRow>
-                <TableCell colSpan={8} className="p-3">
+                <TableCell colSpan={9} className="p-3">
                   <ErrorState
                     message={usersQuery.error instanceof Error ? usersQuery.error.message : "加载用户失败"}
                   />
@@ -245,7 +249,7 @@ export function UsersPage() {
               </TableRow>
             ) : users.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={8} className="h-24 text-center text-muted-foreground">暂无用户</TableCell>
+                <TableCell colSpan={9} className="h-24 text-center text-muted-foreground">暂无用户</TableCell>
               </TableRow>
             ) : (
               users.map((item) => (
@@ -271,6 +275,11 @@ export function UsersPage() {
                   <TableCell className="text-center">
                     <Badge variant="outline" className="font-normal">
                       {item.role === "admin" ? "不受限" : item.can_edit_leads ? "允许" : "仅查看"}
+                    </Badge>
+                  </TableCell>
+                  <TableCell className="text-center">
+                    <Badge variant="outline" className="font-normal">
+                      {item.role === "admin" ? "不受限" : item.can_send_email ? "允许" : "关闭"}
                     </Badge>
                   </TableCell>
                   <TableCell className="text-center">
@@ -313,8 +322,8 @@ export function UsersPage() {
                             setConfirm({
                               title: item.can_collect ? "取消采集权限？" : "允许发起采集？",
                               description: item.can_collect
-                                ? `${item.username} 将不能再新建或重新运行采集任务，已有数据不受影响。`
-                                : `${item.username} 将可以新建和重新运行采集任务。`,
+                                ? `${item.username} 将不能再新建采集轮次或重新运行采集，已有数据不受影响。`
+                                : `${item.username} 将可以新建采集轮次和重新运行采集。`,
                               variant: item.can_collect ? "destructive" : "default",
                               action: () =>
                                 updateMutation.mutate({
@@ -326,6 +335,26 @@ export function UsersPage() {
                         >
                           {item.can_collect ? <UserX /> : <UserCheck />}
                           {item.can_collect ? "取消采集权限" : "允许发起采集"}
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          disabled={item.role === "admin"}
+                          onClick={() =>
+                            setConfirm({
+                              title: item.can_send_email ? "关闭自动发件？" : "允许自动发件？",
+                              description: item.can_send_email
+                                ? `${item.username} 将不能配置发件账号或创建发件任务，已有发送记录保留。`
+                                : `${item.username} 将可以配置发件账号、维护达人邮箱并创建发件任务。`,
+                              variant: item.can_send_email ? "destructive" : "default",
+                              action: () =>
+                                updateMutation.mutate({
+                                  id: item.id,
+                                  payload: { can_send_email: !item.can_send_email },
+                                }),
+                            })
+                          }
+                        >
+                          {item.can_send_email ? <UserX /> : <UserCheck />}
+                          {item.can_send_email ? "关闭自动发件" : "允许自动发件"}
                         </DropdownMenuItem>
                         <DropdownMenuItem
                           disabled={item.role === "admin"}
@@ -534,6 +563,22 @@ export function UsersPage() {
                   id="create-can-collect"
                   checked={role === "admin" ? true : canCollect}
                   onCheckedChange={setCanCollect}
+                  disabled={role === "admin"}
+                />
+              </div>
+              <div className="flex items-center justify-between gap-4 border-t pt-4">
+                <div className="space-y-1">
+                  <Label htmlFor="create-can-send-email">允许自动发件</Label>
+                  <p className="text-xs text-muted-foreground">
+                    {role === "admin"
+                      ? "管理员默认可以使用自动发件。"
+                      : "成员开启后才能配置邮箱并创建发件任务。"}
+                  </p>
+                </div>
+                <Switch
+                  id="create-can-send-email"
+                  checked={role === "admin" ? true : canSendEmail}
+                  onCheckedChange={setCanSendEmail}
                   disabled={role === "admin"}
                 />
               </div>

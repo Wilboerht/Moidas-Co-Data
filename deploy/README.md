@@ -66,8 +66,6 @@ JUSTONEAPI_TOKEN=
 SOCIALDATAX_API_KEY=
 REDFOX_API_KEY=
 
-CODATA_ROOT=/opt/codata
-CODATA_ENV_FILE=/opt/codata/data/runtime.env
 CODATA_ALLOWED_HOSTS=codata.example.com
 CODATA_ALLOWED_ORIGINS=https://codata.example.com
 CODATA_COOKIE_SECURE=true
@@ -76,6 +74,23 @@ CODATA_PROVIDER_TRUST_ENV=false
 ```
 
 `CODATA_ALLOWED_HOSTS` 和 `CODATA_ALLOWED_ORIGINS` 必须和实际域名完全一致，否则 Host/Origin 校验会返回 400/403。`DATAFLOW_ALLOWED_HOSTS` / `RNOTE_ALLOWED_HOSTS` 是出站服务商域名白名单，不要把文档域名当成 API host。
+
+`CODATA_ROOT` 和 `CODATA_ENV_FILE` 不是 `.env` 项：它们在进程启动时读取，必须在 `codata.service` 的 `Environment=` 中设置（示例 unit 已经包含）。`CODATA_ROOT` 写进 `.env` 不会生效。
+
+自动发件需要独立的 SMTP 密码加密密钥（不要放进 `data/`，否则会和数据库备份一起泄露）：
+
+```bash
+sudo install -d -m 750 -o codata -g codata /etc/codata
+sudo -u codata env CODATA_EMAIL_KEY_FILE=/etc/codata/email.key \
+  /opt/codata/.venv/bin/codata-admin email-key --init
+sudo chown root:codata /etc/codata /etc/codata/email.key
+sudo chmod 750 /etc/codata
+sudo chmod 640 /etc/codata/email.key
+```
+
+`codata.service` 已经设置 `CODATA_EMAIL_KEY_FILE`。自动发件 worker 运行在 `codata-web` 进程内，请保持单实例；服务器需要能访问所选 SMTP 的 465/587 端口，日志在 `data/logs/email_worker.log`。密钥丢失后无法解密已保存的 SMTP 密码，只能删除并重新添加发件账号；备份数据库时请另外备份这把密钥。
+
+对外发信前请在 `.env` 设置 `CODATA_PUBLIC_URL`（例如 `https://codata.example.com`），worker 会据此生成带随机令牌的退订链接和 `List-Unsubscribe` 头；留空时邮件只能提示收件人回复退订。冷却分别由 `CODATA_EMAIL_COOLDOWN_DAYS`（邮箱，默认 30）和 `CODATA_EMAIL_CREATOR_COOLDOWN_DAYS`（达人，默认 90）控制。worker 心跳超过 2 分钟会显示在任务页，便于发现进程未启动或卡死。
 
 在线更新的令牌保存到 `data/runtime.env`，启动时覆盖基础 `.env` 中的同名配置。该文件由 `codata` 用户写入，systemd 只需开放 `data/`；基础 `.env` 和代码可以保持只读。备份时必须同时包含 `.env` 与 `data/runtime.env`。
 
@@ -150,7 +165,8 @@ sudo ufw status
 - 新建用户或管理员重置密码后，用户首次登录会强制修改密码。
 - 新用户默认没有发起采集权限；管理员在「用户管理」中开启“允许发起采集”。
 - 新用户默认只能查看线索；需要新增或编辑线索时，管理员在「用户管理」中开启“允许维护线索”。采集权限与线索权限相互独立。
-- 无采集权限的账号看不到采集任务、关键词、系统设置及轮次信息；接口返回的轮次名称和采集状态也会自动脱敏。
+- 无采集权限的账号看不到采集任务、关键词、系统设置及轮次名称；任务、关键词和统计数据会脱敏，但轮次状态、时间等基础字段仍会返回给共享看板使用。
+- 校验/转换线索需要“采集权限 + 线索权限”同时开启；只能处理自己负责或未分配的线索。
 - `CODATA_MAX_ACTIVE_JOBS` 控制全局同时运行的采集任务数，默认 2。
 
 ## 8. 备份与升级
@@ -176,22 +192,42 @@ sudo tar -czf /var/backups/codata/attachments-$(date +%F).tar.gz -C /opt/codata/
 sudo chmod 600 /var/backups/codata/*
 ```
 
-合作附件存放在 `data/cooperation_attachments/`，恢复数据库时请同时恢复对应日期的附件包。
+合作附件存放在 `data/cooperation_attachments/`，恢复数据库时请同时恢复对应日期的附件包。也可以直接运行 `sudo -u codata /opt/codata/.venv/bin/codata-admin backup --out /var/backups/codata`，它会同时备份数据库、`.env`、`data/runtime.env` 和附件，并生成带 SHA-256 校验和的 `manifest.json`。`codata-admin backup-verify --path <备份目录>` 可随时校验；`codata-admin status` 查看数据库/任务/备份/磁盘状态；`codata-admin config-check` 报告 Host/Origin/Cookie 的危险组合。
+
+恢复时先停服务，再执行（会自动备份当前数据库、清理 WAL/SHM、校验恢复后的完整性）：
+
+```bash
+sudo systemctl stop codata
+sudo -u codata /opt/codata/.venv/bin/codata-admin restore --from /var/backups/codata/codata-YYYYMMDD-HHMMSS --yes
+sudo systemctl start codata
+```
 
 恢复步骤（先停服务，确认备份可打开后再替换）：
 
 ```bash
 sudo systemctl stop codata
-sudo -u codata cp /var/backups/codata/codata-YYYY-MM-DD.sqlite /opt/codata/data/codata.sqlite
+# 1. 校验备份完整性
+sudo /opt/codata/.venv/bin/python -c \
+  "import sqlite3; print(sqlite3.connect('/var/backups/codata/codata-YYYY-MM-DD.sqlite').execute('PRAGMA integrity_check').fetchone()[0])"
+# 2. 清掉旧 WAL/SHM，避免旧日志被重放；用 root 覆盖并修正属主
+sudo rm -f /opt/codata/data/codata.sqlite-wal /opt/codata/data/codata.sqlite-shm /opt/codata/data/codata.sqlite-journal
+sudo cp /var/backups/codata/codata-YYYY-MM-DD.sqlite /opt/codata/data/codata.sqlite
+sudo chown codata:codata /opt/codata/data/codata.sqlite
+# 3. 恢复环境变量与合作附件（使用同一备份日期）
+sudo tar -xzf /var/backups/codata/env-YYYY-MM-DD.tar.gz -C /opt/codata
+sudo tar -xzf /var/backups/codata/attachments-YYYY-MM-DD.tar.gz -C /opt/codata/data
+sudo chown -R codata:codata /opt/codata/.env /opt/codata/data/runtime.env /opt/codata/data/cooperation_attachments
 sudo systemctl start codata
 curl -fsS http://127.0.0.1:8501/api/health
 ```
+
+数据库与附件必须来自同一备份日期，否则会出现“有记录、缺文件”。数据库、`.env`、`data/runtime.env` 与 `data/cooperation_attachments/` 建议放在同一备份批次里。
 
 升级：
 
 ```bash
 cd /opt/codata
-# 先按上一节完成备份
+# 先按上一节完成备份；确认没有运行中的采集任务（或先取消并等待进程退出）
 sudo /opt/codata/.local/bin/uv sync --frozen
 sudo npm --prefix /opt/codata/frontend ci
 sudo npm --prefix /opt/codata/frontend run build

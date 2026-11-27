@@ -43,7 +43,7 @@ const COOPERATION_CHART_COLORS: Record<string, string> = {
 };
 
 export function withRound(path: string, selectedRoundId: number | null, params: Record<string, string> = {}) {
-  if (path !== "/creators" && path !== "/leads") return path;
+  if (path !== "/creators" && path !== "/leads" && path !== "/tasks") return path;
   const search = new URLSearchParams(params);
   if (selectedRoundId !== null) search.set("round", String(selectedRoundId));
   const query = search.toString();
@@ -56,6 +56,13 @@ export function DashboardPage() {
   const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
   const canCollect = user?.role === "admin" || Boolean(user?.can_collect);
+  const [onboardingDismissed, setOnboardingDismissed] = useState(() => {
+    try {
+      return window.localStorage.getItem("codata_onboarding_v1") === "1";
+    } catch {
+      return false;
+    }
+  });
   const [selectedRoundId, setSelectedRoundId] = useState<number | null>(() => {
     if (!canCollect) return null;
     const value = Number(searchParams.get("round"));
@@ -286,7 +293,7 @@ export function DashboardPage() {
         </>
       ),
       icon: CheckCircle2,
-      href: withRound("/creators", selectedRoundId),
+      href: withRound("/creators", selectedRoundId, { only_unenriched: "true" }),
     },
     {
       label: "已采用",
@@ -298,11 +305,11 @@ export function DashboardPage() {
             {canCollect ? <>{" "}· 按各达人最近一条轮次统计</> : null}
           </>
         ) : (
-          "尚无已审核"
+          "尚无可统计记录"
         )
       ) : processedTotal > 0 ? (
         <>
-          审核通过率 <span className="font-medium text-foreground">{adoptedRate}%</span>
+          采用率 <span className="font-medium text-foreground">{adoptedRate}%</span>
           {notContactedCount > 0 || cooperatingCount > 0 || completedCount > 0 ? (
             <>
               {" "}· 未联系 <span className="font-medium text-foreground">{fmtNumber(notContactedCount)}</span>
@@ -316,7 +323,7 @@ export function DashboardPage() {
           ) : null}
         </>
       ) : (
-        "尚无已审核"
+        "尚无可统计记录"
       ),
       icon: UserCheck,
       href: withRound("/creators", selectedRoundId, { status: "adopted" }),
@@ -331,7 +338,7 @@ export function DashboardPage() {
         </>
       ),
       icon: ContactRound,
-      href: withRound("/leads", selectedRoundId),
+      href: withRound("/leads", selectedRoundId, { status: "none" }),
     },
     {
       label: "总消耗",
@@ -353,7 +360,7 @@ export function DashboardPage() {
           </>
         ),
       icon: Coins,
-      href: canCollect ? "/tasks" : null,
+      href: canCollect ? withRound("/tasks", selectedRoundId) : null,
     },
   ].filter((item) => canCollect || item.href !== null);
 
@@ -387,6 +394,32 @@ export function DashboardPage() {
         }
       />
 
+      {canCollect && !onboardingDismissed ? (
+        <div className="flex flex-wrap items-center gap-3 border bg-muted/20 px-3 py-2 text-xs">
+          <span className="font-medium">三步上手</span>
+          <span className="text-muted-foreground">
+            新建采集轮次 → 审核达人（设置采用状态）→ 跟进合作
+          </span>
+          <Button asChild size="sm" variant="outline" className="ml-auto">
+            <Link to="/new">开始</Link>
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => {
+              setOnboardingDismissed(true);
+              try {
+                window.localStorage.setItem("codata_onboarding_v1", "1");
+              } catch {
+                /* ignore */
+              }
+            }}
+          >
+            知道了
+          </Button>
+        </div>
+      ) : null}
+
       {jobActive ? (
         <div
           className="flex flex-wrap items-center gap-3 border bg-muted/30 px-3 py-2"
@@ -408,12 +441,12 @@ export function DashboardPage() {
             </p>
             <p className="truncate text-xs text-muted-foreground">{watchedJob?.stage || "任务正在后台运行"}</p>
             {jobPercent !== null ? (
-              <Progress value={jobPercent} className="h-1 max-w-md" aria-label="采集任务进度" />
+              <Progress value={jobPercent} className="h-1 max-w-md" aria-label="采集轮次进度" />
             ) : null}
           </div>
           {canCollect ? (
             <Button asChild variant="outline" size="sm">
-              <Link to={`/tasks/${watchedJob?.round_id ?? roundId}`}>查看采集任务</Link>
+              <Link to={`/tasks/${watchedJob?.round_id ?? roundId}`}>查看采集轮次</Link>
             </Button>
           ) : null}
         </div>
@@ -451,11 +484,11 @@ export function DashboardPage() {
       <div className="grid gap-4 lg:grid-cols-3">
         <Card className="h-full">
           <CardHeader>
-            <CardTitle>{isAllRounds ? "采用分布" : "本轮审核进度"}</CardTitle>
+            <CardTitle>{isAllRounds ? "采用分布" : "本轮采用进度"}</CardTitle>
             <CardDescription className="min-h-10">
               {isAllRounds
                 ? `共 ${fmtNumber(total)} 位达人${canCollect ? "，按各达人最近一条轮次统计" : ""}，点击柱条按采用状态筛选。`
-                : `共 ${fmtNumber(total)} 位达人，点击柱条按审核状态筛选。`}
+                : `共 ${fmtNumber(total)} 位达人，点击柱条按采用状态筛选。`}
             </CardDescription>
             <CardAction>
               <Badge
@@ -463,9 +496,9 @@ export function DashboardPage() {
                 title={
                   isAllRounds
                     ? canCollect
-                      ? "已处理 = 已审核（非待审核）达人 / 全部达人；按各达人最近一条轮次统计"
-                      : "已处理 = 已审核（非待审核）达人 / 全部达人"
-                    : "已处理 = 本轮已审核（非待审核）达人 / 本轮达人"
+                      ? "已处理 = 已标注（非待处理）达人 / 全部达人；按各达人最近一条轮次统计"
+                      : "已处理 = 已标注（非待处理）达人 / 全部达人"
+                    : "已处理 = 本轮已标注（非待处理）达人 / 本轮达人"
                 }
               >
                 已处理 {processedPercent.toFixed(1)}%
@@ -478,7 +511,7 @@ export function DashboardPage() {
             ) : (
               <HorizontalBarChart
                 items={statusSegments}
-                ariaLabel={isAllRounds ? "采用状态分布" : "审核状态分布"}
+                ariaLabel="采用状态分布"
                 minCategories={5}
               />
             )}

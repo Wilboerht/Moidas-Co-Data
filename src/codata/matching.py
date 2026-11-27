@@ -343,19 +343,16 @@ def match_lead_against_creators(
         stats["skipped"] = 1
         return stats
     platform = str(lead.get("platform") or "xhs")
-    account, _ = normalize_identity(
+    lead_account = str(lead.get("account_id") or "").strip()
+    normalized_account, _ = normalize_identity(
         platform, lead.get("account_id") or "", lead.get("profile_url") or ""
     )
-    handle = str(lead.get("platform_handle") or "").strip()
-    keys = {
-        key
-        for key in (
-            account,
-            handle,
-            str(lead.get("legacy_user_id") or "").strip(),
-        )
-        if key
+    account_keys = {
+        value for value in (lead_account, normalized_account) if value
     }
+    handle = str(lead.get("platform_handle") or "").strip()
+    legacy = str(lead.get("legacy_user_id") or "").strip()
+    keys = {value for value in (*account_keys, handle, legacy) if value}
     if not keys:
         stats["skipped"] = 1
         return stats
@@ -371,46 +368,69 @@ def match_lead_against_creators(
           AND (cr.user_id IN ({placeholders}) OR cr.account_id IN ({placeholders})
                OR c.red_id IN ({placeholders}))
         ORDER BY cr.round_id DESC
-        LIMIT 20
+        LIMIT 50
         """,
         [platform, *keys, *keys, *keys],
     ).fetchall()
+    confidence_by_rank = {
+        0: "account_id",
+        1: "platform_handle",
+        2: "round_account_id",
+        3: "legacy_user_id",
+        4: "legacy_user_id",
+    }
+    ranked: list[tuple[tuple[int, int], dict[str, Any], dict[str, Any], str]] = []
+    for row in rows:
+        candidate = db.get_creator(platform, row["user_id"])
+        if not candidate:
+            continue
+        uid = str(candidate.get("user_id") or "")
+        round_account = str(row["account_id"] or "").strip()
+        creator_handle = str(row["creator_handle"] or "").strip()
+        if uid and uid in account_keys:
+            rank = 0
+        elif handle and handle in {round_account, creator_handle}:
+            rank = 1
+        elif round_account and round_account in account_keys:
+            rank = 2
+        elif legacy and legacy in {uid, round_account, creator_handle}:
+            rank = 3
+        else:
+            rank = 4
+        ranked.append(
+            ((rank, -int(row["round_id"])), row, candidate, confidence_by_rank[rank])
+        )
     creator: dict[str, Any] | None = None
     round_id: int | None = None
     matched_user_id = ""
     matched_round_account = ""
     matched_handle = ""
-    for row in rows:
-        candidate = db.get_creator(platform, row["user_id"])
-        if candidate:
-            creator = candidate
-            round_id = int(row["round_id"])
-            matched_user_id = str(candidate.get("user_id") or "")
-            matched_round_account = str(row["account_id"] or "")
-            matched_handle = str(row["creator_handle"] or "")
-            break
+    confidence = "legacy_user_id"
+    if ranked:
+        ranked.sort(key=lambda entry: entry[0])
+        _, row, creator, confidence = ranked[0]
+        round_id = int(row["round_id"])
+        matched_user_id = str(creator.get("user_id") or "")
+        matched_round_account = str(row["account_id"] or "")
+        matched_handle = str(row["creator_handle"] or "")
     if creator is None:
-        for key in keys:
+        for key in sorted(keys):
             candidate = db.get_creator(platform, key)
             if candidate:
                 creator = candidate
                 matched_user_id = str(candidate.get("user_id") or "")
+                if key in account_keys:
+                    confidence = "account_id"
+                elif handle and key == handle:
+                    confidence = "platform_handle"
+                else:
+                    confidence = "legacy_user_id"
                 break
     if creator is None:
         stats["skipped"] = 1
         if not dry_run and (lead.get("matched_user_id") or lead.get("matched_round_id")):
             db.clear_lead_match(lead_id, actor_id=actor_id)
         return stats
-    account = str(lead.get("account_id") or "")
-    handle = str(lead.get("platform_handle") or "")
-    if account and account == matched_user_id:
-        confidence = "account_id"
-    elif handle and handle in {matched_round_account, matched_handle}:
-        confidence = "platform_handle"
-    elif account and matched_round_account and account == matched_round_account:
-        confidence = "round_account_id"
-    else:
-        confidence = "legacy_user_id"
     match = {
         "lead_id": lead_id,
         "platform": platform,

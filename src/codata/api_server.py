@@ -8,13 +8,17 @@ import json
 import mimetypes
 import sqlite3
 import os
-import re
-import tempfile
+import sys
 import threading
+import time
+import re
+import shutil
+import tempfile
 import uuid
 import zipfile
 from contextvars import ContextVar
 from dataclasses import replace
+from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 from typing import Annotated, Any, Generator, Iterable
@@ -22,7 +26,14 @@ from typing import Annotated, Any, Generator, Iterable
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    Response,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from dotenv import set_key
 from starlette.concurrency import run_in_threadpool
@@ -33,6 +44,7 @@ from starlette.background import BackgroundTask
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import Request
+from zoneinfo import ZoneInfo
 
 from .api import DOUYIN_COST, XHS_COST, DataFlowAPI, RnoteAPI
 from .auth import (
@@ -60,7 +72,22 @@ from .cooperation_statuses import (
     COOPERATION_STATUS_LABELS,
     normalize_cooperation_status,
 )
-from .db import Database, JobBusyError, SCHEMA_VERSION
+from .db import (
+    Database,
+    JobBusyError,
+    SCHEMA_VERSION,
+    normalize_email_address,
+)
+from .diagnostics import config_warnings
+from .email_crypto import (
+    EmailKeyError,
+    decrypt_secret,
+    encrypt_secret,
+    key_fingerprint,
+)
+from .email_sender import EmailSendError, test_smtp
+from .email_worker import start_email_worker
+from .email_templates import creator_context, render_template
 from .normalize import (
     as_optional_int,
     format_fans_wan,
@@ -103,7 +130,12 @@ def serialized_settings_update(fn):
     return wrapped
 
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
-PUBLIC_API_PATHS = {"/api/health", "/api/auth/login", "/api/auth/me"}
+PUBLIC_API_PATHS = {
+    "/api/health",
+    "/api/auth/login",
+    "/api/auth/me",
+    "/api/email/unsubscribe",
+}
 _ROUND_NAMES_VISIBLE: ContextVar[bool] = ContextVar(
     "codata_round_names_visible", default=True
 )
@@ -138,7 +170,10 @@ def _enforce_action_limit(key: str) -> None:
 
 class LocalOriginMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        if request.method not in SAFE_METHODS:
+        if (
+            request.method not in SAFE_METHODS
+            and request.url.path != "/api/email/unsubscribe"
+        ):
             origin = request.headers.get("origin")
             if origin and origin not in settings.allowed_origins:
                 return JSONResponse({"detail": "origin not allowed"}, status_code=403)
@@ -253,8 +288,7 @@ app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestSizeMiddleware)
 
 
-@app.on_event("startup")
-def reconcile_jobs_on_startup() -> None:
+def _run_maintenance() -> None:
     with Database(settings.output_dir) as db:
         db.reconcile_stale_jobs(settings.job_stale_minutes)
         db.prune_maintenance(settings.audit_retention_days)
@@ -266,6 +300,26 @@ def reconcile_jobs_on_startup() -> None:
             settings.backup_retention_count,
             apply=True,
         )
+        db.prune_trash(settings.log_retention_days)
+
+
+def _maintenance_loop() -> None:
+    while True:
+        time.sleep(24 * 60 * 60)
+        try:
+            _run_maintenance()
+        except Exception:
+            pass
+
+
+@app.on_event("startup")
+def reconcile_jobs_on_startup() -> None:
+    for warning in config_warnings(settings):
+        print(f"[config] {warning}", file=sys.stderr)
+    _run_maintenance()
+    threading.Thread(
+        target=_maintenance_loop, name="codata-maintenance", daemon=True
+    ).start()
 
 
 def get_db(request: Request) -> Generator[Database, None, None]:
@@ -418,7 +472,20 @@ def _round_dict(row: dict[str, Any]) -> dict[str, Any]:
     if payload["archived"]:
         payload["status_label"] = "已归档"
     if not _round_names_visible():
-        payload["name"] = ""
+        return {
+            key: payload.get(key)
+            for key in (
+                "id",
+                "name",
+                "status",
+                "status_label",
+                "created_at",
+                "started_at",
+                "finished_at",
+                "archived_at",
+                "archived",
+            )
+        } | {"name": ""}
     return payload
 
 
@@ -814,6 +881,15 @@ def _checked_raw_json(value: Any) -> Any:
     return value
 
 
+def _lead_identifiable(
+    nickname: Any, account_id: Any, platform_handle: Any, profile_url: Any
+) -> bool:
+    return any(
+        str(value or "").strip()
+        for value in (nickname, account_id, platform_handle, profile_url)
+    )
+
+
 def _validate_owner(db: Database, owner_user_id: int | None) -> None:
     if owner_user_id is None:
         return
@@ -1096,6 +1172,10 @@ class PurgeRoundRequest(BaseModel):
     confirm_name: str = Field(min_length=1, max_length=100)
 
 
+class DeleteCooperationCaseRequest(BaseModel):
+    confirm: bool = False
+
+
 class KeywordCreateRequest(BaseModel):
     word: KeywordText
     category: str | None = Field(None, max_length=40)
@@ -1138,6 +1218,7 @@ class UserCreateRequest(BaseModel):
     role: str = Field(default="member", max_length=20)
     can_collect: bool = False
     can_edit_leads: bool = False
+    can_send_email: bool = False
 
 
 class UserUpdateRequest(BaseModel):
@@ -1145,6 +1226,7 @@ class UserUpdateRequest(BaseModel):
     disabled: bool | None = None
     can_collect: bool | None = None
     can_edit_leads: bool | None = None
+    can_send_email: bool | None = None
 
 
 class UserResetPasswordRequest(BaseModel):
@@ -1159,6 +1241,7 @@ def _public_user(user: dict[str, Any]) -> dict[str, Any]:
         "disabled": bool(user.get("disabled")),
         "can_collect": bool(user.get("can_collect")),
         "can_edit_leads": bool(user.get("can_edit_leads")),
+        "can_send_email": bool(user.get("can_send_email")),
         "must_change_password": bool(user.get("must_change_password")),
         "auth_source": user.get("auth_source") or "password",
         "created_at": user.get("created_at"),
@@ -1207,10 +1290,32 @@ def require_lead_editor(request: Request) -> dict[str, Any]:
     return user
 
 
+def require_lead_converter(request: Request) -> dict[str, Any]:
+    user = getattr(request.state, "user", None)
+    if not user:
+        raise HTTPException(401, "请先登录")
+    if user.get("role") == "admin":
+        return user
+    if not user.get("can_collect"):
+        raise HTTPException(403, "当前账号没有发起采集的权限，请联系管理员")
+    if not user.get("can_edit_leads"):
+        raise HTTPException(403, "当前账号没有维护线索的权限，请联系管理员")
+    return user
+
+
 def require_user(request: Request) -> dict[str, Any]:
     user = getattr(request.state, "user", None)
     if not user:
         raise HTTPException(401, "请先登录")
+    return user
+
+
+def require_email_sender(request: Request) -> dict[str, Any]:
+    user = getattr(request.state, "user", None)
+    if not user:
+        raise HTTPException(401, "请先登录")
+    if user.get("role") != "admin" and not user.get("can_send_email"):
+        raise HTTPException(403, "当前账号没有自动发件权限，请联系管理员")
     return user
 
 
@@ -1403,6 +1508,7 @@ def create_user(
             role=role,
             can_collect=bool(payload.can_collect),
             can_edit_leads=bool(payload.can_edit_leads),
+            can_send_email=bool(payload.can_send_email),
             must_change_password=True,
         )
     except ValueError as exc:
@@ -1417,6 +1523,7 @@ def create_user(
             "role": role,
             "can_collect": bool(payload.can_collect),
             "can_edit_leads": bool(payload.can_edit_leads),
+            "can_send_email": bool(payload.can_send_email),
         },
     )
     return _public_user(db.get_user(user_id) or {})
@@ -1463,6 +1570,13 @@ def update_user(
             "from": bool(target["can_edit_leads"]),
             "to": bool(payload.can_edit_leads),
         }
+    if payload.can_send_email is not None and bool(payload.can_send_email) != bool(
+        target.get("can_send_email")
+    ):
+        changes["can_send_email"] = {
+            "from": bool(target.get("can_send_email")),
+            "to": bool(payload.can_send_email),
+        }
     if not changes:
         return _public_user(target)
     try:
@@ -1472,6 +1586,7 @@ def update_user(
             disabled=payload.disabled,
             can_collect=payload.can_collect,
             can_edit_leads=payload.can_edit_leads,
+            can_send_email=payload.can_send_email,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -1576,6 +1691,7 @@ def _settings_payload(include_paths: bool = False) -> dict[str, Any]:
     platforms_payload: list[dict[str, Any]] = []
     providers_payload: list[dict[str, Any]] = []
     xhs_cost = XHS_COST
+    douyin_cost = DOUYIN_COST
     credentials_ok = bool(settings.host and settings.token)
     try:
         registry = load_registry(settings)
@@ -1585,6 +1701,11 @@ def _settings_payload(include_paths: bool = False) -> dict[str, Any]:
         credentials_ok = bool(option)
         if option:
             xhs_cost = option.search.price.tokens(registry.usd_cny, registry.token_cny)
+        douyin_option = registry.cheapest("douyin")
+        if douyin_option:
+            douyin_cost = douyin_option.search.price.tokens(
+                registry.usd_cny, registry.token_cny
+            )
     except PlatformConfigError:
         credentials_ok = False
     return {
@@ -1595,13 +1716,14 @@ def _settings_payload(include_paths: bool = False) -> dict[str, Any]:
         "output_dir": str(settings.output_dir) if include_paths else "",
         "cache_days": settings.cache_days,
         "xhs_cost": xhs_cost,
-        "douyin_cost": DOUYIN_COST,
+        "douyin_cost": douyin_cost,
         "token_cny": settings.token_cny,
         "usd_cny": settings.usd_cny,
         "credentials_ok": credentials_ok,
         "providers": providers_payload,
         "platforms": platforms_payload,
         "default_provider": platforms_payload[0].get("default_provider") if platforms_payload else None,
+        "email_public_url": settings.public_url,
     }
 
 
@@ -1624,8 +1746,1125 @@ def api_settings(request: Request) -> dict[str, Any]:
             "providers": [],
             "platforms": [],
             "default_provider": None,
+            "email_public_url": settings.public_url,
         }
     return _settings_payload(include_paths=bool(user and user.get("role") == "admin"))
+
+
+
+class EmailAccountCreateRequest(BaseModel):
+    scope: str = Field(default="personal", max_length=20)
+    label: str = Field(default="", max_length=80)
+    from_name: str = Field(default="", max_length=80)
+    from_email: str = Field(min_length=3, max_length=254)
+    reply_to: str = Field(default="", max_length=254)
+    host: str = Field(min_length=1, max_length=253)
+    port: int = Field(ge=1, le=65535)
+    security: str = Field(default="starttls", max_length=20)
+    username: str = Field(min_length=1, max_length=200)
+    password: str = Field(min_length=1, max_length=500)
+    daily_limit: int = Field(default=20, ge=1, le=500)
+    min_interval_seconds: int = Field(default=60, ge=1, le=3600)
+
+
+class EmailAccountUpdateRequest(BaseModel):
+    label: str | None = Field(None, max_length=80)
+    from_name: str | None = Field(None, max_length=80)
+    from_email: str | None = Field(None, max_length=254)
+    reply_to: str | None = Field(None, max_length=254)
+    host: str | None = Field(None, max_length=253)
+    port: int | None = Field(None, ge=1, le=65535)
+    security: str | None = Field(None, max_length=20)
+    username: str | None = Field(None, max_length=200)
+    password: str | None = Field(None, max_length=500)
+    daily_limit: int | None = Field(None, ge=1, le=500)
+    min_interval_seconds: int | None = Field(None, ge=1, le=3600)
+    enabled: bool | None = None
+
+
+class EmailAccountTestRequest(BaseModel):
+    send_test_to: str = Field(default="", max_length=254)
+
+
+class CreatorEmailCreateRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    label: str = Field(default="", max_length=80)
+    is_primary: bool = False
+
+
+def _email_account_payload(row: dict[str, Any], actor: dict[str, Any]) -> dict[str, Any]:
+    scope = str(row.get("scope") or "personal")
+    is_shared = scope == "shared"
+    can_manage = (
+        actor.get("role") == "admin"
+        if is_shared
+        else int(row.get("owner_user_id") or 0) == int(actor["id"])
+    )
+    return {
+        "id": row.get("id"),
+        "scope": scope,
+        "owner_user_id": row.get("owner_user_id"),
+        "label": row.get("label") or "",
+        "from_name": row.get("from_name") or "",
+        "from_email": row.get("from_email") or "",
+        "reply_to": row.get("reply_to") or "",
+        "host": row.get("host") or "",
+        "port": row.get("port"),
+        "security": row.get("security") or "starttls",
+        "username": row.get("username") or "",
+        "daily_limit": row.get("daily_limit"),
+        "min_interval_seconds": int(row.get("min_interval_seconds") or 60),
+        "paused_campaigns": int(row.get("paused_campaigns") or 0),
+        "enabled": bool(row.get("enabled")),
+        "has_password": bool(row.get("password_encrypted")),
+        "last_test_at": row.get("last_test_at"),
+        "last_test_error": row.get("last_test_error") or "",
+        "auth_failed_at": row.get("auth_failed_at"),
+        "auth_error": row.get("auth_error") or "",
+        "can_manage": can_manage,
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+    }
+
+
+def _email_account_for_actor(
+    db: Database, account_id: int, actor: dict[str, Any]
+) -> dict[str, Any] | None:
+    row = db.get_email_account(account_id)
+    if not row:
+        return None
+    if row.get("scope") == "shared":
+        return row
+    if int(row.get("owner_user_id") or 0) != int(actor["id"]):
+        return None
+    return row
+
+
+def _require_email_account_manager(row: dict[str, Any], actor: dict[str, Any]) -> None:
+    if row.get("scope") == "shared":
+        if actor.get("role") != "admin":
+            raise HTTPException(403, "共享发件账号只能由管理员修改")
+        return
+    if int(row.get("owner_user_id") or 0) != int(actor["id"]):
+        raise HTTPException(404, "发件账号不存在")
+
+
+def _plaintext_smtp_allowed() -> bool:
+    return os.getenv("CODATA_SMTP_ALLOW_PLAINTEXT", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _account_password(row: dict[str, Any]) -> str:
+    fingerprint = key_fingerprint()
+    stored = str(row.get("key_fingerprint") or "")
+    if stored and fingerprint and stored != fingerprint:
+        raise HTTPException(400, "加密密钥与账号不匹配，请重新保存 SMTP 密码")
+    try:
+        return decrypt_secret(str(row.get("password_encrypted") or ""))
+    except EmailKeyError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/email/accounts")
+def list_email_accounts(
+    actor: dict[str, Any] = Depends(require_email_sender),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    rows = db.list_email_accounts(int(actor["id"]))
+    return {"items": [_email_account_payload(row, actor) for row in rows]}
+
+
+@app.post("/api/email/accounts")
+def create_email_account(
+    payload: EmailAccountCreateRequest,
+    http_request: Request,
+    actor: dict[str, Any] = Depends(require_email_sender),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    scope = payload.scope.strip().lower() or "personal"
+    if (
+        payload.security.strip().lower() == "none"
+        and not _plaintext_smtp_allowed()
+    ):
+        raise HTTPException(400, "未启用明文 SMTP，请使用 SSL 或 STARTTLS")
+    if scope == "shared" and actor.get("role") != "admin":
+        raise HTTPException(403, "只有管理员可以创建共享发件账号")
+    try:
+        token = encrypt_secret(payload.password)
+    except EmailKeyError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    try:
+        account_id = db.create_email_account(
+            scope=scope,
+            owner_user_id=int(actor["id"]) if scope == "personal" else None,
+            label=payload.label,
+            from_name=payload.from_name,
+            from_email=payload.from_email,
+            reply_to=payload.reply_to,
+            host=payload.host,
+            port=payload.port,
+            security=payload.security,
+            username=payload.username,
+            password_encrypted=token,
+            key_fingerprint=key_fingerprint() or "",
+            daily_limit=payload.daily_limit,
+            min_interval_seconds=payload.min_interval_seconds,
+            created_by=int(actor["id"]),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    db.audit(
+        actor["id"],
+        "email.account_created",
+        f"email_account:{account_id}",
+        _client_ip(http_request),
+        http_request.headers.get("user-agent", ""),
+        details={"scope": scope, "host": payload.host, "from_email": payload.from_email},
+    )
+    row = db.get_email_account(account_id)
+    return _email_account_payload(row or {}, actor)
+
+
+@app.patch("/api/email/accounts/{account_id}")
+def update_email_account(
+    account_id: int,
+    payload: EmailAccountUpdateRequest,
+    http_request: Request,
+    actor: dict[str, Any] = Depends(require_email_sender),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    row = _email_account_for_actor(db, account_id, actor)
+    if not row:
+        raise HTTPException(404, "发件账号不存在")
+    _require_email_account_manager(row, actor)
+    if (
+        payload.security is not None
+        and payload.security.strip().lower() == "none"
+        and not _plaintext_smtp_allowed()
+    ):
+        raise HTTPException(400, "未启用明文 SMTP，请使用 SSL 或 STARTTLS")
+    fields: dict[str, Any] = {}
+    for name in (
+        "label",
+        "from_name",
+        "from_email",
+        "reply_to",
+        "host",
+        "port",
+        "security",
+        "username",
+        "daily_limit",
+        "enabled",
+    ):
+        value = getattr(payload, name)
+        if value is not None:
+            fields[name] = value
+    if payload.password:
+        try:
+            fields["password_encrypted"] = encrypt_secret(payload.password)
+        except EmailKeyError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        fields["key_fingerprint"] = key_fingerprint() or ""
+    password_changed = bool(payload.password)
+    try:
+        db.update_email_account(account_id, **fields)
+        if password_changed:
+            db.clear_email_account_auth(account_id)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    db.audit(
+        actor["id"],
+        "email.account_updated",
+        f"email_account:{account_id}",
+        _client_ip(http_request),
+        http_request.headers.get("user-agent", ""),
+        details={"fields": sorted(fields)},
+    )
+    updated = db.get_email_account(account_id)
+    return _email_account_payload(updated or {}, actor)
+
+
+@app.delete("/api/email/accounts/{account_id}")
+def delete_email_account(
+    account_id: int,
+    http_request: Request,
+    actor: dict[str, Any] = Depends(require_email_sender),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    row = _email_account_for_actor(db, account_id, actor)
+    if not row:
+        raise HTTPException(404, "发件账号不存在")
+    _require_email_account_manager(row, actor)
+    try:
+        db.delete_email_account(account_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    db.audit(
+        actor["id"],
+        "email.account_deleted",
+        f"email_account:{account_id}",
+        _client_ip(http_request),
+        http_request.headers.get("user-agent", ""),
+        details={"scope": row.get("scope"), "host": row.get("host")},
+    )
+    return {"deleted": True}
+
+
+@app.post("/api/email/accounts/{account_id}/test")
+def test_email_account(
+    account_id: int,
+    payload: EmailAccountTestRequest,
+    http_request: Request,
+    actor: dict[str, Any] = Depends(require_email_sender),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    _enforce_action_limit(f"email-test:{actor['id']}")
+    row = _email_account_for_actor(db, account_id, actor)
+    if not row:
+        raise HTTPException(404, "发件账号不存在")
+    password = _account_password(row)
+    target = payload.send_test_to.strip()
+    if (
+        target
+        and actor.get("role") != "admin"
+        and target.lower() != str(row.get("from_email") or "").lower()
+    ):
+        raise HTTPException(403, "测试邮件只能发送到当前发件邮箱")
+    try:
+        result = test_smtp(row, password, send_test_to=target)
+    except EmailSendError as exc:
+        db.mark_email_account_test(account_id, str(exc))
+        if getattr(exc, "kind", "") == "auth":
+            db.mark_email_account_auth_failed(account_id, str(exc))
+        db.audit(
+            actor["id"],
+            "email.account_tested",
+            f"email_account:{account_id}",
+            _client_ip(http_request),
+            http_request.headers.get("user-agent", ""),
+            details={"ok": False},
+        )
+        raise HTTPException(400, str(exc)) from exc
+    db.mark_email_account_test(account_id, None)
+    db.clear_email_account_auth(account_id)
+    db.audit(
+        actor["id"],
+        "email.account_tested",
+        f"email_account:{account_id}",
+        _client_ip(http_request),
+        http_request.headers.get("user-agent", ""),
+        details={
+            "ok": True,
+            "sent_test": result.get("sent_test", False),
+            "send_test_to": target,
+        },
+    )
+    return result
+
+
+@app.get("/api/creators/{platform}/{user_id}/emails")
+def list_creator_emails(
+    platform: str,
+    user_id: str,
+    actor: dict[str, Any] = Depends(require_email_sender),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    return {"items": db.creator_emails(platform, user_id)}
+
+
+@app.post("/api/creators/{platform}/{user_id}/emails")
+def add_creator_email(
+    platform: str,
+    user_id: str,
+    payload: CreatorEmailCreateRequest,
+    http_request: Request,
+    actor: dict[str, Any] = Depends(require_email_sender),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        item = db.add_creator_email(
+            platform,
+            user_id,
+            payload.email,
+            label=payload.label,
+            is_primary=payload.is_primary,
+            source="manual",
+            created_by=int(actor["id"]),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    db.audit(
+        actor["id"],
+        "creator.email_added",
+        f"{platform}:{user_id}",
+        _client_ip(http_request),
+        http_request.headers.get("user-agent", ""),
+        details={"email_id": item.get("id")},
+    )
+    return item
+
+
+@app.delete("/api/email/creator-emails/{email_id}")
+def delete_creator_email(
+    email_id: int,
+    http_request: Request,
+    actor: dict[str, Any] = Depends(require_email_sender),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    row = db.delete_creator_email(email_id)
+    if not row:
+        raise HTTPException(404, "达人邮箱不存在")
+    db.audit(
+        actor["id"],
+        "creator.email_deleted",
+        f"{row['platform']}:{row['user_id']}",
+        _client_ip(http_request),
+        http_request.headers.get("user-agent", ""),
+        details={"email_id": email_id},
+    )
+    return {"deleted": True}
+
+
+@app.post("/api/email/creator-emails/{email_id}/primary")
+def set_primary_creator_email(
+    email_id: int,
+    http_request: Request,
+    actor: dict[str, Any] = Depends(require_email_sender),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    row = db.set_primary_creator_email(email_id)
+    if not row:
+        raise HTTPException(404, "达人邮箱不存在")
+    db.audit(
+        actor["id"],
+        "creator.email_primary",
+        f"{row['platform']}:{row['user_id']}",
+        _client_ip(http_request),
+        http_request.headers.get("user-agent", ""),
+        details={"email_id": email_id},
+    )
+    return row
+
+
+
+class EmailRecipientInput(BaseModel):
+    platform: str = Field(min_length=1, max_length=20)
+    user_id: str = Field(min_length=1, max_length=200)
+    email: str = Field(min_length=3, max_length=254)
+    nickname: str = Field(default="", max_length=120)
+
+
+class EmailCampaignCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    account_id: int
+    subject: str = Field(min_length=1, max_length=200)
+    body: str = Field(min_length=1, max_length=20000)
+    scheduled_start: str | None = None
+    schedule: bool = False
+    timezone: str = Field(default="Asia/Shanghai", max_length=64)
+    window_start: str = Field(default="09:00", max_length=5)
+    window_end: str = Field(default="18:00", max_length=5)
+    weekdays: list[int] = Field(default_factory=lambda: [1, 2, 3, 4, 5])
+    interval_seconds: int = Field(default=60, ge=1, le=3600)
+    jitter_seconds: int = Field(default=30, ge=0, le=600)
+    daily_limit: int = Field(default=20, ge=1, le=500)
+    auto_mark_contacted: bool = True
+    recipients: list[EmailRecipientInput] = Field(min_length=1, max_length=500)
+
+
+class EmailCampaignScheduleRequest(BaseModel):
+    scheduled_start: str | None = None
+    timezone: str = Field(default="Asia/Shanghai", max_length=64)
+    window_start: str = Field(default="09:00", max_length=5)
+    window_end: str = Field(default="18:00", max_length=5)
+    weekdays: list[int] = Field(default_factory=lambda: [1, 2, 3, 4, 5])
+    interval_seconds: int = Field(default=60, ge=1, le=3600)
+    jitter_seconds: int = Field(default=30, ge=0, le=600)
+    daily_limit: int = Field(default=20, ge=1, le=500)
+
+
+class EmailCampaignUpdateRequest(BaseModel):
+    name: str | None = Field(None, max_length=80)
+    account_id: int | None = None
+    subject: str | None = Field(None, max_length=200)
+    body: str | None = Field(None, max_length=20000)
+    timezone: str | None = Field(None, max_length=64)
+    window_start: str | None = Field(None, max_length=5)
+    window_end: str | None = Field(None, max_length=5)
+    weekdays: list[int] | None = None
+    interval_seconds: int | None = Field(None, ge=1, le=3600)
+    jitter_seconds: int | None = Field(None, ge=0, le=600)
+    daily_limit: int | None = Field(None, ge=1, le=500)
+    auto_mark_contacted: bool | None = None
+
+
+class EmailPreviewRequest(BaseModel):
+    subject: str = Field(default="", max_length=200)
+    body: str = Field(default="", max_length=20000)
+    platform: str = Field(default="", max_length=20)
+    user_id: str = Field(default="", max_length=200)
+
+
+class EmailSuppressionCreateRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    reason: str = Field(default="", max_length=200)
+
+
+def _validate_email_schedule(
+    *,
+    timezone: str,
+    window_start: str,
+    window_end: str,
+    weekdays: list[int],
+    interval_seconds: int,
+    jitter_seconds: int,
+    daily_limit: int,
+    scheduled_start: str | None = None,
+) -> dict[str, Any]:
+    try:
+        ZoneInfo(timezone)
+    except Exception as exc:
+        raise HTTPException(400, "时区无效") from exc
+    time_pattern = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
+    if not time_pattern.match(window_start) or not time_pattern.match(window_end):
+        raise HTTPException(400, "发送时段格式应为 HH:MM")
+    if window_start >= window_end:
+        raise HTTPException(400, "发送时段开始时间必须早于结束时间")
+    unique_days = sorted({int(day) for day in weekdays})
+    if not unique_days or any(day < 1 or day > 7 for day in unique_days):
+        raise HTTPException(400, "发送星期应使用 1（周一）至 7（周日）")
+    start_value = None
+    if scheduled_start:
+        try:
+            start_value = datetime.fromisoformat(scheduled_start.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise HTTPException(400, "计划开始时间格式无效") from exc
+        start_value = start_value.isoformat()
+    return {
+        "scheduled_start": start_value,
+        "timezone": timezone,
+        "window_start": window_start,
+        "window_end": window_end,
+        "weekdays": json.dumps(unique_days),
+        "interval_seconds": max(1, min(3600, int(interval_seconds))),
+        "jitter_seconds": max(0, min(600, int(jitter_seconds))),
+        "daily_limit": max(1, min(500, int(daily_limit))),
+    }
+
+
+def _campaign_for_actor(
+    db: Database, campaign_id: int, actor: dict[str, Any]
+) -> dict[str, Any] | None:
+    row = db.email_campaign_detail(campaign_id)
+    if not row:
+        return None
+    if actor.get("role") != "admin" and int(row.get("created_by") or 0) != int(actor["id"]):
+        return None
+    return row
+
+
+def _campaign_payload(row: dict[str, Any]) -> dict[str, Any]:
+    try:
+        weekdays = json.loads(row.get("weekdays") or "[1,2,3,4,5]")
+    except ValueError:
+        weekdays = [1, 2, 3, 4, 5]
+    return {
+        "id": row.get("id"),
+        "name": row.get("name") or "",
+        "account_id": row.get("account_id"),
+        "account_label": row.get("account_label") or "",
+        "account_from_email": row.get("account_from_email") or "",
+        "account_scope": row.get("account_scope") or "",
+        "subject": row.get("subject") or "",
+        "body": row.get("body") or "",
+        "status": row.get("status") or "draft",
+        "scheduled_start": row.get("scheduled_start"),
+        "timezone": row.get("timezone") or "Asia/Shanghai",
+        "window_start": row.get("window_start") or "09:00",
+        "window_end": row.get("window_end") or "18:00",
+        "weekdays": weekdays if isinstance(weekdays, list) else [1, 2, 3, 4, 5],
+        "interval_seconds": int(row.get("interval_seconds") or 60),
+        "jitter_seconds": int(row.get("jitter_seconds") or 0),
+        "daily_limit": int(row.get("daily_limit") or 20),
+        "auto_mark_contacted": bool(row.get("auto_mark_contacted")),
+        "recipients": int(row.get("recipients") or 0),
+        "sent": int(row.get("sent") or 0),
+        "failed": int(row.get("failed") or 0),
+        "skipped_count": int(row.get("skipped") or 0),
+        "created_by": row.get("created_by"),
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+        "started_at": row.get("started_at"),
+        "finished_at": row.get("finished_at"),
+        "paused_reason": row.get("paused_reason") or "",
+    }
+
+
+@app.get("/api/email/targets")
+def list_email_targets(
+    search: str = "",
+    platform: str = "",
+    round_id: int | None = None,
+    owner: str = "all",
+    has_email: bool | None = None,
+    page: int = Query(1, ge=1, le=10000),
+    page_size: int = Query(50, ge=1, le=200),
+    actor: dict[str, Any] = Depends(require_email_sender),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    if round_id is not None and not db.get_round(round_id):
+        raise HTTPException(404, "轮次不存在")
+    if owner not in {"", "all", "unassigned"} and not owner.isdigit():
+        raise HTTPException(400, "负责人筛选无效")
+    return db.email_targets(
+        search=search,
+        platform=platform,
+        round_id=round_id,
+        owner=owner,
+        has_email=has_email,
+        page=page,
+        page_size=page_size,
+        cooldown_days=settings.email_cooldown_days,
+        creator_cooldown_days=settings.email_creator_cooldown_days,
+    )
+
+
+@app.post("/api/email/campaigns/preview")
+def preview_email_campaign(
+    payload: EmailPreviewRequest,
+    actor: dict[str, Any] = Depends(require_email_sender),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    if payload.platform and payload.user_id:
+        creator = db.get_creator(payload.platform, payload.user_id)
+        context = creator_context(creator or {})
+    else:
+        context = {
+            "nickname": "示例达人",
+            "platform": "xhs",
+            "user_id": "example-user",
+            "fans": "12,345",
+            "profile_url": "https://www.xiaohongshu.com/user/profile/example",
+        }
+    return {
+        "subject": render_template(payload.subject, context),
+        "body": render_template(payload.body, context),
+        "context": context,
+    }
+
+
+@app.get("/api/email/campaigns")
+def list_email_campaigns(
+    actor: dict[str, Any] = Depends(require_email_sender),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    rows = db.list_email_campaigns(
+        int(actor["id"]), is_admin=actor.get("role") == "admin"
+    )
+    return {"items": [ _campaign_payload(row) for row in rows ]}
+
+
+@app.post("/api/email/campaigns")
+def create_email_campaign(
+    payload: EmailCampaignCreateRequest,
+    http_request: Request,
+    actor: dict[str, Any] = Depends(require_email_sender),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    _enforce_action_limit(f"email-campaign:{actor['id']}")
+    account = _email_account_for_actor(db, payload.account_id, actor)
+    if not account:
+        raise HTTPException(404, "发件账号不存在")
+    if not bool(account.get("enabled")):
+        raise HTTPException(400, "发件账号已停用")
+    schedule = _validate_email_schedule(
+        timezone=payload.timezone,
+        window_start=payload.window_start,
+        window_end=payload.window_end,
+        weekdays=payload.weekdays,
+        interval_seconds=payload.interval_seconds,
+        jitter_seconds=payload.jitter_seconds,
+        daily_limit=payload.daily_limit,
+        scheduled_start=payload.scheduled_start,
+    )
+    allowed_variables = set(creator_context({}))
+    unknown_variables = sorted(
+        set(
+            re.findall(
+                r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}",
+                f"{payload.subject}\n{payload.body}",
+            )
+        )
+        - allowed_variables
+    )
+    if unknown_variables:
+        raise HTTPException(400, f"模板包含未知变量：{', '.join(unknown_variables)}")
+    recipients: list[dict[str, Any]] = []
+    for recipient in payload.recipients:
+        try:
+            normalized = normalize_email_address(recipient.email)
+        except ValueError as exc:
+            raise HTTPException(400, f"达人 {recipient.user_id} 的邮箱无效") from exc
+        if not db.get_creator(recipient.platform, recipient.user_id):
+            raise HTTPException(400, f"达人 {recipient.user_id} 不存在")
+        data = recipient.model_dump()
+        data["email"] = normalized
+        recipients.append(data)
+    try:
+        result = db.create_email_campaign(
+            name=payload.name,
+            account_id=payload.account_id,
+            subject=payload.subject,
+            body=payload.body,
+            timezone=schedule["timezone"],
+            window_start=schedule["window_start"],
+            window_end=schedule["window_end"],
+            weekdays=schedule["weekdays"],
+            interval_seconds=schedule["interval_seconds"],
+            jitter_seconds=schedule["jitter_seconds"],
+            daily_limit=schedule["daily_limit"],
+            auto_mark_contacted=payload.auto_mark_contacted,
+            recipients=recipients,
+            created_by=int(actor["id"]),
+            scheduled_start=schedule["scheduled_start"],
+            schedule=payload.schedule,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    db.audit(
+        actor["id"],
+        "email.campaign_created",
+        f"email_campaign:{result['campaign_id']}",
+        _client_ip(http_request),
+        http_request.headers.get("user-agent", ""),
+        details={
+            "account_id": payload.account_id,
+            "recipients": result["inserted"],
+            "skipped": len(result["skipped"]),
+            "scheduled": payload.schedule,
+        },
+    )
+    row = db.email_campaign_detail(result["campaign_id"])
+    data = _campaign_payload(row or {})
+    data["skipped"] = result["skipped"]
+    return data
+
+
+@app.patch("/api/email/campaigns/{campaign_id}")
+def update_email_campaign(
+    campaign_id: int,
+    payload: EmailCampaignUpdateRequest,
+    actor: dict[str, Any] = Depends(require_email_sender),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    if not _campaign_for_actor(db, campaign_id, actor):
+        raise HTTPException(404, "发件任务不存在")
+    fields: dict[str, Any] = {}
+    if payload.account_id is not None:
+        account = _email_account_for_actor(db, payload.account_id, actor)
+        if not account or not bool(account.get("enabled")):
+            raise HTTPException(400, "发件账号不可用")
+        fields["account_id"] = payload.account_id
+    for name in ("name", "subject", "body"):
+        value = getattr(payload, name)
+        if value is not None:
+            fields[name] = value
+    if payload.auto_mark_contacted is not None:
+        fields["auto_mark_contacted"] = 1 if payload.auto_mark_contacted else 0
+    if any(
+        value is not None
+        for value in (
+            payload.timezone,
+            payload.window_start,
+            payload.window_end,
+            payload.weekdays,
+            payload.interval_seconds,
+            payload.jitter_seconds,
+            payload.daily_limit,
+        )
+    ):
+        current = db.email_campaign_detail(campaign_id) or {}
+        schedule = _validate_email_schedule(
+            timezone=payload.timezone or current.get("timezone") or "Asia/Shanghai",
+            window_start=payload.window_start or current.get("window_start") or "09:00",
+            window_end=payload.window_end or current.get("window_end") or "18:00",
+            weekdays=payload.weekdays
+            if payload.weekdays is not None
+            else (json.loads(current.get("weekdays") or "[1,2,3,4,5]")),
+            interval_seconds=payload.interval_seconds
+            if payload.interval_seconds is not None
+            else int(current.get("interval_seconds") or 60),
+            jitter_seconds=payload.jitter_seconds
+            if payload.jitter_seconds is not None
+            else int(current.get("jitter_seconds") or 0),
+            daily_limit=payload.daily_limit
+            if payload.daily_limit is not None
+            else int(current.get("daily_limit") or 20),
+        )
+        fields.update(schedule)
+    try:
+        db.update_email_campaign(campaign_id, **fields)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    row = db.email_campaign_detail(campaign_id)
+    return _campaign_payload(row or {})
+
+
+@app.post("/api/email/campaigns/{campaign_id}/schedule")
+def schedule_email_campaign(
+    campaign_id: int,
+    payload: EmailCampaignScheduleRequest,
+    http_request: Request,
+    actor: dict[str, Any] = Depends(require_email_sender),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    if not _campaign_for_actor(db, campaign_id, actor):
+        raise HTTPException(404, "发件任务不存在")
+    recipients = db.email_campaign_recipients(campaign_id, page_size=1)
+    if recipients["total"] == 0:
+        raise HTTPException(400, "发件任务没有收件人")
+    schedule = _validate_email_schedule(
+        timezone=payload.timezone,
+        window_start=payload.window_start,
+        window_end=payload.window_end,
+        weekdays=payload.weekdays,
+        interval_seconds=payload.interval_seconds,
+        jitter_seconds=payload.jitter_seconds,
+        daily_limit=payload.daily_limit,
+        scheduled_start=payload.scheduled_start,
+    )
+    try:
+        db.schedule_email_campaign(campaign_id, **schedule)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    db.audit(
+        actor["id"],
+        "email.campaign_scheduled",
+        f"email_campaign:{campaign_id}",
+        _client_ip(http_request),
+        http_request.headers.get("user-agent", ""),
+        details={"scheduled_start": schedule["scheduled_start"]},
+    )
+    row = db.email_campaign_detail(campaign_id)
+    return _campaign_payload(row or {})
+
+
+@app.post("/api/email/campaigns/{campaign_id}/cancel")
+def cancel_email_campaign(
+    campaign_id: int,
+    http_request: Request,
+    actor: dict[str, Any] = Depends(require_email_sender),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    if not _campaign_for_actor(db, campaign_id, actor):
+        raise HTTPException(404, "发件任务不存在")
+    try:
+        db.cancel_email_campaign(campaign_id, reason="用户取消")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    db.audit(
+        actor["id"],
+        "email.campaign_cancelled",
+        f"email_campaign:{campaign_id}",
+        _client_ip(http_request),
+        http_request.headers.get("user-agent", ""),
+    )
+    row = db.email_campaign_detail(campaign_id)
+    return _campaign_payload(row or {})
+
+
+@app.delete("/api/email/campaigns/{campaign_id}")
+def delete_email_campaign(
+    campaign_id: int,
+    http_request: Request,
+    actor: dict[str, Any] = Depends(require_email_sender),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    if not _campaign_for_actor(db, campaign_id, actor):
+        raise HTTPException(404, "发件任务不存在")
+    try:
+        db.delete_email_campaign(campaign_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    db.audit(
+        actor["id"],
+        "email.campaign_deleted",
+        f"email_campaign:{campaign_id}",
+        _client_ip(http_request),
+        http_request.headers.get("user-agent", ""),
+    )
+    return {"deleted": True}
+
+
+@app.get("/api/email/campaigns/{campaign_id}")
+def get_email_campaign(
+    campaign_id: int,
+    status: str = "",
+    page: int = Query(1, ge=1, le=10000),
+    page_size: int = Query(50, ge=1, le=200),
+    actor: dict[str, Any] = Depends(require_email_sender),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    row = _campaign_for_actor(db, campaign_id, actor)
+    if not row:
+        raise HTTPException(404, "发件任务不存在")
+    recipients = db.email_campaign_recipients(
+        campaign_id, status=status, page=page, page_size=page_size
+    )
+    return {
+        "campaign": _campaign_payload(row),
+        "recipients": recipients["items"],
+        "total": recipients["total"],
+        "page": recipients["page"],
+        "page_size": recipients["page_size"],
+    }
+
+
+
+@app.post("/api/email/campaigns/{campaign_id}/pause")
+def pause_email_campaign(
+    campaign_id: int,
+    http_request: Request,
+    actor: dict[str, Any] = Depends(require_email_sender),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    if not _campaign_for_actor(db, campaign_id, actor):
+        raise HTTPException(404, "发件任务不存在")
+    changed = db.pause_email_campaign(campaign_id, "用户暂停")
+    if not changed:
+        raise HTTPException(400, "当前状态不能暂停")
+    db.audit(
+        actor["id"],
+        "email.campaign_paused",
+        f"email_campaign:{campaign_id}",
+        _client_ip(http_request),
+        http_request.headers.get("user-agent", ""),
+    )
+    row = db.email_campaign_detail(campaign_id)
+    return _campaign_payload(row or {})
+
+
+@app.post("/api/email/campaigns/{campaign_id}/resume")
+def resume_email_campaign(
+    campaign_id: int,
+    http_request: Request,
+    actor: dict[str, Any] = Depends(require_email_sender),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    if not _campaign_for_actor(db, campaign_id, actor):
+        raise HTTPException(404, "发件任务不存在")
+    changed = db.resume_email_campaign(campaign_id)
+    if not changed:
+        raise HTTPException(400, "只有已暂停的任务可以恢复")
+    db.audit(
+        actor["id"],
+        "email.campaign_resumed",
+        f"email_campaign:{campaign_id}",
+        _client_ip(http_request),
+        http_request.headers.get("user-agent", ""),
+    )
+    row = db.email_campaign_detail(campaign_id)
+    return _campaign_payload(row or {})
+
+
+@app.post("/api/email/campaigns/{campaign_id}/retry-failed")
+def retry_failed_email_recipients(
+    campaign_id: int,
+    http_request: Request,
+    actor: dict[str, Any] = Depends(require_email_sender),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    if not _campaign_for_actor(db, campaign_id, actor):
+        raise HTTPException(404, "发件任务不存在")
+    try:
+        changed = db.retry_failed_email_recipients(campaign_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    db.audit(
+        actor["id"],
+        "email.campaign_retried",
+        f"email_campaign:{campaign_id}",
+        _client_ip(http_request),
+        http_request.headers.get("user-agent", ""),
+        details={"recipients": changed},
+    )
+    row = db.email_campaign_detail(campaign_id)
+    return {**_campaign_payload(row or {}), "retried": changed}
+
+
+
+@app.get("/api/email/worker-status")
+def email_worker_status(
+    actor: dict[str, Any] = Depends(require_email_sender),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    state = db.email_worker_status()
+    heartbeat = str(state.get("heartbeat_at") or "")
+    stale = True
+    if heartbeat:
+        try:
+            stamp = datetime.fromisoformat(heartbeat.replace("Z", "+00:00"))
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            stale = (datetime.now(timezone.utc) - stamp).total_seconds() > 120
+        except ValueError:
+            stale = True
+    state.pop("owner", None)
+    return {
+        **state,
+        "stale": stale,
+        "public_url_configured": bool(settings.public_url),
+    }
+
+
+@app.post("/api/email/accounts/{account_id}/resume-paused")
+def resume_paused_email_campaigns(
+    account_id: int,
+    http_request: Request,
+    actor: dict[str, Any] = Depends(require_email_sender),
+    db: Database = Depends(get_db),
+) -> dict[str, int]:
+    account = _email_account_for_actor(db, account_id, actor)
+    if not account:
+        raise HTTPException(404, "发件账号不存在")
+    _require_email_account_manager(account, actor)
+    if not bool(account.get("enabled")):
+        raise HTTPException(400, "发件账号已停用，请先启用后再恢复任务")
+    resumed = db.resume_paused_campaigns_for_account(account_id)
+    if resumed:
+        db.audit(
+            actor["id"],
+            "email.campaigns_resumed",
+            f"email_account:{account_id}",
+            _client_ip(http_request),
+            http_request.headers.get("user-agent", ""),
+            details={"resumed": resumed},
+        )
+    return {"resumed": resumed}
+
+
+def _unsubscribe_page(title: str, message: str, *, token: str = "", confirm: bool = False) -> str:
+    form = ""
+    if confirm:
+        form = (
+            f'<form method="post" action="/api/email/unsubscribe?token={token}">'
+            '<button type="submit">确认退订</button></form>'
+        )
+    return f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f5f4;
+color:#1c1917;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}}
+main{{background:#fff;padding:40px;border-radius:16px;max-width:420px;width:90%;
+box-shadow:0 10px 30px rgba(0,0,0,.08);text-align:center}}
+h1{{font-size:20px;margin:0 0 12px}}p{{color:#57534e;line-height:1.6}}
+button{{margin-top:24px;padding:10px 24px;border:0;border-radius:999px;
+background:#1c1917;color:#fff;font-size:14px;cursor:pointer}}
+</style></head><body><main><h1>{title}</h1><p>{message}</p>{form}</main></body></html>"""
+
+
+@app.api_route("/api/email/unsubscribe", methods=["GET", "POST"])
+def email_unsubscribe(
+    request: Request,
+    token: str = "",
+    db: Database = Depends(get_db),
+) -> HTMLResponse:
+    client_ip = _client_ip(request)
+    if request.method == "POST":
+        _enforce_action_limit(f"unsubscribe:{client_ip}")
+        result = db.apply_email_unsubscribe(token)
+        if not result:
+            return HTMLResponse(
+                _unsubscribe_page("退订链接无效", "链接无效或已过期，请直接回复邮件联系发件人。"),
+                status_code=400,
+            )
+        db.audit(
+            None,
+            "email.unsubscribed",
+            result["email"],
+            client_ip,
+            request.headers.get("user-agent", ""),
+            details={"source": "link", "skipped": result["skipped_recipients"]},
+        )
+        return HTMLResponse(
+            _unsubscribe_page("已退订", "该邮箱已加入退订名单，今后不会再收到自动邮件。")
+        )
+    info = db.get_email_unsubscribe_token(token)
+    if not info:
+        return HTMLResponse(
+            _unsubscribe_page("退订链接无效", "链接无效或已过期，请直接回复邮件联系发件人。"),
+            status_code=400,
+        )
+    masked = str(info.get("email") or "")
+    if "@" in masked:
+        local, domain = masked.split("@", 1)
+        masked = (local[:2] + "***@" + domain) if len(local) > 2 else ("***@" + domain)
+    return HTMLResponse(
+        _unsubscribe_page(
+            "确认退订",
+            f"将停止向 {masked} 发送自动邮件。点击下方按钮确认。",
+            token=token,
+            confirm=True,
+        )
+    )
+
+@app.get("/api/email/suppressions")
+def list_email_suppressions(
+    admin: dict[str, Any] = Depends(require_admin),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    return {"items": db.email_suppressions()}
+
+
+@app.post("/api/email/suppressions")
+def add_email_suppression(
+    payload: EmailSuppressionCreateRequest,
+    http_request: Request,
+    admin: dict[str, Any] = Depends(require_admin),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        item = db.add_email_suppression(
+            payload.email,
+            reason=payload.reason,
+            source="manual",
+            created_by=int(admin["id"]),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    db.audit(
+        admin["id"],
+        "email.suppression_added",
+        payload.email,
+        _client_ip(http_request),
+        http_request.headers.get("user-agent", ""),
+    )
+    return item
+
+
+@app.delete("/api/email/suppressions/{suppression_id}")
+def delete_email_suppression(
+    suppression_id: int,
+    http_request: Request,
+    admin: dict[str, Any] = Depends(require_admin),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    if not db.delete_email_suppression(suppression_id):
+        raise HTTPException(404, "退订记录不存在")
+    db.audit(
+        admin["id"],
+        "email.suppression_deleted",
+        str(suppression_id),
+        _client_ip(http_request),
+        http_request.headers.get("user-agent", ""),
+    )
+    return {"deleted": True}
 
 
 def _fetch_balance(target: Settings, provider: str = "dataflow") -> dict[str, Any]:
@@ -1876,7 +3115,7 @@ def _fetch_extra_balance(provider_id: str) -> dict[str, Any]:
 def api_balance(
     http_request: Request, provider: str = "dataflow"
 ) -> dict[str, Any]:
-    actor = require_user(http_request)
+    actor = require_collector(http_request)
     _enforce_action_limit(f"balance:{actor['id']}")
     provider = provider.strip().lower()
     if provider in {"dataflow", "rnote"}:
@@ -1905,9 +3144,12 @@ def api_balance(
 
 @app.get("/api/rounds")
 def list_rounds(
+    http_request: Request,
     include_archived: bool = False,
     db: Database = Depends(get_db),
 ) -> list[dict[str, Any]]:
+    if include_archived:
+        require_admin(http_request)
     jobs = db.latest_jobs_by_round()
     visible = _round_names_visible()
     items: list[dict[str, Any]] = []
@@ -2074,6 +3316,8 @@ def purge_round(
     if not impact["can_purge"]:
         if impact["jobs_active"]:
             raise HTTPException(400, "该轮次仍有运行中的任务，请先取消")
+        if impact.get("live_process"):
+            raise HTTPException(400, "上一任务进程仍在退出，请稍后再试")
         raise HTTPException(400, "该轮次仍关联线索，不能永久删除；请使用归档")
     backup = db.backup(f"round-{round_id}-delete")
     try:
@@ -2822,6 +4066,10 @@ async def upload_cooperation_attachment(
                     raise HTTPException(413, "附件超过大小限制")
                 digest.update(chunk)
                 target.write(chunk)
+        with temp_path.open("rb") as handle:
+            head = handle.read(64)
+        if head.startswith((b"MZ", b"\x7fELF")):
+            raise HTTPException(400, "附件内容疑似可执行文件")
         temp_path.replace(final_path)
         created = db.add_cooperation_attachment(
             case_id,
@@ -2862,7 +4110,7 @@ def download_cooperation_attachment(
     http_request: Request,
     db: Database = Depends(get_db),
 ) -> FileResponse:
-    require_user(http_request)
+    actor = require_user(http_request)
     row = db.get_cooperation_attachment(attachment_id)
     if not row or row.get("deleted_at"):
         raise HTTPException(404, "附件不存在")
@@ -2870,6 +4118,14 @@ def download_cooperation_attachment(
     root = settings.output_dir.resolve()
     if not path.is_relative_to(root) or not path.is_file():
         raise HTTPException(404, "附件文件不存在")
+    db.audit(
+        actor["id"],
+        "cooperation.attachment_downloaded",
+        f"cooperation_case:{row['case_id']}",
+        _client_ip(http_request),
+        http_request.headers.get("user-agent", ""),
+        details={"attachment_id": attachment_id, "name": row.get("original_name")},
+    )
     return FileResponse(
         path,
         media_type=row.get("content_type") or "application/octet-stream",
@@ -2896,6 +4152,13 @@ def delete_cooperation_attachment(
         )
     except ValueError as exc:
         raise _case_error(exc) from exc
+    if result.get("changed"):
+        storage_key = str(row.get("storage_key") or "").strip()
+        if storage_key:
+            root = settings.output_dir.resolve()
+            path = (settings.output_dir / storage_key).resolve()
+            if path.is_relative_to(root):
+                path.unlink(missing_ok=True)
     db.audit(
         actor["id"],
         "cooperation.attachment_deleted",
@@ -3049,6 +4312,48 @@ def export_cooperation_case(
         filename=f"cooperation_case_{case_id}.zip",
         background=BackgroundTask(os.unlink, temp_path),
     )
+
+
+@app.delete("/api/cooperation-cases/{case_id}")
+def delete_cooperation_case(
+    case_id: int,
+    payload: DeleteCooperationCaseRequest,
+    http_request: Request,
+    admin: dict[str, Any] = Depends(require_admin),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    if not payload.confirm:
+        raise HTTPException(400, "请确认删除该合作记录")
+    if not db.cooperation_case_detail(int(case_id)):
+        raise HTTPException(404, "合作记录不存在")
+    backup = db.backup(f"cooperation-case-{case_id}-delete")
+    try:
+        result = db.delete_cooperation_case(int(case_id))
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    shutil.rmtree(_attachment_root() / str(int(case_id)), ignore_errors=True)
+    root = settings.output_dir.resolve()
+    for storage_key in result.pop("storage_keys", []):
+        path = (settings.output_dir / str(storage_key)).resolve()
+        if path.is_relative_to(root):
+            path.unlink(missing_ok=True)
+    db.audit(
+        admin["id"],
+        "cooperation.case_deleted",
+        f"cooperation_case:{case_id}",
+        _client_ip(http_request),
+        http_request.headers.get("user-agent", ""),
+        details={
+            "seq": result["seq"],
+            "status": result["status"],
+            "impact": result["impact"],
+            "backup": str(backup),
+        },
+    )
+    db.prune_backups(
+        settings.backup_retention_days, settings.backup_retention_count, apply=True
+    )
+    return {**result, "deleted": True, "backup": str(backup)}
 
 
 @app.patch("/api/creators/{platform}/{user_id}/cooperation")
@@ -3381,27 +4686,31 @@ def _iter_lead_export_rows(
     owner: str | None,
     sort: str = "updated_at",
     order: str = "desc",
+    page_size: int = 200,
 ) -> Generator[dict[str, Any], None, None]:
-    page = 1
-    while True:
-        result = db.query_leads(
-            round_id=round_id,
-            platform=platform,
-            search=search,
-            statuses=statuses,
-            sources=_csv(source),
-            owner=owner,
-            sort=sort,
-            order=order,
-            page=page,
-            page_size=200,
-        )
-        items = result["items"]
-        for item in items:
-            yield _lead_dict(item)
-        if not items or page * 200 >= int(result["total"]):
-            break
-        page += 1
+    page_size = max(1, min(200, int(page_size)))
+    with db._conn:
+        db._conn.execute("BEGIN")
+        page = 1
+        while True:
+            result = db.query_leads(
+                round_id=round_id,
+                platform=platform,
+                search=search,
+                statuses=statuses,
+                sources=_csv(source),
+                owner=owner,
+                sort=sort,
+                order=order,
+                page=page,
+                page_size=page_size,
+            )
+            items = result["items"]
+            for item in items:
+                yield _lead_dict(item)
+            if not items or page * page_size >= int(result["total"]):
+                break
+            page += 1
 
 
 def _lead_export_value(row: dict[str, Any], column: str) -> Any:
@@ -3508,6 +4817,10 @@ def create_lead(
     db: Database = Depends(get_db),
     actor: dict[str, Any] = Depends(require_lead_editor),
 ) -> dict[str, Any]:
+    if not _lead_identifiable(
+        payload.nickname, payload.account_id, payload.platform_handle, payload.profile_url
+    ):
+        raise HTTPException(400, "昵称、平台账号、用户 ID 或主页链接至少填写一项")
     if payload.source_round_id is not None and not db.get_round(payload.source_round_id):
         raise HTTPException(400, "来源轮次不存在")
     _validate_owner(db, payload.owner_user_id)
@@ -3572,6 +4885,10 @@ def create_leads_bulk(
     match_errors = 0
     for index, item in enumerate(payload.items, 1):
         try:
+            if not _lead_identifiable(
+                item.nickname, item.account_id, item.platform_handle, item.profile_url
+            ):
+                raise ValueError("昵称、平台账号、用户 ID 或主页链接至少填写一项")
             if item.source_round_id is not None and not db.get_round(item.source_round_id):
                 raise ValueError("来源轮次不存在")
             _validate_owner(db, item.owner_user_id)
@@ -3657,6 +4974,14 @@ def update_lead(
     if lead.get("status") == "converted":
         raise HTTPException(400, "已转达人的线索不可修改")
     changes = payload.model_dump(exclude_unset=True)
+    merged = {**lead, **changes}
+    if not _lead_identifiable(
+        merged.get("nickname"),
+        merged.get("account_id"),
+        merged.get("platform_handle"),
+        merged.get("profile_url"),
+    ):
+        raise HTTPException(400, "昵称、平台账号、用户 ID 或主页链接至少保留一项")
     if "source_round_id" in changes and changes["source_round_id"] is not None:
         if not db.get_round(int(changes["source_round_id"])):
             raise HTTPException(400, "来源轮次不存在")
@@ -3765,7 +5090,7 @@ def verify_lead_endpoint(
     payload: LeadVerifyRequest,
     http_request: Request,
     db: Database = Depends(get_db),
-    actor: dict[str, Any] = Depends(require_collector),
+    actor: dict[str, Any] = Depends(require_lead_converter),
 ) -> dict[str, Any]:
     lead = db.get_lead(lead_id)
     if not lead:
@@ -3813,7 +5138,7 @@ def convert_lead_endpoint(
     payload: LeadConvertRequest,
     http_request: Request,
     db: Database = Depends(get_db),
-    actor: dict[str, Any] = Depends(require_collector),
+    actor: dict[str, Any] = Depends(require_lead_converter),
 ) -> dict[str, Any]:
     lead = db.get_lead(lead_id)
     if not lead:
@@ -3848,6 +5173,17 @@ def convert_lead_endpoint(
         details={"owner_user_id": lead.get("owner_user_id") or actor["id"]},
     )
     return result
+
+
+@app.get("/api/rounds/{round_id}/jobs")
+def round_jobs(
+    round_id: int,
+    db: Database = Depends(get_db),
+    collector: dict[str, Any] = Depends(require_collector),
+) -> dict[str, Any]:
+    if not db.get_round(round_id):
+        raise HTTPException(404, "轮次不存在")
+    return {"items": [_job_dict(item) for item in db.jobs_for_round(round_id)]}
 
 
 @app.get("/api/jobs/active")
@@ -4401,6 +5737,12 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8501)
     args, _ = parser.parse_known_args()
+    threading.Thread(
+        target=start_email_worker,
+        args=(settings,),
+        daemon=True,
+        name="codata-email-worker",
+    ).start()
     uvicorn.run("codata.api_server:app", host=args.host, port=args.port, reload=False)
 
 

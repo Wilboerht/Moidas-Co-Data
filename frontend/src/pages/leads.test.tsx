@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import { createMemoryRouter, RouterProvider } from "react-router-dom";
 import { vi } from "vitest";
-import { LeadsPage } from "./leads";
+import { hasQuickConvertIdentity, LeadsPage } from "./leads";
 import { api } from "@/shared/api";
 
 vi.mock("@/shared/api", () => ({
@@ -92,5 +92,14 @@ describe("LeadsPage URL state", () => {
         expect.objectContaining({ platform: "weibo", page: 2 }),
       );
     });
+  });
+
+  it("shows quick conversion for a verified handle-only lead", () => {
+    expect(hasQuickConvertIdentity({
+      status: "unverified",
+      account_id: "",
+      platform_handle: "xhs-handle",
+      profile_url: "",
+    })).toBe(true);
   });
 });

@@ -1,6 +1,6 @@
 import { lazy, Suspense, type ComponentType } from "react";
 import { Loader2 } from "lucide-react";
-import { Route, Routes } from "react-router-dom";
+import { Navigate, Route, Routes } from "react-router-dom";
 import { AppShell } from "@/components/app-shell";
 import { LoginPage } from "@/pages/login";
 import { ChangePasswordRequiredPage } from "@/pages/change-password-required";
@@ -12,6 +12,9 @@ const DashboardPage = lazy(() =>
 );
 const CreatorsPage = lazy(() =>
   import("@/pages/creators").then((module) => ({ default: module.CreatorsPage })),
+);
+const EmailPage = lazy(() =>
+  import("@/pages/email").then((module) => ({ default: module.EmailPage })),
 );
 const LeadsPage = lazy(() =>
   import("@/pages/leads").then((module) => ({ default: module.LeadsPage })),
@@ -39,22 +42,6 @@ function PageFallback() {
   return (
     <div className="flex min-h-[40vh] items-center justify-center" aria-busy="true">
       <Loader2 className="size-5 animate-spin text-muted-foreground" />
-    </div>
-  );
-}
-
-function NoCollectAccess() {
-  return (
-    <div className="flex min-h-[40vh] items-center justify-center text-sm text-muted-foreground">
-      无权访问该页面
-    </div>
-  );
-}
-
-function NoAdminAccess() {
-  return (
-    <div className="flex min-h-[40vh] items-center justify-center text-sm text-muted-foreground">
-      需要管理员权限
     </div>
   );
 }
@@ -87,6 +74,7 @@ export function App() {
   }
 
   const canCollect = user.role === "admin" || user.can_collect;
+  const canSendEmail = user.role === "admin" || user.can_send_email;
   const isAdmin = user.role === "admin";
 
   return (
@@ -96,12 +84,13 @@ export function App() {
           <Route index element={page(DashboardPage)} />
           <Route path="/creators" element={page(CreatorsPage)} />
           <Route path="/leads" element={page(LeadsPage)} />
-          <Route path="/new" element={canCollect ? page(NewRoundPage) : <NoCollectAccess />} />
-          <Route path="/tasks" element={canCollect ? page(TasksPage) : <NoCollectAccess />} />
-          <Route path="/tasks/:roundId" element={canCollect ? page(TaskDetailPage) : <NoCollectAccess />} />
-          <Route path="/keywords" element={canCollect ? page(KeywordsPage) : <NoCollectAccess />} />
-          <Route path="/users" element={page(UsersPage)} />
-          <Route path="/settings" element={isAdmin ? page(SettingsPage) : <NoAdminAccess />} />
+          <Route path="/email" element={canSendEmail ? page(EmailPage) : <Navigate to="/" replace />} />
+          <Route path="/new" element={canCollect ? page(NewRoundPage) : <Navigate to="/" replace />} />
+          <Route path="/tasks" element={canCollect ? page(TasksPage) : <Navigate to="/" replace />} />
+          <Route path="/tasks/:roundId" element={canCollect ? page(TaskDetailPage) : <Navigate to="/" replace />} />
+          <Route path="/keywords" element={canCollect ? page(KeywordsPage) : <Navigate to="/" replace />} />
+          <Route path="/users" element={isAdmin ? page(UsersPage) : <Navigate to="/" replace />} />
+          <Route path="/settings" element={isAdmin ? page(SettingsPage) : <Navigate to="/" replace />} />
           <Route
             path="*"
             element={

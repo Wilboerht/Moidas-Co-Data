@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from .api import XHS_COST, DataFlowAPI
+from .api import DOUYIN_COST, XHS_COST, DataFlowAPI
 from .client import DataFlowClient, DataFlowError
 from .config import load_settings
 from .db import Database
@@ -210,12 +210,36 @@ def cmd_dy_sub_comments(runner: Runner, args: argparse.Namespace) -> None:
     )
 
 
+def _legacy_costs(settings: Any) -> tuple[int, int]:
+    from .platforms import load_registry
+
+    try:
+        registry = load_registry(settings)
+    except Exception:
+        return XHS_COST, DOUYIN_COST
+
+    def search_cost(platform: str) -> int | None:
+        try:
+            option = registry.cheapest(platform)
+        except Exception:
+            return None
+        if option is None:
+            return None
+        return option.search.price.tokens(registry.usd_cny, registry.token_cny)
+
+    return (
+        search_cost("xhs") or XHS_COST,
+        search_cost("douyin") or DOUYIN_COST,
+    )
+
+
 def cmd_crawl(runner: Runner, args: argparse.Namespace) -> None:
     settings = runner.api.client.settings
     calls = args.pages + args.max_notes + (args.max_notes if args.with_comments else 0)
-    estimate = calls * XHS_COST
+    unit_cost = int(getattr(runner.api, "xhs_cost", XHS_COST))
+    estimate = calls * unit_cost
     if not args.yes:
-        _out(f"将发起约 {calls} 次请求，预计消耗约 {estimate} token（单价 {XHS_COST}/次）。加 --yes 跳过确认。")
+        _out(f"将发起约 {calls} 次请求，预计消耗约 {estimate} token（单价 {unit_cost}/次）。加 --yes 跳过确认。")
         return
 
     seen: set[str] = set()
@@ -274,7 +298,12 @@ def _print_stats(settings: Any) -> None:
 
 def cmd_round_create(settings: Any, args: argparse.Namespace) -> None:
     if args.dry_run:
-        estimate = Pipeline.estimate(len(args.keyword), args.pages, args.max_creators or None)
+        estimate = Pipeline.estimate(
+            len(args.keyword),
+            args.pages,
+            args.max_creators or None,
+            unit_cost=_legacy_costs(settings)[0],
+        )
         _out(f"将创建轮次，关键词 {len(args.keyword)} 个，每词 {args.pages} 页")
         _out(f"预估最多 {estimate['total_calls']} 次调用，约 {estimate['tokens']} token")
         return
@@ -289,7 +318,12 @@ def cmd_round_create(settings: Any, args: argparse.Namespace) -> None:
         )
         row = db.get_round(round_id)
         keywords = db.get_round_keywords(round_id, include_disabled=True)
-        estimate = Pipeline.estimate(len(keywords), args.pages, args.max_creators or None)
+        estimate = Pipeline.estimate(
+            len(keywords),
+            args.pages,
+            args.max_creators or None,
+            unit_cost=_legacy_costs(settings)[0],
+        )
     _out(f"已创建轮次 #{round_id} {row['name']}（关键词 {len(keywords)} 个，每词 {args.pages} 页）")
     _out(f"预估最多 {estimate['total_calls']} 次调用，约 {estimate['tokens']} token")
     _out(f"运行：uv run codata round run {round_id}")
@@ -581,6 +615,8 @@ def cmd_import_excel(settings: Any, args: argparse.Namespace) -> None:
                 )
 
         db.import_creator_rows(round_id, items)
+        for warning in getattr(db, "last_import_warnings", []):
+            _out(f"提示：{warning}")
         db.update_round(round_id, status="done", finished_at=utc_now(), error=None)
         matched = 0
         if getattr(settings, "lead_match_enabled", True):
@@ -592,21 +628,13 @@ def cmd_import_excel(settings: Any, args: argparse.Namespace) -> None:
             f"Excel 导入完成：轮次 #{round_id} {round_name}，共 {len(items)} 条；"
             f"有账号ID {with_id} 条，有粉丝数据 {enriched} 条；匹配线索 {matched} 条"
         )
-        _out("打开面板：uv run codata-panel")
+        _out("打开面板：uv run codata-web")
 
 
 def cmd_panel(args: argparse.Namespace) -> None:
-    command = [
-        sys.executable,
-        "-m",
-        "uvicorn",
-        "codata.api_server:app",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        "8501",
-    ]
-    raise SystemExit(subprocess.call(command))
+    from .api_server import main as web_main
+
+    web_main()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -769,13 +797,18 @@ def main(argv: list[str] | None = None) -> None:
 
     store = Store(settings.output_dir)
     client = DataFlowClient(settings)
+    xhs_cost, douyin_cost = _legacy_costs(settings)
+    api = DataFlowAPI(client, xhs_cost=xhs_cost, douyin_cost=douyin_cost)
     try:
-        runner = Runner(DataFlowAPI(client), store)
+        runner = Runner(api, store)
         args.func(runner, args)
     except DataFlowError as exc:
         message = str(exc)
         if exc.code == 1001:
-            message += "（余额不足，请在 dataflow 后台充值或订阅后再试；小红书单次 45 token、抖音单次 90 token）"
+            message += (
+                "（余额不足，请在 dataflow 后台充值或订阅后再试；"
+                f"小红书单次 {api.xhs_cost} token、抖音单次 {api.douyin_cost} token）"
+            )
         print(f"请求失败: {message}", file=sys.stderr)
         raise SystemExit(2)
     finally:

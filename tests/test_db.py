@@ -8,11 +8,14 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from codata.db import Database, SCHEMA, SCHEMA_VERSION
+from codata import jobs
+from codata.config import Settings
+from codata.db import Database, JobBusyError, SCHEMA, SCHEMA_VERSION
 from codata.normalize import normalize_user_info
 from helpers import user_payload
 
@@ -359,6 +362,116 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(cancelled["stage"], "已取消")
         self.assertEqual(self.db.get_round(round_id)["status"], "cancelled")
 
+    def test_stale_job_keeps_running_while_job_process_alive(self) -> None:
+        round_id = self._seed_round()
+        job_id = self.db.claim_job(round_id)
+        self.db.update_job(
+            job_id,
+            status="running",
+            pid=424242,
+            started_at="2000-01-01T00:00:00+00:00",
+            heartbeat_at="2000-01-01T00:00:00+00:00",
+        )
+        with patch("codata.db.process_matches", return_value=True):
+            self.assertEqual(self.db.reconcile_stale_jobs(1), [])
+        self.assertEqual(self.db.get_job(job_id)["status"], "running")
+
+    def test_stale_pending_job_keeps_queued_while_process_alive(self) -> None:
+        round_id = self._seed_round()
+        job_id = self.db.claim_job(round_id)
+        self.db.update_job(
+            job_id,
+            status="pending",
+            pid=424242,
+            heartbeat_at="2000-01-01T00:00:00+00:00",
+        )
+        with patch("codata.db.pid_alive", return_value=True):
+            self.assertEqual(self.db.reconcile_stale_jobs(1), [])
+        self.assertEqual(self.db.get_job(job_id)["status"], "pending")
+
+    def test_mark_start_failure_closes_pending_job(self) -> None:
+        round_id = self._seed_round()
+        job_id = self.db.claim_job(round_id)
+        settings = Settings(host="", token="", output_dir=Path(self.tmp.name))
+        with patch("codata.jobs.load_settings", return_value=settings):
+            jobs._mark_start_failure(round_id, job_id, "启动失败: 测试")
+        job = self.db.get_job(job_id)
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["stage"], "启动失败")
+        self.assertIn("启动失败", job["error"])
+        self.assertEqual(self.db.get_round(round_id)["status"], "failed")
+
+    def test_rerun_snapshot_keeps_reviewed_and_drops_stale_collected(self) -> None:
+        round_id = self._seed_round()
+        self.db._conn.execute(
+            "UPDATE note_hits SET last_run_id = 11 WHERE round_id = ?", (round_id,)
+        )
+        self.db.update_round(round_id, latest_run_id=11)
+        self.db.update_review(round_id, "xhs", "u1", status="adopted")
+        self.db.add_creator_round(round_id, "xhs", "lead-only")
+
+        self.db.upsert_note(make_note("n4", "u3", 30, 2, 0, 0, ["咖啡"]), commit=True)
+        self.db.add_note_hit(round_id, "xhs", "n4", "咖啡", 1, 1, run_id=22)
+
+        removed = self.db.prune_snapshot_creators(round_id, 22)
+        self.assertEqual(removed, 1)
+        rows = self.db.refresh_creator_rounds(round_id, run_id=22)
+        self.assertEqual(rows, 1)
+        self.db.update_round(round_id, latest_run_id=22)
+
+        stats = self.db.round_author_stats(round_id)
+        self.assertEqual([entry["user_id"] for entry in stats], ["u3"])
+        table = {row["user_id"]: row for row in self.db.creator_table(round_id)}
+        self.assertIn("u1", table)
+        self.assertEqual(table["u1"]["status"], "adopted")
+        self.assertIn("u3", table)
+        self.assertIn("lead-only", table)
+        self.assertNotIn("u2", table)
+
+        summary = self.db.round_summary(round_id)
+        self.assertEqual(summary["note_hits"], 1)
+        self.assertEqual(summary["notes"], 2)
+
+    def test_note_hit_rerun_updates_last_run(self) -> None:
+        round_id = self._seed_round()
+        self.db.add_note_hit(round_id, "xhs", "n1", "咖啡", 1, 1, run_id=1)
+        self.db.add_note_hit(round_id, "xhs", "n1", "咖啡", 2, 5, run_id=2)
+        row = self.db._conn.execute(
+            "SELECT page, rank, last_run_id FROM note_hits "
+            "WHERE round_id = ? AND note_id = 'n1' AND keyword = '咖啡'",
+            (round_id,),
+        ).fetchone()
+        self.assertEqual(row["page"], 2)
+        self.assertEqual(row["rank"], 5)
+        self.assertEqual(row["last_run_id"], 2)
+
+    def test_prune_trash_removes_expired_files(self) -> None:
+        trash = Path(self.tmp.name) / "trash"
+        trash.mkdir()
+        old = trash / "old.json"
+        old.write_text("{}", encoding="utf-8")
+        os.utime(old, (0, 0))
+        report = self.db.prune_trash(1)
+        self.assertEqual(report["deleted"], 1)
+        self.assertFalse(old.exists())
+
+    def test_cancelled_process_blocks_claim_and_archive(self) -> None:
+        round_id = self._seed_round()
+        job_id = self.db.claim_job(round_id)
+        self.db.cancel_job(job_id)
+        self.db.update_job(job_id, pid=424242)
+        with patch("codata.db.process_matches", return_value=True):
+            with self.assertRaises(JobBusyError):
+                self.db.claim_job(round_id)
+            with self.assertRaises(ValueError):
+                self.db.archive_round(round_id)
+            impact = self.db.round_impact(round_id)
+            self.assertTrue(impact["live_process"])
+            self.assertFalse(impact["can_purge"])
+        with patch("codata.db.process_matches", return_value=False):
+            self.assertIsInstance(self.db.claim_job(round_id), int)
+
+
     def test_prune_preserves_claimed_creator(self) -> None:
         round_id = self._seed_round()
         self.db.claim_creator(round_id, "xhs", "u2", 1)
@@ -662,6 +775,10 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(
             self.db.get_creator("xhs", "u1")["cooperation_status"], "cooperating"
         )
+        self.db.update_cooperation("xhs", "u1", "negotiating")
+        self.assertEqual(
+            self.db.get_creator("xhs", "u1")["cooperation_status"], "negotiating"
+        )
 
     def test_cooperation_enrollment_transition_and_cancel(self) -> None:
         round_id = self._seed_round()
@@ -690,6 +807,82 @@ class DatabaseTests(unittest.TestCase):
         creator = self.db.get_creator("xhs", "u1")
         self.assertEqual(creator["cooperation_status"], "cancelled")
         self.assertEqual(creator["cooperation_count"], 1)
+
+    def test_delete_cooperation_case_cascades_and_recomputes_summary(self) -> None:
+        round_id = self._seed_round()
+        self.db.update_review(round_id, "xhs", "u1", status="adopted")
+        first = self.db.cooperation_cases("xhs", "u1")[0]
+        self.db.add_cooperation_work(
+            first["id"],
+            {"platform": "xhs", "url": "https://example.com/work/1"},
+            actor_user_id=None,
+        )
+        self.db.add_cooperation_attachment(
+            first["id"],
+            original_name="quote.txt",
+            storage_key="cooperation_attachments/1/quote.txt",
+            content_type="text/plain",
+            size_bytes=10,
+            sha256="0" * 64,
+            category="other",
+            description="",
+            uploaded_by=None,
+        )
+        self.db.complete_cooperation_case(first["id"])
+        second = self.db.create_cooperation_case("xhs", "u1")
+
+        result = self.db.delete_cooperation_case(first["id"])
+        self.assertEqual(result["seq"], 1)
+        self.assertEqual(result["impact"]["works"], 1)
+        self.assertEqual(result["impact"]["attachments"], 1)
+        self.assertEqual(
+            result["storage_keys"], ["cooperation_attachments/1/quote.txt"]
+        )
+        self.assertEqual(
+            [item["id"] for item in self.db.cooperation_cases("xhs", "u1")],
+            [second["case_id"]],
+        )
+        creator = self.db.get_creator("xhs", "u1")
+        self.assertEqual(creator["cooperation_count"], 1)
+        self.assertEqual(creator["cooperation_case_id"], second["case_id"])
+        for table in (
+            "cooperation_events",
+            "cooperation_works",
+            "cooperation_attachments",
+        ):
+            remaining = self.db._conn.execute(
+                f"SELECT COUNT(*) AS n FROM {table} WHERE case_id = ?",
+                (first["id"],),
+            ).fetchone()["n"]
+            self.assertEqual(remaining, 0)
+
+        self.db.delete_cooperation_case(second["case_id"])
+        creator = self.db.get_creator("xhs", "u1")
+        self.assertFalse(creator["cooperation_status"])
+        self.assertEqual(creator["cooperation_count"], 0)
+        self.assertIsNone(creator["cooperation_case_id"])
+        self.assertTrue(creator["cooperation_reset_at"])
+        self.assertEqual(self.db.cooperation_cases("xhs", "u1"), [])
+        with self.assertRaises(ValueError):
+            self.db.delete_cooperation_case(first["id"])
+
+        # Re-saving adoption must not silently re-enroll a deleted cooperation.
+        self.db.update_review(round_id, "xhs", "u1", status="pending")
+        self.db.update_review(round_id, "xhs", "u1", status="adopted")
+        self.assertEqual(self.db.cooperation_cases("xhs", "u1"), [])
+        creator = self.db.get_creator("xhs", "u1")
+        self.assertFalse(creator["cooperation_status"])
+        self.assertEqual(creator["cooperation_count"], 0)
+
+        # Explicitly starting cooperation clears the reset marker.
+        self.db.create_cooperation_case("xhs", "u1")
+        cases = self.db.cooperation_cases("xhs", "u1")
+        self.assertEqual(len(cases), 1)
+        self.assertEqual(cases[0]["seq"], 1)
+        creator = self.db.get_creator("xhs", "u1")
+        self.assertEqual(creator["cooperation_status"], "not_contacted")
+        self.assertEqual(creator["cooperation_count"], 1)
+        self.assertIsNone(creator["cooperation_reset_at"])
 
     def test_explicit_status_wins_over_auto_enroll(self) -> None:
         round_id = self._seed_round()
@@ -958,6 +1151,68 @@ class DatabaseTests(unittest.TestCase):
             cases[0]["completed_at"], "2026-01-05T00:00:00.000+00:00"
         )
 
+    def test_import_cooperation_after_terminal_creates_new_case(self) -> None:
+        round_id = self._seed_round()
+        self.db.update_review(round_id, "xhs", "u1", status="adopted")
+        self.db.update_cooperation("xhs", "u1", "completed")
+        new_round = self.db.create_round(["咖啡"], name="IMPORT-RERUN")
+        self.db.import_creator_rows(
+            new_round,
+            [
+                {
+                    "cooperation_status": "cooperating",
+                    "cooperation_updated_at": "2026-02-01T00:00:00+00:00",
+                    "creator": {
+                        "platform": "xhs",
+                        "user_id": "u1",
+                        "nickname": "咖啡师",
+                    },
+                    "note": None,
+                    "round": {
+                        "platform": "xhs",
+                        "user_id": "u1",
+                        "status": "adopted",
+                        "account_id": "u1",
+                    },
+                }
+            ],
+        )
+        cases = self.db.cooperation_cases("xhs", "u1")
+        self.assertEqual(len(cases), 2)
+        self.assertEqual(cases[0]["status"], "cooperating")
+        self.assertEqual(cases[0]["started_at"], "2026-02-01T00:00:00.000+00:00")
+        self.assertEqual(
+            self.db.get_creator("xhs", "u1")["cooperation_status"], "cooperating"
+        )
+        self.assertEqual(self.db.last_import_warnings, [])
+
+    def test_import_cooperation_warns_when_not_adopted(self) -> None:
+        round_id = self.db.create_round(["咖啡"], name="IMPORT-WARN")
+        self.db.import_creator_rows(
+            round_id,
+            [
+                {
+                    "cooperation_status": "contacted",
+                    "creator": {
+                        "platform": "xhs",
+                        "user_id": "u-warn",
+                        "nickname": "未采用达人",
+                    },
+                    "note": None,
+                    "round": {
+                        "platform": "xhs",
+                        "user_id": "u-warn",
+                        "status": "shortlisted",
+                        "account_id": "u-warn",
+                    },
+                }
+            ],
+        )
+        self.assertEqual(self.db.cooperation_cases("xhs", "u-warn"), [])
+        self.assertTrue(
+            any("未采用" in item for item in self.db.last_import_warnings)
+        )
+
     def test_enrichment_status_partial_and_complete(self) -> None:
         round_id = self._seed_round()
         partial = normalize_user_info({"code": 0, "data": {"userid": "u-partial"}})
@@ -975,6 +1230,31 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(result["total"], 0)
         self.assertTrue(self.db.creator_is_fresh("xhs", "u-partial", 30))
         self.assertEqual(self.db.dashboard_breakdown(None)["metrics"]["enriched"], 2)
+
+    def test_bulk_combined_adoption_and_cooperation_is_atomic(self) -> None:
+        round_id = self._seed_round()
+        result = self.db.bulk_update_review(
+            round_id,
+            [{
+                "platform": "xhs",
+                "user_id": "u1",
+                "expected_status": "pending",
+                "expected_cooperation_status": "",
+            }],
+            status="adopted",
+            cooperation_status="contacted",
+        )
+        self.assertEqual(result["changed"], 1)
+        self.assertEqual(result["conflicts"], [])
+        row = next(
+            item for item in self.db.creator_table(round_id) if item["user_id"] == "u1"
+        )
+        self.assertEqual(row["status"], "adopted")
+        creator = self.db.get_creator("xhs", "u1")
+        self.assertEqual(creator["cooperation_status"], "contacted")
+        cases = self.db.cooperation_cases("xhs", "u1")
+        self.assertEqual(len(cases), 1)
+        self.assertEqual(cases[0]["status"], "contacted")
 
     def test_bulk_update_returns_version_conflicts(self) -> None:
         round_id = self._seed_round()
@@ -1023,6 +1303,41 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(
             self.db.get_creator("xhs", "u1")["cooperation_status"], "contacted"
         )
+
+    def test_schema_v14_without_snapshot_columns_migrates(self) -> None:
+        self.db.close()
+        path = Path(self.tmp.name) / "legacy-v14"
+        path.mkdir()
+        legacy = sqlite3.connect(path / "codata.sqlite")
+        legacy.executescript(
+            SCHEMA.replace("    latest_run_id INTEGER,\n", "")
+            .replace("    last_run_id INTEGER,\n", "")
+            .replace("    cooperation_reset_at TEXT,\n", "")
+            .replace("    created_at TEXT,\n    updated_at TEXT NOT NULL,", "    updated_at TEXT NOT NULL,")
+        )
+        legacy.execute("PRAGMA user_version = 14")
+        legacy.execute(
+            "INSERT INTO rounds (id, name, status, created_at) "
+            "VALUES (1, 'OLD-V14', 'done', '2026-01-01')"
+        )
+        legacy.commit()
+        legacy.close()
+
+        self.db = Database(path)
+
+        self.assertEqual(
+            self.db._conn.execute("PRAGMA user_version").fetchone()[0],
+            SCHEMA_VERSION,
+        )
+        self.assertIn(
+            "latest_run_id",
+            {row["name"] for row in self.db._conn.execute("PRAGMA table_info(rounds)")},
+        )
+        self.assertIn(
+            "last_run_id",
+            {row["name"] for row in self.db._conn.execute("PRAGMA table_info(note_hits)")},
+        )
+        self.assertEqual(self.db.get_round(1)["name"], "OLD-V14")
 
     def test_schema_v8_migrates_to_cooperation(self) -> None:
         self.db.close()
@@ -1117,6 +1432,38 @@ class DatabaseTests(unittest.TestCase):
         self.assertNotIn("adoption_updated_at", columns)
         self.assertEqual(self.db._conn.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
 
+    def test_schema_v20_migrates_legacy_weekdays(self) -> None:
+        self.db.close()
+        path = Path(self.tmp.name) / "legacy-v20"
+        path.mkdir()
+        legacy = sqlite3.connect(path / "codata.sqlite")
+        legacy.executescript(SCHEMA)
+        legacy.execute("PRAGMA user_version = 20")
+        legacy.execute(
+            "INSERT INTO email_campaigns "
+            "(id, account_id, weekdays, created_at, updated_at) "
+            "VALUES (1, 1, '[0,1,2,3,4,5,6]', '2026-01-01', '2026-01-01')"
+        )
+        legacy.execute(
+            "INSERT INTO email_campaigns "
+            "(id, account_id, weekdays, created_at, updated_at) "
+            "VALUES (2, 1, '[1,2,3,4,5]', '2026-01-01', '2026-01-01')"
+        )
+        legacy.commit()
+        legacy.close()
+
+        self.db = Database(path)
+
+        rows = self.db._conn.execute(
+            "SELECT id, weekdays FROM email_campaigns ORDER BY id"
+        ).fetchall()
+        self.assertEqual(json.loads(rows[0]["weekdays"]), [1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual(json.loads(rows[1]["weekdays"]), [1, 2, 3, 4, 5])
+        self.assertEqual(
+            self.db._conn.execute("PRAGMA user_version").fetchone()[0],
+            SCHEMA_VERSION,
+        )
+
     def test_failed_api_call_records_estimated_cost(self) -> None:
         round_id = self._seed_round()
         job_id = self.db.claim_job(round_id)
@@ -1158,6 +1505,49 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(
             self.db.get_creator("xhs", "created-full")["created_at"],
             full["created_at"],
+        )
+
+    def test_creator_notes_follow_latest_run_and_preserve_kept_creator(self) -> None:
+        round_id = self.db.create_round(["快照"], name="NOTE-SNAPSHOT")
+        self.db.upsert_creator({"platform": "xhs", "user_id": "snapshot-user"})
+        self.db.add_creator_round(round_id, "xhs", "snapshot-user")
+        for note_id, run_id in (("snapshot-n1", 1), ("snapshot-n2", 2)):
+            self.db.upsert_note(make_note(note_id, "snapshot-user", 10))
+            self.db.add_note_hit(
+                round_id, "xhs", note_id, "快照", 1, 1, run_id=run_id
+            )
+        self.db.update_round(round_id, latest_run_id=2)
+        self.assertEqual(
+            [item["note_id"] for item in self.db.creator_notes(round_id, "xhs", "snapshot-user")],
+            ["snapshot-n2"],
+        )
+        self.db.update_round(round_id, latest_run_id=3)
+        self.assertEqual(
+            {item["note_id"] for item in self.db.creator_notes(round_id, "xhs", "snapshot-user")},
+            {"snapshot-n1", "snapshot-n2"},
+        )
+
+    def test_round_activity_uses_creator_round_added_at(self) -> None:
+        round_id = self.db.create_round(["日历"], name="ROUND-ADDED-AT")
+        self.db.upsert_creator({"platform": "xhs", "user_id": "existing-creator"})
+        self.db._conn.execute(
+            "UPDATE creators SET created_at = '2000-01-01T00:00:00+00:00' "
+            "WHERE platform = 'xhs' AND user_id = 'existing-creator'"
+        )
+        self.db.add_creator_round(round_id, "xhs", "existing-creator")
+        added_at = self.db._conn.execute(
+            "SELECT created_at FROM creator_rounds WHERE round_id = ? AND user_id = 'existing-creator'",
+            (round_id,),
+        ).fetchone()["created_at"]
+        result = self.db.activity_calendar(days=30, tz_offset=0, round_id=round_id)
+        self.assertEqual(result["totals"]["collected"], 1)
+        self.db.update_review(round_id, "xhs", "existing-creator", status="shortlisted")
+        self.assertEqual(
+            self.db._conn.execute(
+                "SELECT created_at FROM creator_rounds WHERE round_id = ? AND user_id = 'existing-creator'",
+                (round_id,),
+            ).fetchone()["created_at"],
+            added_at,
         )
 
     def test_activity_calendar_counts_creators_and_review_actions(self) -> None:

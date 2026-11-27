@@ -27,7 +27,7 @@ from codata.platforms import (
     validate_provider_host,
 )
 from codata.pipeline import Pipeline
-from codata.providers import BalanceResponse, RnoteProvider, SearchResponse
+from codata.providers import BalanceResponse, RnoteProvider, SearchResponse, build_provider
 from codata.providers_multi import EveryInfraProvider, _has_more
 from helpers import search_item, user_payload
 
@@ -218,6 +218,22 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(creator["avatar"], "https://example.com/avatar.jpg")
         self.assertEqual(creator["ip_location"], "上海")
 
+    def test_profile_normalizers_prefer_upstream_identity(self) -> None:
+        rnote = normalize_rnote_user(
+            {"data": {"result": {"user_id": "upstream"}}}, "requested"
+        )
+        self.assertEqual(rnote["user_id"], "upstream")
+        cases = (
+            ("xhs", {"data": {"user_id": "upstream"}}, "upstream"),
+            ("douyin", {"data": {"sec_uid": "upstream-sec"}}, "upstream-sec"),
+            ("bilibili", {"data": {"mid": 123456}}, "123456"),
+            ("zhihu", {"data": {"author_id": "upstream"}}, "upstream"),
+        )
+        for platform, payload, expected in cases:
+            with self.subTest(platform=platform):
+                creator = normalize_user_platform(platform, payload, "requested")
+                self.assertEqual(creator["user_id"], expected)
+
     def test_pipeline_falls_back_before_round_start(self) -> None:
         class FakeProvider:
             def __init__(self, provider_id: str, fail_balance: bool = False) -> None:
@@ -355,6 +371,75 @@ class ProviderTests(unittest.TestCase):
             self.assertEqual(seen[0]["action"], "search")
         finally:
             provider.close()
+
+    def test_multi_provider_request_contracts(self) -> None:
+        settings = Settings(host="", token="", output_dir=Path("data"))
+        credentials = {
+            "TIKHUB_API_KEY": "tikhub-key",
+            "JUSTONEAPI_TOKEN": "justone-key",
+            "SOCIALDATAX_API_KEY": "social-key",
+            "REDFOX_API_KEY": "redfox-key",
+            "CODATA_PROVIDER_DELAY": "0",
+        }
+        cases = {
+            "tikhub": (200, "GET", "user_id"),
+            "justoneapi": (0, "GET", "userId"),
+            "socialdatax": (None, "POST", "user_id"),
+            "redfox": (2000, "POST", "accountId"),
+        }
+        with patch.dict(os.environ, credentials):
+            registry = load_registry(settings)
+            for provider_id, (success_code, method, user_key) in cases.items():
+                with self.subTest(provider=provider_id):
+                    option = registry.platforms["xhs"].providers[provider_id]
+                    provider = build_provider(settings, option, "xhs")
+                    requests: list[httpx.Request] = []
+
+                    def handler(request: httpx.Request, option=option, success_code=success_code):
+                        requests.append(request)
+                        envelope = {} if success_code is None else {"code": success_code}
+                        if request.url.path == option.search.path:
+                            envelope["data"] = {"items": [{
+                                "note_id": "n-contract",
+                                "title": "契约测试",
+                                "user_id": "u-contract",
+                                "nickname": "达人",
+                            }]}
+                        else:
+                            envelope["data"] = {
+                                "user_id": "u-contract",
+                                "nickname": "达人",
+                                "fans": 100,
+                            }
+                        if provider_id == "socialdatax":
+                            envelope["success"] = True
+                        return httpx.Response(200, json=envelope)
+
+                    provider.client._client.close()
+                    provider.client._client = httpx.Client(
+                        base_url=option.provider.base_url,
+                        transport=httpx.MockTransport(handler),
+                    )
+                    try:
+                        result = provider.search("咖啡", 1, {})
+                        self.assertEqual(result.items[0]["note_id"], "n-contract")
+                        provider.user("u-contract")
+                        self.assertEqual(str(requests[0].method), method)
+                        self.assertEqual(requests[0].url.path, option.search.path)
+                        self.assertEqual(requests[1].url.path, option.user.path)
+                        if method == "GET":
+                            self.assertEqual(
+                                requests[1].url.params.get(user_key), "u-contract"
+                            )
+                        else:
+                            body = __import__("json").loads(requests[1].content)
+                            self.assertEqual(body[user_key], "u-contract")
+                        if provider_id == "justoneapi":
+                            self.assertEqual(
+                                requests[0].url.params.get("token"), "justone-key"
+                            )
+                    finally:
+                        provider.close()
 
     def test_everyinfra_platform_actions(self) -> None:
         settings = Settings(host="", token="", output_dir=Path("data"))

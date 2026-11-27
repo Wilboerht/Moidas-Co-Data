@@ -86,14 +86,22 @@ def _insert_lead(
         profile_url or primary.get("creator_profile_url") or "",
     )
     converted = bool(account_id)
+    identity_status = "verified" if converted else "unverified"
+    identity_confidence = "conversion" if converted else ""
+    identity_provider = "migration" if converted else ""
+    identity_checked_at = now if converted else None
+    identity_note = "导入身份迁移" if converted else ""
     lead_id = int(
         db._conn.execute(
             """
             INSERT INTO leads
             (platform, nickname, account_id, profile_url, raw_title, source,
              source_round_id, owner_user_id, status, legacy_user_id, raw_json,
-             created_by, created_at, updated_at, converted_platform, converted_user_id, converted_at)
-            VALUES (?, ?, ?, ?, ?, 'excel_import', ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+             created_by, created_at, updated_at, identity_status, identity_confidence,
+             identity_provider, identity_checked_at, identity_note,
+             converted_platform, converted_user_id, converted_at)
+            VALUES (?, ?, ?, ?, ?, 'excel_import', ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?)
             """,
             (
                 platform,
@@ -108,6 +116,11 @@ def _insert_lead(
                 primary.get("creator_raw_json") or "{}",
                 now,
                 now,
+                identity_status,
+                identity_confidence,
+                identity_provider,
+                identity_checked_at,
+                identity_note,
                 platform if converted else None,
                 account_id if converted else None,
                 now if converted else None,
@@ -169,6 +182,14 @@ def _merge_resolved_rows(
         "SELECT 1 FROM creators WHERE platform = ? AND user_id = ?",
         (platform, account_id),
     ).fetchone()
+    legacy_case_count = int(
+        db._conn.execute(
+            "SELECT COUNT(*) AS n FROM cooperation_cases "
+            "WHERE platform = ? AND user_id = ?",
+            (platform, legacy_user_id),
+        ).fetchone()["n"]
+        or 0
+    )
     legacy_leads = db._conn.execute(
         "SELECT id, owner_user_id, status FROM leads WHERE platform = ? AND account_id = ?",
         (platform, legacy_user_id),
@@ -210,6 +231,25 @@ def _merge_resolved_rows(
         "UPDATE notes SET author_id = ? WHERE platform = ? AND author_id = ?",
         (account_id, platform, legacy_user_id),
     )
+    if existing and legacy_case_count:
+        real_open = db._open_cooperation_case_locked(platform, account_id)
+        legacy_open = db._open_cooperation_case_locked(platform, legacy_user_id)
+        if real_open and legacy_open:
+            legacy_case_count = -1
+        else:
+            offset_row = db._conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS n FROM cooperation_cases "
+                "WHERE platform = ? AND user_id = ?",
+                (platform, account_id),
+            ).fetchone()
+            offset = int(offset_row["n"] or 0)
+            db._conn.execute(
+                "UPDATE cooperation_cases SET user_id = ?, seq = seq + ? "
+                "WHERE platform = ? AND user_id = ?",
+                (account_id, offset, platform, legacy_user_id),
+            )
+            db._sync_cooperation_summary_locked(platform, account_id)
+            legacy_case_count = 0
     for row in rows:
         round_id = row.get("round_id")
         if round_id is None:
@@ -266,6 +306,11 @@ def _merge_resolved_rows(
                 (account_id, account_id, platform, legacy_user_id),
             )
             db._conn.execute(
+                "UPDATE cooperation_cases SET user_id = ? "
+                "WHERE platform = ? AND user_id = ?",
+                (account_id, platform, legacy_user_id),
+            )
+            db._conn.execute(
                 "UPDATE creator_rounds SET user_id = ?, account_id = ? "
                 "WHERE round_id = ? AND platform = ? AND user_id = ?",
                 (account_id, account_id, round_id, platform, legacy_user_id),
@@ -277,7 +322,9 @@ def _merge_resolved_rows(
     db._conn.execute(
         "DELETE FROM creators WHERE platform = ? AND user_id = ? "
         "AND NOT EXISTS (SELECT 1 FROM creator_rounds cr WHERE cr.platform = creators.platform "
-        "AND cr.user_id = creators.user_id)",
+        "AND cr.user_id = creators.user_id) "
+        "AND NOT EXISTS (SELECT 1 FROM cooperation_cases cc "
+        "WHERE cc.platform = creators.platform AND cc.user_id = creators.user_id)",
         (platform, legacy_user_id),
     )
 

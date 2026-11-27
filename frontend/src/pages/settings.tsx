@@ -854,7 +854,7 @@ export function SettingsPage() {
             <DialogHeader>
               <DialogTitle>设置 {providerTokenTarget?.label ?? "服务商"} 访问令牌</DialogTitle>
               <DialogDescription>
-                令牌保存到 .env；新服务商暂不做在线余额验证，保存后可在新建采集里使用。
+                支持余额查询的服务商会先在线校验凭据；不支持余额查询的服务商保存后可在采集中使用。
               </DialogDescription>
             </DialogHeader>
             <div className="space-y-2">

@@ -188,8 +188,13 @@ def resolve_lead_identity(
     profile_id = (
         normalize_account_id(platform, requested_profile) if requested_profile else ""
     )
-    if profile_id and (platform != "xhs" or is_probable_user_id(platform, profile_id)):
-        candidate = profile_id
+    profile_candidate = (
+        profile_id
+        if profile_id and (platform != "xhs" or is_probable_user_id(platform, profile_id))
+        else ""
+    )
+    if profile_candidate:
+        candidate = profile_candidate
     else:
         candidate = requested_user_id or requested_handle
         if not candidate and requested_profile:
@@ -233,10 +238,16 @@ def resolve_lead_identity(
     total_native = 0.0
     total_estimated = 0
     total_attempts = 0
+    total_currency = "token"
     search_matched_handle = ""
     search_nickname = ""
     try:
-        kind = _candidate_kind(platform, candidate)
+        kind = (
+            "user_id"
+            if (profile_candidate and candidate == profile_candidate)
+            or (requested_user_id and candidate == requested_user_id)
+            else _candidate_kind(platform, candidate)
+        )
         if kind == "handle":
             if platform != "xhs":
                 result.update(
@@ -258,6 +269,7 @@ def resolve_lead_identity(
             total_native += float(search_cost.get("native") or 0)
             total_estimated += int(search_cost.get("estimated_tokens") or 0)
             total_attempts += int(search_cost.get("attempts") or 0)
+            total_currency = str(search_cost.get("currency") or total_currency)
             result["search_cost"] = int(search_cost.get("tokens") or 0)
             result["resolution"] = "search"
             if not resolved:
@@ -268,6 +280,7 @@ def resolve_lead_identity(
                     error=search_error,
                     cost=total_cost,
                     cost_native=total_native,
+                    cost_currency=total_currency,
                     estimated_cost=total_estimated,
                     attempts=total_attempts,
                 )
@@ -281,6 +294,7 @@ def resolve_lead_identity(
                     note="搜索结果缺少平台用户 ID",
                     cost=total_cost,
                     cost_native=total_native,
+                    cost_currency=total_currency,
                     estimated_cost=total_estimated,
                     attempts=total_attempts,
                 )
@@ -301,8 +315,9 @@ def resolve_lead_identity(
             total_estimated += estimated["tokens"]
             total_attempts += estimated["attempts"]
             result.update(
-                cost=0,
-                cost_native=0.0,
+                cost=total_cost,
+                cost_native=total_native,
+                cost_currency=total_currency if total_cost or total_native else estimated["currency"],
                 estimated_cost=total_estimated,
                 attempts=total_attempts,
                 error=str(exc)[:1000],
@@ -419,9 +434,7 @@ def record_identity_attempt(
     attempt_status: str | None = None,
 ) -> None:
     status = result.get("status") or ""
-    resolved_status = attempt_status or (
-        "matched" if applied and status == "verified" else "suggested"
-    )
+    resolved_status = attempt_status or ("matched" if applied else "suggested")
     if attempt_status is None and status == "error":
         resolved_status = "error"
     elif attempt_status is None and status == "not_found":
@@ -510,7 +523,7 @@ def verify_lead_identity(
         db,
         lead,
         result,
-        applied=applied and result["status"] == "verified",
+        applied=applied,
         actor_id=actor_id,
     )
     if apply and not applied and result["status"] in {"mismatch", "not_found", "error"}:

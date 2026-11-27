@@ -79,6 +79,9 @@ class Settings:
     usd_cny: float = 7.2
     token_cny: float = 0.001
     provider_trust_env: bool = False
+    email_cooldown_days: int = 30
+    email_creator_cooldown_days: int = 90
+    public_url: str = ""
 
 
 def load_settings(require_credentials: bool = True) -> Settings:
@@ -177,4 +180,11 @@ def load_settings(require_credentials: bool = True) -> Settings:
         usd_cny=float(os.getenv("CODATA_USD_CNY", "7.2")),
         token_cny=float(os.getenv("CODATA_TOKEN_CNY", "0.001")),
         provider_trust_env=_env_bool("CODATA_PROVIDER_TRUST_ENV", False),
+        email_cooldown_days=max(
+            0, int(os.getenv("CODATA_EMAIL_COOLDOWN_DAYS", "30") or 30)
+        ),
+        email_creator_cooldown_days=max(
+            0, int(os.getenv("CODATA_EMAIL_CREATOR_COOLDOWN_DAYS", "90") or 90)
+        ),
+        public_url=os.getenv("CODATA_PUBLIC_URL", "").strip().rstrip("/"),
     )

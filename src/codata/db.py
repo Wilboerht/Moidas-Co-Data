@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import re
+import secrets
 import shutil
 import sqlite3
 import threading
@@ -31,14 +34,42 @@ from .lead_statuses import (
     normalize_lead_status,
 )
 from .normalize import TIER_LABELS, derive_tags, normalize_tier_label, utc_now
+from .processes import pid_alive, process_matches
 from .statuses import DEFAULT_STATUS, normalize_status
+
+
+
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+EMAIL_SECURITY_MODES = {"ssl", "starttls", "none"}
+EMAIL_ACCOUNT_SCOPES = {"personal", "shared"}
+
+
+def _cooldown_until(value: Any, days: int) -> datetime | None:
+    if not value or days <= 0:
+        return None
+    try:
+        stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return datetime.fromtimestamp(
+        stamp.timestamp() + days * 86400, tz=timezone.utc
+    )
+
+
+def normalize_email_address(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text or not EMAIL_PATTERN.match(text):
+        raise ValueError("邮箱格式不正确")
+    return text
 
 
 class JobBusyError(RuntimeError):
     """A round already has a pending or running job."""
 
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 21
 
 LEAD_IDENTITY_STATUSES = {"unverified", "verified", "mismatch", "not_found"}
 
@@ -58,6 +89,7 @@ CREATE TABLE IF NOT EXISTS rounds (
     cost_tokens INTEGER NOT NULL DEFAULT 0,
     error TEXT,
     archived_at TEXT,
+    latest_run_id INTEGER,
     created_at TEXT NOT NULL
 );
 
@@ -103,6 +135,7 @@ CREATE TABLE IF NOT EXISTS note_hits (
     keyword TEXT NOT NULL,
     page INTEGER,
     rank INTEGER,
+    last_run_id INTEGER,
     PRIMARY KEY (round_id, platform, note_id, keyword)
 );
 
@@ -133,6 +166,7 @@ CREATE TABLE IF NOT EXISTS creators (
     cooperation_count INTEGER NOT NULL DEFAULT 0,
     cooperation_last_completed_at TEXT,
     cooperation_case_id INTEGER,
+    cooperation_reset_at TEXT,
     PRIMARY KEY (platform, user_id)
 );
 
@@ -160,6 +194,7 @@ CREATE TABLE IF NOT EXISTS creator_rounds (
     claimed_at TEXT,
     cooperation_platform TEXT,
     raw_title TEXT,
+    created_at TEXT,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (round_id, platform, user_id)
 );
@@ -405,6 +440,7 @@ CREATE TABLE IF NOT EXISTS users (
     disabled INTEGER NOT NULL DEFAULT 0,
     can_collect INTEGER NOT NULL DEFAULT 0,
     can_edit_leads INTEGER NOT NULL DEFAULT 0,
+    can_send_email INTEGER NOT NULL DEFAULT 0,
     must_change_password INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -424,6 +460,164 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions (user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions (expires_at);
+
+
+CREATE TABLE IF NOT EXISTS email_accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope TEXT NOT NULL DEFAULT 'personal',
+    owner_user_id INTEGER,
+    label TEXT NOT NULL DEFAULT '',
+    from_name TEXT NOT NULL DEFAULT '',
+    from_email TEXT NOT NULL,
+    reply_to TEXT NOT NULL DEFAULT '',
+    host TEXT NOT NULL,
+    port INTEGER NOT NULL,
+    security TEXT NOT NULL DEFAULT 'starttls',
+    username TEXT NOT NULL,
+    password_encrypted TEXT NOT NULL,
+    key_fingerprint TEXT NOT NULL DEFAULT '',
+    daily_limit INTEGER NOT NULL DEFAULT 20,
+    min_interval_seconds INTEGER NOT NULL DEFAULT 60,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_test_at TEXT,
+    last_test_error TEXT,
+    auth_failed_at TEXT,
+    auth_error TEXT NOT NULL DEFAULT '',
+    created_by INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_accounts_owner ON email_accounts (owner_user_id);
+CREATE INDEX IF NOT EXISTS idx_email_accounts_scope ON email_accounts (scope, enabled);
+
+CREATE TABLE IF NOT EXISTS creator_emails (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    email TEXT NOT NULL,
+    email_normalized TEXT NOT NULL,
+    label TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'manual',
+    is_primary INTEGER NOT NULL DEFAULT 0,
+    last_sent_at TEXT,
+    created_by INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (platform, user_id, email_normalized)
+);
+
+CREATE INDEX IF NOT EXISTS idx_creator_emails_creator
+ON creator_emails (platform, user_id);
+CREATE INDEX IF NOT EXISTS idx_creator_emails_email
+ON creator_emails (email_normalized);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_creator_emails_primary
+ON creator_emails (platform, user_id) WHERE is_primary = 1;
+
+
+CREATE TABLE IF NOT EXISTS email_campaigns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL DEFAULT '',
+    account_id INTEGER NOT NULL,
+    subject TEXT NOT NULL DEFAULT '',
+    body TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'draft',
+    scheduled_start TEXT,
+    timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai',
+    window_start TEXT NOT NULL DEFAULT '09:00',
+    window_end TEXT NOT NULL DEFAULT '18:00',
+    weekdays TEXT NOT NULL DEFAULT '[1,2,3,4,5]',
+    interval_seconds INTEGER NOT NULL DEFAULT 60,
+    jitter_seconds INTEGER NOT NULL DEFAULT 30,
+    daily_limit INTEGER NOT NULL DEFAULT 20,
+    auto_mark_contacted INTEGER NOT NULL DEFAULT 1,
+    created_by INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    paused_reason TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_campaigns_status
+ON email_campaigns (status, scheduled_start);
+CREATE INDEX IF NOT EXISTS idx_email_campaigns_creator
+ON email_campaigns (created_by, id);
+
+CREATE TABLE IF NOT EXISTS email_recipients (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id INTEGER NOT NULL,
+    creator_platform TEXT NOT NULL,
+    creator_user_id TEXT NOT NULL,
+    creator_nickname TEXT NOT NULL DEFAULT '',
+    email TEXT NOT NULL,
+    email_normalized TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    manual_retries INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT,
+    last_attempt_at TEXT,
+    claimed_at TEXT,
+    sent_at TEXT,
+    sent_date TEXT,
+    message_id TEXT NOT NULL DEFAULT '',
+    error_code TEXT NOT NULL DEFAULT '',
+    error_message TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (campaign_id, creator_platform, creator_user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_recipients_campaign
+ON email_recipients (campaign_id, status, id);
+CREATE INDEX IF NOT EXISTS idx_email_recipients_due
+ON email_recipients (status, next_attempt_at);
+
+CREATE TABLE IF NOT EXISTS email_suppressions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL,
+    email_normalized TEXT NOT NULL UNIQUE,
+    reason TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'manual',
+    created_by INTEGER,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_suppressions_email
+ON email_suppressions (email_normalized);
+
+
+CREATE TABLE IF NOT EXISTS email_worker_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    owner TEXT NOT NULL DEFAULT '',
+    heartbeat_at TEXT,
+    last_tick_at TEXT,
+    last_error TEXT NOT NULL DEFAULT ''
+);
+
+
+
+CREATE INDEX IF NOT EXISTS idx_email_recipients_email_sent
+ON email_recipients (email_normalized, status, sent_at);
+CREATE INDEX IF NOT EXISTS idx_email_recipients_creator_sent
+ON email_recipients (creator_platform, creator_user_id, status, sent_at);
+
+CREATE TABLE IF NOT EXISTS email_unsubscribe_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_hash TEXT NOT NULL UNIQUE,
+    email TEXT NOT NULL,
+    email_normalized TEXT NOT NULL,
+    creator_platform TEXT NOT NULL DEFAULT '',
+    creator_user_id TEXT NOT NULL DEFAULT '',
+    campaign_id INTEGER,
+    recipient_id INTEGER,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    used_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_unsubscribe_email
+ON email_unsubscribe_tokens (email_normalized, expires_at);
 
 CREATE TABLE IF NOT EXISTS backfill_attempts (
     platform TEXT NOT NULL,
@@ -622,6 +816,7 @@ ROUND_FIELDS = {
     "finished_at",
     "cost_tokens",
     "error",
+    "latest_run_id",
 }
 JOB_FIELDS = {
     "status",
@@ -647,6 +842,7 @@ _SCHEMA_READY: dict[str, tuple[bool, bool]] = {}
 class Database:
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
+        self.last_import_warnings: list[str] = []
         self.root.mkdir(parents=True, exist_ok=True)
         self.raw_dir = self.root / "raw"
         self.raw_dir.mkdir(parents=True, exist_ok=True)
@@ -703,6 +899,13 @@ class Database:
         self._rebuild_creator_sources()
         self._migrate_cooperation_cases_v13(current)
         self._migrate_lead_identity_v14(current)
+        self._migrate_cooperation_v15(current)
+        self._migrate_snapshot_v16(current)
+        self._migrate_email_v18(current)
+        self._migrate_email_v19(current)
+        self._migrate_email_v20(current)
+        self._migrate_email_v21(current)
+        self._ensure_creator_round_added_at()
         self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self._conn.commit()
 
@@ -722,6 +925,10 @@ class Database:
                 )
                 self._conn.execute(
                     "UPDATE users SET can_edit_leads = 1 WHERE can_collect = 1"
+                )
+            if "can_send_email" not in user_columns:
+                self._conn.execute(
+                    "ALTER TABLE users ADD COLUMN can_send_email INTEGER NOT NULL DEFAULT 0"
                 )
             if "must_change_password" not in user_columns:
                 self._conn.execute(
@@ -744,12 +951,54 @@ class Database:
                 self._conn.execute(
                     "ALTER TABLE creators ADD COLUMN cooperation_case_id INTEGER"
                 )
+            if "cooperation_reset_at" not in creator_columns:
+                self._conn.execute(
+                    "ALTER TABLE creators ADD COLUMN cooperation_reset_at TEXT"
+                )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_creators_cooperation_count "
                 "ON creators (cooperation_count)"
             )
+            round_columns = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(rounds)").fetchall()
+            }
+            if "latest_run_id" not in round_columns:
+                self._conn.execute(
+                    "ALTER TABLE rounds ADD COLUMN latest_run_id INTEGER"
+                )
+            hit_columns = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(note_hits)").fetchall()
+            }
+            if "last_run_id" not in hit_columns:
+                self._conn.execute(
+                    "ALTER TABLE note_hits ADD COLUMN last_run_id INTEGER"
+                )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_note_hits_run "
+                "ON note_hits (round_id, last_run_id)"
+            )
             self._ensure_lead_identity_columns()
+        self._ensure_creator_round_added_at()
         self.try_create_lead_unique_indexes()
+
+    def _ensure_creator_round_added_at(self) -> None:
+        with self._conn:
+            columns = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(creator_rounds)").fetchall()
+            }
+            if "created_at" not in columns:
+                self._conn.execute("ALTER TABLE creator_rounds ADD COLUMN created_at TEXT")
+            self._conn.execute(
+                "UPDATE creator_rounds SET created_at = updated_at "
+                "WHERE created_at IS NULL OR created_at = ''"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_creator_rounds_added "
+                "ON creator_rounds (round_id, created_at)"
+            )
 
     def _ensure_lead_identity_columns(self) -> None:
         columns = {
@@ -843,6 +1092,159 @@ class Database:
                     updates,
                 )
         self.try_create_lead_unique_indexes()
+
+    def _migrate_cooperation_v15(self, current: int) -> None:
+        if current >= 15:
+            return
+        with self._conn:
+            columns = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(creators)").fetchall()
+            }
+            if "cooperation_reset_at" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE creators ADD COLUMN cooperation_reset_at TEXT"
+                )
+
+    def _migrate_snapshot_v16(self, current: int) -> None:
+        if current >= 16:
+            return
+        with self._conn:
+            round_columns = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(rounds)").fetchall()
+            }
+            if "latest_run_id" not in round_columns:
+                self._conn.execute(
+                    "ALTER TABLE rounds ADD COLUMN latest_run_id INTEGER"
+                )
+            hit_columns = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(note_hits)").fetchall()
+            }
+            if "last_run_id" not in hit_columns:
+                self._conn.execute(
+                    "ALTER TABLE note_hits ADD COLUMN last_run_id INTEGER"
+                )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_note_hits_run "
+                "ON note_hits (round_id, last_run_id)"
+            )
+
+
+    def _migrate_email_v18(self, current: int) -> None:
+        if current >= 18:
+            return
+        with self._conn:
+            user_columns = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(users)").fetchall()
+            }
+            if "can_send_email" not in user_columns:
+                self._conn.execute(
+                    "ALTER TABLE users ADD COLUMN can_send_email INTEGER NOT NULL DEFAULT 0"
+                )
+
+
+    def _migrate_email_v19(self, current: int) -> None:
+        if current >= 19:
+            return
+        with self._conn:
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_email_campaigns_status "
+                "ON email_campaigns (status, scheduled_start)"
+            )
+
+
+    def _migrate_email_v20(self, current: int) -> None:
+        if current >= 20:
+            return
+        with self._conn:
+            account_columns = {
+                row["name"]
+                for row in self._conn.execute(
+                    "PRAGMA table_info(email_accounts)"
+                ).fetchall()
+            }
+            if "auth_failed_at" not in account_columns:
+                self._conn.execute(
+                    "ALTER TABLE email_accounts ADD COLUMN auth_failed_at TEXT"
+                )
+            if "auth_error" not in account_columns:
+                self._conn.execute(
+                    "ALTER TABLE email_accounts ADD COLUMN auth_error TEXT NOT NULL DEFAULT ''"
+                )
+            recipient_columns = {
+                row["name"]
+                for row in self._conn.execute(
+                    "PRAGMA table_info(email_recipients)"
+                ).fetchall()
+            }
+            if "sent_date" not in recipient_columns:
+                self._conn.execute(
+                    "ALTER TABLE email_recipients ADD COLUMN sent_date TEXT"
+                )
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS email_worker_state "
+                "(id INTEGER PRIMARY KEY CHECK (id = 1), owner TEXT NOT NULL DEFAULT '', "
+                "heartbeat_at TEXT)"
+            )
+
+
+    def _migrate_email_v21(self, current: int) -> None:
+        if current >= 21:
+            return
+        with self._conn:
+            account_columns = {
+                row["name"]
+                for row in self._conn.execute(
+                    "PRAGMA table_info(email_accounts)"
+                ).fetchall()
+            }
+            if "min_interval_seconds" not in account_columns:
+                self._conn.execute(
+                    "ALTER TABLE email_accounts ADD COLUMN "
+                    "min_interval_seconds INTEGER NOT NULL DEFAULT 60"
+                )
+            recipient_columns = {
+                row["name"]
+                for row in self._conn.execute(
+                    "PRAGMA table_info(email_recipients)"
+                ).fetchall()
+            }
+            if "manual_retries" not in recipient_columns:
+                self._conn.execute(
+                    "ALTER TABLE email_recipients ADD COLUMN "
+                    "manual_retries INTEGER NOT NULL DEFAULT 0"
+                )
+            worker_columns = {
+                row["name"]
+                for row in self._conn.execute(
+                    "PRAGMA table_info(email_worker_state)"
+                ).fetchall()
+            }
+            if "last_tick_at" not in worker_columns:
+                self._conn.execute(
+                    "ALTER TABLE email_worker_state ADD COLUMN last_tick_at TEXT"
+                )
+            if "last_error" not in worker_columns:
+                self._conn.execute(
+                    "ALTER TABLE email_worker_state ADD COLUMN "
+                    "last_error TEXT NOT NULL DEFAULT ''"
+                )
+            campaigns = self._conn.execute(
+                "SELECT id, weekdays FROM email_campaigns"
+            ).fetchall()
+            for campaign in campaigns:
+                try:
+                    days = [int(day) for day in json.loads(campaign["weekdays"])]
+                except (TypeError, ValueError):
+                    continue
+                if 0 in days and all(0 <= day <= 6 for day in days):
+                    self._conn.execute(
+                        "UPDATE email_campaigns SET weekdays = ? WHERE id = ?",
+                        (json.dumps(sorted({day + 1 for day in days})), campaign["id"]),
+                    )
 
     def _migrate_cooperation_cases_v13(self, current: int) -> None:
         if current >= 13:
@@ -1139,6 +1541,34 @@ class Database:
         if not apply:
             return report
         for path in sorted(stale):
+            try:
+                path.unlink()
+                report["deleted"] += 1
+            except OSError as exc:
+                report["errors"].append(f"{path.name}: {exc}")
+        return report
+
+    def prune_trash(
+        self, retention_days: int = 90, *, apply: bool = True
+    ) -> dict[str, Any]:
+        trash_dir = self.root / "trash"
+        files = (
+            [path for path in trash_dir.rglob("*") if path.is_file()]
+            if trash_dir.exists()
+            else []
+        )
+        cutoff = datetime.now().timestamp() - max(1, retention_days) * 86400
+        stale = [path for path in files if path.stat().st_mtime < cutoff]
+        report: dict[str, Any] = {
+            "files": len(files),
+            "expired": len(stale),
+            "bytes": sum(path.stat().st_size for path in stale),
+            "deleted": 0,
+            "errors": [],
+        }
+        if not apply:
+            return report
+        for path in stale:
             try:
                 path.unlink()
                 report["deleted"] += 1
@@ -1800,7 +2230,9 @@ class Database:
             (round_id,),
         ).fetchone()
         if active:
-            raise ValueError("该轮次仍有运行中的任务，请先取消或等待结束")
+            raise ValueError("该轮次已有任务在运行，请取消或等待结束")
+        if self._round_has_live_job_process(round_id):
+            raise ValueError("上一任务进程仍在退出，请稍后再归档")
         if row.get("archived_at"):
             return row
         with self._conn:
@@ -1873,7 +2305,12 @@ class Database:
         counts["raw_files"] = len(raw_files)
         log_dir = self.root / "logs"
         counts["log_files"] = len(list(log_dir.glob(f"round_{round_id}_*.log")))
-        counts["can_purge"] = counts["jobs_active"] == 0 and counts["leads"] == 0
+        counts["live_process"] = self._round_has_live_job_process(round_id)
+        counts["can_purge"] = (
+            counts["jobs_active"] == 0
+            and counts["leads"] == 0
+            and not counts["live_process"]
+        )
         return counts
 
     def round_keyword_words(self, round_id: int) -> set[str]:
@@ -2114,6 +2551,44 @@ class Database:
             self.rebuild_search_index(round_id)
         return deleted
 
+    def prune_snapshot_creators(self, round_id: int, run_id: int) -> int:
+        current = {
+            (entry["platform"], entry["user_id"])
+            for entry in self.round_author_stats(round_id, run_id=run_id)
+        }
+        rows = self._conn.execute(
+            """
+            SELECT DISTINCT cr.platform, cr.user_id
+            FROM creator_rounds cr
+            LEFT JOIN creators c ON c.platform = cr.platform AND c.user_id = cr.user_id
+            WHERE cr.round_id = ? AND cr.status = 'pending'
+              AND c.follow_up_user_id IS NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM note_hits nh
+                  JOIN notes n ON n.platform = nh.platform AND n.note_id = nh.note_id
+                  WHERE nh.round_id = cr.round_id
+                    AND n.platform = cr.platform AND n.author_id = cr.user_id
+              )
+            """,
+            (round_id,),
+        ).fetchall()
+        stale = [
+            (row["platform"], row["user_id"])
+            for row in rows
+            if (row["platform"], row["user_id"]) not in current
+        ]
+        if not stale:
+            return 0
+        with self._conn:
+            for platform, user_id in stale:
+                self._conn.execute(
+                    "DELETE FROM creator_rounds WHERE round_id = ? AND platform = ? "
+                    "AND user_id = ? AND status = 'pending'",
+                    (round_id, platform, user_id),
+                )
+        return len(stale)
+
     def update_round(self, round_id: int, **fields: Any) -> None:
         updates = {key: value for key, value in fields.items() if key in ROUND_FIELDS}
         if not updates:
@@ -2176,15 +2651,21 @@ class Database:
         keyword: str,
         page: int | None,
         rank: int | None,
+        run_id: int | None = None,
         commit: bool = True,
     ) -> None:
         with self._write(commit):
             self._conn.execute(
                 """
-                INSERT OR IGNORE INTO note_hits (round_id, platform, note_id, keyword, page, rank)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO note_hits
+                (round_id, platform, note_id, keyword, page, rank, last_run_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(round_id, platform, note_id, keyword) DO UPDATE SET
+                    page = COALESCE(excluded.page, note_hits.page),
+                    rank = COALESCE(excluded.rank, note_hits.rank),
+                    last_run_id = COALESCE(excluded.last_run_id, note_hits.last_run_id)
                 """,
-                (round_id, platform, note_id, keyword, page, rank),
+                (round_id, platform, note_id, keyword, page, rank, run_id),
             )
 
     def upsert_creator_basic(
@@ -2452,6 +2933,7 @@ class Database:
         note: str | None = None,
         created_by: int | None = None,
         allow_terminal: bool = False,
+        occurred_at: str | None = None,
     ) -> dict[str, Any]:
         self._ensure_creator_stub(platform, user_id)
         code = normalize_cooperation_status(status, default="")
@@ -2461,13 +2943,18 @@ class Database:
             raise ValueError("新合作必须从未联系、已联系、洽谈中或合作中开始")
         if self._open_cooperation_case_locked(platform, user_id):
             raise ValueError("该达人已有进行中的合作")
+        self._conn.execute(
+            "UPDATE creators SET cooperation_reset_at = NULL "
+            "WHERE platform = ? AND user_id = ?",
+            (platform, user_id),
+        )
         seq_row = self._conn.execute(
             "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM cooperation_cases "
             "WHERE platform = ? AND user_id = ?",
             (platform, user_id),
         ).fetchone()
         seq = int(seq_row["next_seq"] or 1)
-        now = utc_now()
+        now = occurred_at or utc_now()
         completed_at = now if code == "completed" else None
         closed_at = now if code in ("declined", "cancelled") else None
         cur = self._conn.execute(
@@ -2511,6 +2998,20 @@ class Database:
         self, platform: str, user_id: str
     ) -> dict[str, Any]:
         self._ensure_creator_stub(platform, user_id)
+        creator = self._conn.execute(
+            "SELECT cooperation_reset_at FROM creators "
+            "WHERE platform = ? AND user_id = ?",
+            (platform, user_id),
+        ).fetchone()
+        if creator and creator["cooperation_reset_at"]:
+            summary = self._cooperation_summary_row_locked(platform, user_id)
+            return {
+                "enrolled": False,
+                "previous_status": summary["cooperation_status"] if summary else "",
+                "status": summary["cooperation_status"] if summary else "",
+                "cooperation_updated_at": "",
+                "case_id": summary["cooperation_case_id"] if summary else None,
+            }
         existing = self._conn.execute(
             "SELECT COUNT(*) AS n FROM cooperation_cases WHERE platform = ? AND user_id = ?",
             (platform, user_id),
@@ -2646,6 +3147,8 @@ class Database:
         }
 
     def _cooperation_eligible(self, platform: str, user_id: str) -> bool:
+        if self._open_cooperation_case_locked(platform, user_id):
+            return True
         return bool(
             self._conn.execute(
                 "SELECT 1 FROM creator_rounds "
@@ -3398,6 +3901,74 @@ class Database:
                 self._sync_cooperation_summary_locked(case["platform"], case["user_id"])
             return {"changed": True, "case_id": int(row["case_id"])}
 
+    def delete_cooperation_case(self, case_id: int) -> dict[str, Any]:
+        with self._conn:
+            case = self._cooperation_case_locked(case_id)
+            if not case:
+                raise ValueError("合作记录不存在")
+            case_id = int(case_id)
+            counts = self._conn.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM cooperation_events WHERE case_id = ?) AS events,
+                    (SELECT COUNT(*) FROM cooperation_works WHERE case_id = ?) AS works,
+                    (SELECT COUNT(*) FROM cooperation_works
+                     WHERE case_id = ? AND deleted_at IS NULL) AS active_works,
+                    (SELECT COUNT(*) FROM cooperation_attachments WHERE case_id = ?) AS attachments,
+                    (SELECT COUNT(*) FROM cooperation_attachments
+                     WHERE case_id = ? AND deleted_at IS NULL) AS active_attachments
+                """,
+                (case_id, case_id, case_id, case_id, case_id),
+            ).fetchone()
+            attachment_rows = self._conn.execute(
+                "SELECT storage_key FROM cooperation_attachments WHERE case_id = ?",
+                (case_id,),
+            ).fetchall()
+            self._conn.execute(
+                "DELETE FROM cooperation_attachments WHERE case_id = ?", (case_id,)
+            )
+            self._conn.execute(
+                "DELETE FROM cooperation_works WHERE case_id = ?", (case_id,)
+            )
+            self._conn.execute(
+                "DELETE FROM cooperation_events WHERE case_id = ?", (case_id,)
+            )
+            self._conn.execute(
+                "DELETE FROM cooperation_cases WHERE id = ?", (case_id,)
+            )
+            remaining = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM cooperation_cases "
+                "WHERE platform = ? AND user_id = ?",
+                (case["platform"], case["user_id"]),
+            ).fetchone()
+            reset = int(remaining["n"] or 0) == 0
+            if reset:
+                self._conn.execute(
+                    "UPDATE creators SET cooperation_reset_at = ? "
+                    "WHERE platform = ? AND user_id = ?",
+                    (utc_now(), case["platform"], case["user_id"]),
+                )
+            summary = self._sync_cooperation_summary_locked(
+                case["platform"], case["user_id"]
+            )
+        return {
+            "case_id": case_id,
+            "platform": case["platform"],
+            "user_id": case["user_id"],
+            "seq": int(case["seq"]),
+            "status": case["status"],
+            "reset": reset,
+            "storage_keys": [row["storage_key"] for row in attachment_rows],
+            "impact": {
+                "events": int(counts["events"] or 0),
+                "works": int(counts["works"] or 0),
+                "active_works": int(counts["active_works"] or 0),
+                "attachments": int(counts["attachments"] or 0),
+                "active_attachments": int(counts["active_attachments"] or 0),
+            },
+            "summary": summary,
+        }
+
     def cooperation_history(
         self, platform: str, user_id: str, limit: int = 20
     ) -> list[dict[str, Any]]:
@@ -3618,17 +4189,39 @@ class Database:
 
     # ---- aggregation ----
 
-    def round_author_stats(self, round_id: int) -> list[dict[str, Any]]:
+    def _effective_run_id(self, round_id: int, run_id: int | None = None) -> int | None:
+        if run_id is not None:
+            return int(run_id)
+        row = self._conn.execute(
+            "SELECT latest_run_id FROM rounds WHERE id = ?", (round_id,)
+        ).fetchone()
+        if row and row["latest_run_id"] is not None:
+            return int(row["latest_run_id"])
+        return None
+
+    def round_author_stats(
+        self, round_id: int, run_id: int | None = None
+    ) -> list[dict[str, Any]]:
+        conditions = [
+            "nh.round_id = ?",
+            "n.author_id IS NOT NULL",
+            "n.author_id != ''",
+        ]
+        params: list[Any] = [round_id]
+        effective_run = self._effective_run_id(round_id, run_id)
+        if effective_run is not None:
+            conditions.append("nh.last_run_id = ?")
+            params.append(effective_run)
         rows = self._conn.execute(
-            """
+            f"""
             SELECT nh.keyword, nh.page, n.*, c.profile_url AS profile_url,
                    c.verify_info AS creator_verify_info
             FROM note_hits nh
             JOIN notes n ON n.platform = nh.platform AND n.note_id = nh.note_id
             LEFT JOIN creators c ON c.platform = n.platform AND c.user_id = n.author_id
-            WHERE nh.round_id = ? AND n.author_id IS NOT NULL AND n.author_id != ''
+            WHERE {' AND '.join(conditions)}
             """,
-            (round_id,),
+            params,
         ).fetchall()
 
         stats: dict[tuple[str, str], dict[str, Any]] = {}
@@ -3689,12 +4282,12 @@ class Database:
         result.sort(key=lambda item: (-item["sample_likes"], -item["sample_notes"], item["user_id"]))
         return result
 
-    def refresh_creator_rounds(self, round_id: int) -> int:
+    def refresh_creator_rounds(self, round_id: int, run_id: int | None = None) -> int:
         round_row = self._conn.execute(
             "SELECT category FROM rounds WHERE id = ?", (round_id,)
         ).fetchone()
         round_category = (round_row["category"] or "").strip() if round_row else ""
-        stats = self.round_author_stats(round_id)
+        stats = self.round_author_stats(round_id, run_id=run_id)
         now = utc_now()
         with self._conn:
             for entry in stats:
@@ -3708,8 +4301,8 @@ class Database:
                     INSERT INTO creator_rounds
                     (round_id, platform, user_id, source_keywords, source_labels, sample_notes, sample_likes,
                      sample_collected, sample_comments, sample_interactions, top_note_id,
-                     auto_tags, status, match_direction, tags_manual, remark, updated_at)
-                    VALUES (?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?)
+                     auto_tags, status, match_direction, tags_manual, remark, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?)
                     ON CONFLICT(round_id, platform, user_id) DO UPDATE SET
                         source_keywords = excluded.source_keywords,
                         sample_notes = excluded.sample_notes,
@@ -3736,6 +4329,7 @@ class Database:
                         DEFAULT_STATUS,
                         None,
                         now,
+                        now,
                     ),
                 )
         self.rebuild_search_index(round_id)
@@ -3743,6 +4337,7 @@ class Database:
 
     def import_creator_rows(self, round_id: int, items: list[dict[str, Any]]) -> int:
         """Bulk import creators/notes/round rows in one transaction (Excel imports)."""
+        self.last_import_warnings = []
         now = utc_now()
         identities = {
             (
@@ -3864,8 +4459,8 @@ class Database:
                     (round_id, platform, user_id, source_keywords, source_labels, sample_notes, sample_likes,
                      sample_collected, sample_comments, sample_interactions, top_note_id,
                      auto_tags, status, match_direction, tags_manual, remark, data_round,
-                     tier_label, account_id, cooperation_platform, raw_title, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     tier_label, account_id, cooperation_platform, raw_title, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(round_id, platform, user_id) DO UPDATE SET
                         source_keywords = CASE WHEN excluded.source_keywords IN ('', '[]')
                             THEN creator_rounds.source_keywords ELSE excluded.source_keywords END,
@@ -3909,6 +4504,7 @@ class Database:
                         row.get("cooperation_platform"),
                         row.get("raw_title"),
                         now,
+                        now,
                     ),
                 )
         explicit_cooperation: dict[tuple[str, str], tuple[str, str | None]] = {}
@@ -3920,13 +4516,20 @@ class Database:
                 imported_at = self._normalize_cooperation_timestamp(
                     item.get("cooperation_updated_at")
                 )
+                if identity in explicit_cooperation:
+                    self.last_import_warnings.append(
+                        f"{identity[0]}:{identity[1]} 多行合作状态，以最后一行为准"
+                    )
                 explicit_cooperation[identity] = (code, imported_at)
         with self._conn:
             for identity in identities:
                 platform, user_id = identity
-                if identity in explicit_cooperation and self._cooperation_eligible(
-                    platform, user_id
-                ):
+                if identity in explicit_cooperation:
+                    if not self._cooperation_eligible(platform, user_id):
+                        self.last_import_warnings.append(
+                            f"{platform}:{user_id} 未采用，跳过导入的合作状态"
+                        )
+                        continue
                     status, imported_at = explicit_cooperation[identity]
                     existing_case = self._open_cooperation_case_locked(platform, user_id)
                     if existing_case:
@@ -3936,19 +4539,34 @@ class Database:
                                 status,
                                 note="Excel 导入合作状态",
                             )
-                        except ValueError:
-                            pass
+                        except ValueError as exc:
+                            self.last_import_warnings.append(
+                                f"{platform}:{user_id} 合作状态未更新：{exc}"
+                            )
                     else:
-                        summary = self._cooperation_summary_row_locked(
+                        latest_case = self._latest_cooperation_case_locked(
                             platform, user_id
                         )
-                        if int((summary["cooperation_count"] if summary else 0) or 0) == 0:
+                        already_current = bool(
+                            latest_case
+                            and latest_case["status"] == status
+                            and (
+                                not imported_at
+                                or str(latest_case["updated_at"] or "") >= imported_at
+                            )
+                        )
+                        if already_current:
+                            self.last_import_warnings.append(
+                                f"{platform}:{user_id} 合作状态与最近记录一致，跳过"
+                            )
+                        else:
                             self._insert_cooperation_case_locked(
                                 platform,
                                 user_id,
                                 status,
                                 note="Excel 导入合作状态",
                                 allow_terminal=True,
+                                occurred_at=imported_at,
                             )
                     if imported_at:
                         latest_case = self._latest_cooperation_case_locked(
@@ -3963,10 +4581,15 @@ class Database:
                                 if status in ("declined", "cancelled")
                                 else latest_case["closed_at"]
                             )
+                            started_at = latest_case["started_at"] or imported_at
+                            if started_at > imported_at:
+                                started_at = imported_at
                             self._conn.execute(
-                                "UPDATE cooperation_cases SET status_updated_at = ?, "
-                                "updated_at = ?, completed_at = ?, closed_at = ? WHERE id = ?",
+                                "UPDATE cooperation_cases SET started_at = ?, "
+                                "status_updated_at = ?, updated_at = ?, completed_at = ?, "
+                                "closed_at = ? WHERE id = ?",
                                 (
+                                    started_at,
                                     imported_at,
                                     imported_at,
                                     completed_at,
@@ -4299,7 +4922,7 @@ class Database:
 
     def creator_owner_options(self) -> list[dict[str, Any]]:
         rows = self._conn.execute(
-            "SELECT id, username, role, can_collect, can_edit_leads FROM users "
+            "SELECT id, username, role, can_collect, can_edit_leads, can_send_email FROM users "
             "WHERE disabled = 0 ORDER BY username COLLATE NOCASE"
         ).fetchall()
         return [dict(row) for row in rows]
@@ -4957,15 +5580,29 @@ class Database:
         return detail
 
     def creator_notes(self, round_id: int, platform: str, user_id: str) -> list[dict[str, Any]]:
+        run_id = self._effective_run_id(round_id)
+        conditions = ["nh.round_id = ?", "n.platform = ?", "n.author_id = ?"]
+        params: list[Any] = [round_id, platform, user_id]
+        if run_id is not None:
+            current = self._conn.execute(
+                "SELECT 1 FROM note_hits nh JOIN notes n "
+                "ON n.platform = nh.platform AND n.note_id = nh.note_id "
+                "WHERE nh.round_id = ? AND n.platform = ? AND n.author_id = ? "
+                "AND nh.last_run_id = ? LIMIT 1",
+                (round_id, platform, user_id, run_id),
+            ).fetchone()
+            if current:
+                conditions.append("nh.last_run_id = ?")
+                params.append(run_id)
         rows = self._conn.execute(
-            """
+            f"""
             SELECT nh.keyword, n.*
             FROM note_hits nh
             JOIN notes n ON n.platform = nh.platform AND n.note_id = nh.note_id
-            WHERE nh.round_id = ? AND n.platform = ? AND n.author_id = ?
+            WHERE {' AND '.join(conditions)}
             ORDER BY n.liked DESC
             """,
-            (round_id, platform, user_id),
+            params,
         ).fetchall()
         notes: dict[str, dict[str, Any]] = {}
         for row in rows:
@@ -5542,6 +6179,11 @@ class Database:
             updates["identity_provider"] = ""
             updates["identity_checked_at"] = None
             updates["identity_note"] = ""
+            updates["matched_platform"] = None
+            updates["matched_user_id"] = None
+            updates["matched_round_id"] = None
+            updates["matched_at"] = None
+            updates["match_confidence"] = None
         if (
             "status" in updates
             and updates["status"] in ("unverified", "verifying")
@@ -5817,6 +6459,7 @@ class Database:
                     stats["skipped"] += 1
                     continue
                 match_account = str(match.get("account_id") or user_id).strip() or user_id
+                confidence = str(match.get("confidence") or "matched")
                 overwrite = (
                     bool(match.get("overwrite"))
                     and not row["matched_user_id"]
@@ -5835,15 +6478,55 @@ class Database:
                     platform, str(match.get("handle") or "")
                 )
                 if str(user_id).startswith("import:"):
-                    account_id = resolved_handle or match_account
-                    handle = resolved_handle or creator_handle or match_account
+                    candidate_account = resolved_handle or match_account
+                    candidate_handle = resolved_handle or creator_handle or match_account
                 else:
-                    account_id = user_id
-                    handle = (
-                        resolved_handle
-                        or creator_handle
-                        or (row["platform_handle"] or "")
-                    )
+                    candidate_account = user_id
+                    candidate_handle = resolved_handle or creator_handle or ""
+                current_account = str(row["account_id"] or "").strip()
+                current_handle = str(row["platform_handle"] or "").strip()
+                current_identity = str(row["identity_status"] or "unverified")
+                current_confidence = str(row["identity_confidence"] or "")
+                current_provider = str(row["identity_provider"] or "")
+                provider_verified = (
+                    current_identity == "verified"
+                    and current_provider not in ("", "match")
+                )
+                # Local matching may only link; it must not silently replace an
+                # identity that a provider or a human already verified.
+                if provider_verified and current_account != candidate_account:
+                    stats["skipped"] += 1
+                    continue
+                if (
+                    confidence == "platform_handle"
+                    and current_account
+                    and current_account != candidate_account
+                ):
+                    stats["skipped"] += 1
+                    continue
+                strong = confidence == "account_id" or (
+                    confidence == "platform_handle" and not current_account
+                )
+                account_id = current_account
+                handle = current_handle
+                identity_status = current_identity
+                identity_confidence = current_confidence
+                identity_provider = current_provider
+                identity_checked_at = row["identity_checked_at"]
+                identity_note = str(row["identity_note"] or "")
+                if strong and not provider_verified:
+                    account_id = candidate_account
+                    handle = candidate_handle or current_handle
+                    identity_status = "verified"
+                    identity_confidence = confidence
+                    identity_provider = "match"
+                    identity_checked_at = now
+                    identity_note = "本地达人匹配"
+                elif not provider_verified:
+                    if not account_id:
+                        account_id = candidate_account
+                    if not handle:
+                        handle = candidate_handle
                 nickname = row["nickname"] or ""
                 raw_json = row["raw_json"] or ""
                 if overwrite and creator_nickname:
@@ -5864,12 +6547,11 @@ class Database:
                     changed = True
                 if profile_url != current_profile:
                     changed = True
-                previous_identity = str(row["identity_status"] or "unverified")
-                identity_confidence = str(match.get("confidence") or "matched")
-                if (
-                    previous_identity != "verified"
-                    or (row["identity_confidence"] or "") != identity_confidence
-                ):
+                if identity_status != current_identity:
+                    changed = True
+                if identity_confidence != current_confidence:
+                    changed = True
+                if identity_provider != current_provider:
                     changed = True
                 matched_round_id = match.get("round_id")
                 if (
@@ -5908,9 +6590,9 @@ class Database:
                     UPDATE leads SET nickname = ?, account_id = ?, platform_handle = ?,
                         profile_url = ?, raw_json = ?, matched_platform = ?, matched_user_id = ?,
                         matched_round_id = ?, matched_at = ?, match_confidence = ?,
-                        identity_status = 'verified', identity_confidence = ?,
-                        identity_provider = 'match', identity_checked_at = ?,
-                        identity_note = '本地达人匹配', updated_at = ?
+                        identity_status = ?, identity_confidence = ?,
+                        identity_provider = ?, identity_checked_at = ?,
+                        identity_note = ?, updated_at = ?
                     WHERE id = ? AND status IN ('unverified', 'verifying')
                     """,
                     (
@@ -5924,8 +6606,11 @@ class Database:
                         matched_round_id,
                         now,
                         match.get("confidence") or "",
+                        identity_status,
                         identity_confidence,
-                        now,
+                        identity_provider,
+                        identity_checked_at,
+                        identity_note,
                         now if changed else (row["updated_at"] or now),
                         lead_id,
                     ),
@@ -6211,7 +6896,7 @@ class Database:
                     None,
                 )
                 merged = dict(primary)
-                for field in ("nickname", "account_id", "profile_url", "raw_json"):
+                for field in ("nickname", "account_id", "platform_handle", "profile_url", "raw_title", "raw_json"):
                     if not merged.get(field):
                         merged[field] = next(
                             (item[field] for item in duplicates if item.get(field)), ""
@@ -6234,6 +6919,41 @@ class Database:
                         ),
                         None,
                     )
+                verified_identity = next(
+                    (
+                        item
+                        for item in [primary, *duplicates]
+                        if item.get("identity_status") == "verified"
+                    ),
+                    None,
+                )
+                if verified_identity:
+                    for field in (
+                        "identity_status",
+                        "identity_confidence",
+                        "identity_provider",
+                        "identity_checked_at",
+                        "identity_note",
+                    ):
+                        merged[field] = verified_identity.get(field)
+                matched_source = next(
+                    (
+                        item
+                        for item in [primary, *duplicates]
+                        if item.get("matched_user_id")
+                    ),
+                    None,
+                )
+                if matched_source:
+                    for field in (
+                        "matched_platform",
+                        "matched_user_id",
+                        "matched_round_id",
+                        "matched_at",
+                        "match_confidence",
+                    ):
+                        if not merged.get(field):
+                            merged[field] = matched_source.get(field)
                 if converted:
                     merged["status"] = "converted"
                     merged["converted_platform"] = converted.get("converted_platform")
@@ -6241,16 +6961,23 @@ class Database:
                     merged["converted_at"] = converted.get("converted_at")
                 self._conn.execute(
                     """
-                    UPDATE leads SET nickname = ?, account_id = ?, profile_url = ?,
-                        raw_json = ?, owner_user_id = ?, source_round_id = ?, status = ?,
+                    UPDATE leads SET nickname = ?, account_id = ?, platform_handle = ?,
+                        profile_url = ?, raw_title = ?, raw_json = ?,
+                        owner_user_id = ?, source_round_id = ?, status = ?,
                         converted_platform = ?, converted_user_id = ?, converted_at = ?,
+                        identity_status = ?, identity_confidence = ?, identity_provider = ?,
+                        identity_checked_at = ?, identity_note = ?,
+                        matched_platform = ?, matched_user_id = ?, matched_round_id = ?,
+                        matched_at = ?, match_confidence = ?,
                         updated_at = ?
                     WHERE id = ?
                     """,
                     (
                         merged.get("nickname") or "",
                         merged.get("account_id") or "",
+                        merged.get("platform_handle") or "",
                         merged.get("profile_url") or "",
+                        merged.get("raw_title") or "",
                         merged.get("raw_json") or "",
                         merged.get("owner_user_id"),
                         merged.get("source_round_id"),
@@ -6258,6 +6985,16 @@ class Database:
                         merged.get("converted_platform"),
                         merged.get("converted_user_id"),
                         merged.get("converted_at"),
+                        merged.get("identity_status") or "unverified",
+                        merged.get("identity_confidence") or "",
+                        merged.get("identity_provider") or "",
+                        merged.get("identity_checked_at"),
+                        merged.get("identity_note") or "",
+                        merged.get("matched_platform"),
+                        merged.get("matched_user_id"),
+                        merged.get("matched_round_id"),
+                        merged.get("matched_at"),
+                        merged.get("match_confidence"),
                         now,
                         primary["id"],
                     ),
@@ -6282,6 +7019,10 @@ class Database:
                     )
                     self._conn.execute(
                         "UPDATE lead_attempts SET lead_id = ? WHERE lead_id = ?",
+                        (primary["id"], duplicate["id"]),
+                    )
+                    self._conn.execute(
+                        "UPDATE lead_identity_events SET lead_id = ? WHERE lead_id = ?",
                         (primary["id"], duplicate["id"]),
                     )
                     self._conn.execute(
@@ -6393,7 +7134,7 @@ class Database:
 
     def lead_owner_options(self) -> list[dict[str, Any]]:
         rows = self._conn.execute(
-            "SELECT id, username, role, can_collect, can_edit_leads FROM users "
+            "SELECT id, username, role, can_collect, can_edit_leads, can_send_email FROM users "
             "WHERE disabled = 0 AND (role = 'admin' OR can_edit_leads = 1) "
             "ORDER BY username COLLATE NOCASE"
         ).fetchall()
@@ -6438,8 +7179,8 @@ class Database:
                  sample_collected, sample_comments, sample_interactions, top_note_id,
                  auto_tags, status, match_direction, tags_manual, remark, data_round,
                  tier_label, account_id, cooperation_platform, raw_title, owner_user_id,
-                 claimed_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, NULL, '', '', ?, NULL, ?, '', ?, ?, ?, ?)
+                 claimed_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, NULL, '', '', ?, NULL, ?, '', ?, ?, ?, ?, ?)
                 ON CONFLICT(round_id, platform, user_id) DO UPDATE SET
                     owner_user_id = COALESCE(creator_rounds.owner_user_id, excluded.owner_user_id),
                     claimed_at = COALESCE(creator_rounds.claimed_at, excluded.claimed_at),
@@ -6471,6 +7212,7 @@ class Database:
                     raw_title or "",
                     owner_user_id,
                     now if owner_user_id is not None else None,
+                    now,
                     now,
                 ),
             )
@@ -6569,23 +7311,34 @@ class Database:
         }
 
     def round_summary(self, round_id: int) -> dict[str, Any]:
+        run_id = self._effective_run_id(round_id, None)
+        hit_filter = "AND last_run_id = ?" if run_id is not None else ""
+        nh_filter = "AND nh.last_run_id = ?" if run_id is not None else ""
+        params: list[Any] = [round_id, round_id, round_id]
+        if run_id is not None:
+            params.append(run_id)
+        params.append(round_id)
+        if run_id is not None:
+            params.append(run_id)
+        params.extend([round_id, round_id])
         row = self._conn.execute(
-            """
+            f"""
             SELECT
                 (SELECT COUNT(*) FROM creator_rounds WHERE round_id = ?) AS creators,
                 (SELECT COUNT(*) FROM lead_rounds WHERE round_id = ?) AS leads,
-                (SELECT COUNT(*) FROM note_hits WHERE round_id = ?) AS note_hits,
+                (SELECT COUNT(*) FROM note_hits WHERE round_id = ? {hit_filter}) AS note_hits,
                 (SELECT COUNT(DISTINCT note_id) FROM (
                     SELECT n.note_id FROM note_hits nh
                     JOIN notes n ON n.platform = nh.platform AND n.note_id = nh.note_id
-                    WHERE nh.round_id = ?
+                    WHERE nh.round_id = ? {nh_filter}
                     UNION
                     SELECT top_note_id AS note_id FROM creator_rounds
                     WHERE round_id = ? AND top_note_id IS NOT NULL
+                      AND top_note_id != ''
                 )) AS notes,
                 (SELECT COALESCE(SUM(cost), 0) FROM api_calls WHERE round_id = ?) AS cost
             """,
-            (round_id, round_id, round_id, round_id, round_id, round_id),
+            params,
         ).fetchone()
         return dict(row)
 
@@ -6882,11 +7635,16 @@ class Database:
         start = end - timedelta(days=days - 1)
         modifier = f"{tz_offset:+d} minutes"
         cutoff = f"-{days + 5} days"
-        collected_join = (
-            "JOIN creator_rounds cr ON cr.platform = creators.platform "
-            "AND cr.user_id = creators.user_id"
+        collected_from = (
+            "creator_rounds cr JOIN creators ON creators.platform = cr.platform "
+            "AND creators.user_id = cr.user_id"
             if round_id is not None
-            else ""
+            else "creators"
+        )
+        collected_timestamp = (
+            "COALESCE(NULLIF(cr.created_at, ''), cr.updated_at, creators.created_at)"
+            if round_id is not None
+            else "creators.created_at"
         )
         collected_round = "AND cr.round_id = ?" if round_id is not None else ""
         collected_params: list[Any] = [modifier, cutoff]
@@ -6894,11 +7652,11 @@ class Database:
             collected_params.append(int(round_id))
         collected_rows = self._conn.execute(
             f"""
-            SELECT date(datetime(substr(creators.created_at, 1, 19), ?)) AS day,
+            SELECT date(datetime(substr({collected_timestamp}, 1, 19), ?)) AS day,
                    COUNT(*) AS n
-            FROM creators {collected_join}
-            WHERE creators.created_at IS NOT NULL AND creators.created_at <> ''
-              AND substr(creators.created_at, 1, 19) >= datetime('now', ?)
+            FROM {collected_from}
+            WHERE {collected_timestamp} IS NOT NULL AND {collected_timestamp} <> ''
+              AND substr({collected_timestamp}, 1, 19) >= datetime('now', ?)
               {collected_round}
             GROUP BY day
             """,
@@ -7112,6 +7870,12 @@ class Database:
                 last = last.replace(tzinfo=timezone.utc)
             if last >= cutoff:
                 continue
+            if row["status"] == "running" and process_matches(
+                row["pid"], row["round_id"], row["id"]
+            ):
+                continue
+            if row["status"] == "pending" and pid_alive(row["pid"]):
+                continue
             finished = utc_now()
             stage = "启动超时" if row["status"] == "pending" else "执行超时"
             error = "任务进程已失联，系统已自动标记失败"
@@ -7140,6 +7904,16 @@ class Database:
             stale.append(int(row["id"]))
         return stale
 
+    def _round_has_live_job_process(self, round_id: int) -> bool:
+        row = self._conn.execute(
+            "SELECT id, pid, status FROM jobs WHERE round_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (round_id,),
+        ).fetchone()
+        if not row or row["status"] != "cancelled" or not row["pid"]:
+            return False
+        return process_matches(row["pid"], round_id, row["id"])
+
     def claim_job(
         self,
         round_id: int,
@@ -7149,6 +7923,8 @@ class Database:
     ) -> int:
         """Atomically create a job unless the round already has an active one."""
         self.reconcile_stale_jobs(stale_minutes)
+        if self._round_has_live_job_process(round_id):
+            raise JobBusyError("上一任务进程仍在退出，请稍后再试")
         try:
             self._conn.execute("BEGIN IMMEDIATE")
             if max_active is not None and max_active > 0:
@@ -7285,6 +8061,13 @@ class Database:
         ).fetchone()
         return dict(row) if row else None
 
+    def jobs_for_round(self, round_id: int, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM jobs WHERE round_id = ? ORDER BY id DESC LIMIT ?",
+            (int(round_id), max(1, min(100, int(limit)))),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def latest_jobs_by_round(self) -> dict[int, dict[str, Any]]:
         rows = self._conn.execute(
             """
@@ -7337,6 +8120,7 @@ class Database:
         external_id: str | None = None,
         can_collect: bool = False,
         can_edit_leads: bool = False,
+        can_send_email: bool = False,
         must_change_password: bool = False,
     ) -> int:
         now = utc_now()
@@ -7346,8 +8130,9 @@ class Database:
                     """
                     INSERT INTO users
                     (username, password_hash, auth_source, external_id, role, disabled,
-                     can_collect, can_edit_leads, must_change_password, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+                     can_collect, can_edit_leads, can_send_email, must_change_password,
+                     created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         username,
@@ -7357,6 +8142,7 @@ class Database:
                         role,
                         1 if can_collect else 0,
                         1 if can_edit_leads else 0,
+                        1 if can_send_email else 0,
                         1 if must_change_password else 0,
                         now,
                         now,
@@ -7381,7 +8167,8 @@ class Database:
         rows = self._conn.execute(
             """
             SELECT id, username, role, disabled, can_collect, can_edit_leads,
-                   must_change_password, auth_source, created_at, updated_at, last_login_at
+                   can_send_email, must_change_password, auth_source, created_at,
+                   updated_at, last_login_at
             FROM users ORDER BY id ASC
             """
         ).fetchall()
@@ -7404,6 +8191,7 @@ class Database:
         password_hash: str | None = None,
         can_collect: bool | None = None,
         can_edit_leads: bool | None = None,
+        can_send_email: bool | None = None,
         must_change_password: bool | None = None,
     ) -> None:
         updates: dict[str, Any] = {"updated_at": utc_now()}
@@ -7417,6 +8205,8 @@ class Database:
             updates["can_collect"] = 1 if can_collect else 0
         if can_edit_leads is not None:
             updates["can_edit_leads"] = 1 if can_edit_leads else 0
+        if can_send_email is not None:
+            updates["can_send_email"] = 1 if can_send_email else 0
         if must_change_password is not None:
             updates["must_change_password"] = 1 if must_change_password else 0
         sets = ", ".join(f"{key} = ?" for key in updates)
@@ -7430,6 +8220,7 @@ class Database:
         disabled: bool | None = None,
         can_collect: bool | None = None,
         can_edit_leads: bool | None = None,
+        can_send_email: bool | None = None,
     ) -> None:
         try:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -7456,6 +8247,8 @@ class Database:
                 updates["can_collect"] = 1 if can_collect else 0
             if can_edit_leads is not None:
                 updates["can_edit_leads"] = 1 if can_edit_leads else 0
+            if can_send_email is not None:
+                updates["can_send_email"] = 1 if can_send_email else 0
             sets = ", ".join(f"{key} = ?" for key in updates)
             self._conn.execute(
                 f"UPDATE users SET {sets} WHERE id = ?",
@@ -7465,6 +8258,1210 @@ class Database:
         except Exception:
             self._conn.rollback()
             raise
+
+
+    def create_email_account(
+        self,
+        *,
+        scope: str,
+        owner_user_id: int | None,
+        label: str,
+        from_name: str,
+        from_email: str,
+        reply_to: str,
+        host: str,
+        port: int,
+        security: str,
+        username: str,
+        password_encrypted: str,
+        key_fingerprint: str,
+        daily_limit: int,
+        min_interval_seconds: int = 60,
+        created_by: int | None,
+    ) -> int:
+        scope = str(scope or "personal").strip().lower()
+        if scope not in EMAIL_ACCOUNT_SCOPES:
+            raise ValueError("发件账号范围无效")
+        security = str(security or "starttls").strip().lower()
+        if security not in EMAIL_SECURITY_MODES:
+            raise ValueError("SMTP 加密方式无效")
+        if scope == "personal" and owner_user_id is None:
+            raise ValueError("个人发件账号必须指定所属用户")
+        host = str(host or "").strip().lower()
+        if not host or any(ch in host for ch in " \r\n/:"):
+            raise ValueError("SMTP 主机格式不正确")
+        try:
+            port = int(port)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("SMTP 端口无效") from exc
+        if port < 1 or port > 65535:
+            raise ValueError("SMTP 端口无效")
+        normalized_from = normalize_email_address(from_email)
+        normalized_reply = (
+            normalize_email_address(reply_to) if str(reply_to or "").strip() else ""
+        )
+        username = str(username or "").strip()
+        if not username:
+            raise ValueError("SMTP 用户名不能为空")
+        if not password_encrypted:
+            raise ValueError("SMTP 密码不能为空")
+        limit = max(1, min(500, int(daily_limit or 20)))
+        now = utc_now()
+        with self._conn:
+            cur = self._conn.execute(
+                """
+                INSERT INTO email_accounts
+                (scope, owner_user_id, label, from_name, from_email, reply_to,
+                 host, port, security, username, password_encrypted,
+                 key_fingerprint, daily_limit, min_interval_seconds,
+                 enabled, created_by, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                """,
+                (
+                    scope,
+                    int(owner_user_id) if owner_user_id is not None else None,
+                    str(label or "").strip()[:80],
+                    str(from_name or "").strip()[:80],
+                    normalized_from,
+                    normalized_reply,
+                    host,
+                    port,
+                    security,
+                    username[:200],
+                    password_encrypted,
+                    str(key_fingerprint or ""),
+                    limit,
+                    max(1, min(3600, int(min_interval_seconds or 60))),
+                    created_by,
+                    now,
+                    now,
+                ),
+            )
+        return int(cur.lastrowid)
+
+    def list_email_accounts(self, user_id: int) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """
+            SELECT *,
+                   (SELECT COUNT(*) FROM email_campaigns c
+                    WHERE c.account_id = email_accounts.id AND c.status = 'paused')
+                       AS paused_campaigns
+            FROM email_accounts
+            WHERE scope = 'shared' OR owner_user_id = ?
+            ORDER BY CASE scope WHEN 'shared' THEN 0 ELSE 1 END, id
+            """,
+            (int(user_id),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_email_account(self, account_id: int) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM email_accounts WHERE id = ?", (int(account_id),)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def count_email_accounts(self) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM email_accounts"
+        ).fetchone()
+        return int(row["n"] or 0)
+
+    def update_email_account(self, account_id: int, **fields: Any) -> None:
+        allowed = {
+            "label",
+            "from_name",
+            "from_email",
+            "reply_to",
+            "host",
+            "port",
+            "security",
+            "username",
+            "password_encrypted",
+            "key_fingerprint",
+            "daily_limit",
+            "min_interval_seconds",
+            "enabled",
+            "last_test_at",
+            "last_test_error",
+        }
+        updates = {key: value for key, value in fields.items() if key in allowed}
+        if not updates:
+            return
+        if "from_email" in updates:
+            updates["from_email"] = normalize_email_address(updates["from_email"])
+        if "reply_to" in updates:
+            updates["reply_to"] = (
+                normalize_email_address(updates["reply_to"])
+                if str(updates["reply_to"] or "").strip()
+                else ""
+            )
+        if "security" in updates:
+            security = str(updates["security"] or "starttls").strip().lower()
+            if security not in EMAIL_SECURITY_MODES:
+                raise ValueError("SMTP 加密方式无效")
+            updates["security"] = security
+        if "port" in updates:
+            port = int(updates["port"])
+            if port < 1 or port > 65535:
+                raise ValueError("SMTP 端口无效")
+            updates["port"] = port
+        if "host" in updates:
+            host = str(updates["host"] or "").strip().lower()
+            if not host or any(ch in host for ch in " \r\n/:"):
+                raise ValueError("SMTP 主机格式不正确")
+            updates["host"] = host
+        if "daily_limit" in updates:
+            updates["daily_limit"] = max(1, min(500, int(updates["daily_limit"] or 20)))
+        if "min_interval_seconds" in updates:
+            updates["min_interval_seconds"] = max(
+                1, min(3600, int(updates["min_interval_seconds"] or 60))
+            )
+        connection_fields = {
+            "from_email",
+            "host",
+            "port",
+            "security",
+            "username",
+            "password_encrypted",
+        }
+        if connection_fields.intersection(updates):
+            updates.update(
+                last_test_at=None,
+                last_test_error="",
+                auth_failed_at=None,
+                auth_error="",
+            )
+        updates["updated_at"] = utc_now()
+        sets = ", ".join(f"{key} = ?" for key in updates)
+        with self._conn:
+            cur = self._conn.execute(
+                f"UPDATE email_accounts SET {sets} WHERE id = ?",
+                [*updates.values(), int(account_id)],
+            )
+        if cur.rowcount == 0:
+            raise ValueError("发件账号不存在")
+
+    def mark_email_account_test(self, account_id: int, error: str | None) -> None:
+        now = utc_now()
+        with self._conn:
+            self._conn.execute(
+                "UPDATE email_accounts SET last_test_at = ?, last_test_error = ?, "
+                "updated_at = ? WHERE id = ?",
+                (now, (error or "")[:500], now, int(account_id)),
+            )
+
+    def delete_email_account(self, account_id: int) -> None:
+        with self._conn:
+            used = self._conn.execute(
+                "SELECT 1 FROM email_campaigns WHERE account_id = ? LIMIT 1",
+                (int(account_id),),
+            ).fetchone()
+            if used:
+                raise ValueError("该账号已被发件任务使用，请改为停用而不是删除")
+            cur = self._conn.execute(
+                "DELETE FROM email_accounts WHERE id = ?", (int(account_id),)
+            )
+        if cur.rowcount == 0:
+            raise ValueError("发件账号不存在")
+
+    def creator_emails(self, platform: str, user_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM creator_emails WHERE platform = ? AND user_id = ? "
+            "ORDER BY is_primary DESC, id ASC",
+            (platform, user_id),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _add_creator_email_locked(
+        self,
+        platform: str,
+        user_id: str,
+        email: str,
+        *,
+        label: str = "",
+        is_primary: bool = False,
+        source: str = "manual",
+        created_by: int | None = None,
+    ) -> dict[str, Any]:
+        creator = self._conn.execute(
+            "SELECT 1 FROM creators WHERE platform = ? AND user_id = ?",
+            (platform, user_id),
+        ).fetchone()
+        if not creator:
+            raise ValueError("达人不存在")
+        normalized = normalize_email_address(email)
+        now = utc_now()
+        existing = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM creator_emails "
+            "WHERE platform = ? AND user_id = ?",
+            (platform, user_id),
+        ).fetchone()
+        primary = bool(is_primary) or int(existing["n"] or 0) == 0
+        if primary:
+            self._conn.execute(
+                "UPDATE creator_emails SET is_primary = 0 WHERE platform = ? AND user_id = ?",
+                (platform, user_id),
+            )
+        self._conn.execute(
+            """
+            INSERT INTO creator_emails
+            (platform, user_id, email, email_normalized, label, source,
+             is_primary, created_by, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(platform, user_id, email_normalized) DO UPDATE SET
+                label = excluded.label,
+                is_primary = CASE
+                    WHEN excluded.is_primary = 1 THEN 1
+                    ELSE creator_emails.is_primary
+                END,
+                updated_at = excluded.updated_at
+            """,
+            (
+                platform,
+                user_id,
+                str(email).strip(),
+                normalized,
+                str(label or "").strip()[:80],
+                str(source or "manual")[:40],
+                1 if primary else 0,
+                created_by,
+                now,
+                now,
+            ),
+        )
+        row = self._conn.execute(
+            "SELECT * FROM creator_emails WHERE platform = ? AND user_id = ? "
+            "AND email_normalized = ?",
+            (platform, user_id, normalized),
+        ).fetchone()
+        return dict(row) if row else {}
+
+    def add_creator_email(
+        self,
+        platform: str,
+        user_id: str,
+        email: str,
+        *,
+        label: str = "",
+        is_primary: bool = False,
+        source: str = "manual",
+        created_by: int | None = None,
+    ) -> dict[str, Any]:
+        with self.transaction():
+            return self._add_creator_email_locked(
+                platform,
+                user_id,
+                email,
+                label=label,
+                is_primary=is_primary,
+                source=source,
+                created_by=created_by,
+            )
+
+    def delete_creator_email(self, email_id: int) -> dict[str, Any] | None:
+        with self.transaction():
+            row = self._conn.execute(
+                "SELECT * FROM creator_emails WHERE id = ?", (int(email_id),)
+            ).fetchone()
+            if not row:
+                return None
+            self._conn.execute(
+                "DELETE FROM creator_emails WHERE id = ?", (int(email_id),)
+            )
+            if row["is_primary"]:
+                replacement = self._conn.execute(
+                    "SELECT id FROM creator_emails WHERE platform = ? AND user_id = ? "
+                    "ORDER BY id ASC LIMIT 1",
+                    (row["platform"], row["user_id"]),
+                ).fetchone()
+                if replacement:
+                    self._conn.execute(
+                        "UPDATE creator_emails SET is_primary = 1, updated_at = ? WHERE id = ?",
+                        (utc_now(), int(replacement["id"])),
+                    )
+        return dict(row)
+
+    def set_primary_creator_email(self, email_id: int) -> dict[str, Any] | None:
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT * FROM creator_emails WHERE id = ?", (int(email_id),)
+            ).fetchone()
+            if not row:
+                return None
+            self._conn.execute(
+                "UPDATE creator_emails SET is_primary = 0 WHERE platform = ? AND user_id = ?",
+                (row["platform"], row["user_id"]),
+            )
+            self._conn.execute(
+                "UPDATE creator_emails SET is_primary = 1, updated_at = ? WHERE id = ?",
+                (utc_now(), int(email_id)),
+            )
+        updated = self._conn.execute(
+            "SELECT * FROM creator_emails WHERE id = ?", (int(email_id),)
+        ).fetchone()
+        return dict(updated) if updated else None
+
+
+    def _creator_primary_email_locked(
+        self, platform: str, user_id: str
+    ) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM creator_emails WHERE platform = ? AND user_id = ? "
+            "ORDER BY is_primary DESC, id ASC LIMIT 1",
+            (platform, user_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def email_targets(
+        self,
+        *,
+        search: str = "",
+        platform: str = "",
+        round_id: int | None = None,
+        owner: str = "all",
+        has_email: bool | None = None,
+        page: int = 1,
+        page_size: int = 50,
+        cooldown_days: int = 30,
+        creator_cooldown_days: int = 90,
+    ) -> dict[str, Any]:
+        conditions = [
+            "c.cooperation_status = 'not_contacted'",
+            "EXISTS (SELECT 1 FROM creator_rounds cr "
+            "WHERE cr.platform = c.platform AND cr.user_id = c.user_id "
+            "AND cr.status = 'adopted'"
+            + (" AND cr.round_id = ?" if round_id is not None else "")
+            + ")",
+        ]
+        params: list[Any] = []
+        if round_id is not None:
+            params.append(int(round_id))
+        if platform:
+            conditions.append("c.platform = ?")
+            params.append(platform)
+        query = search.strip()
+        if query:
+            like = f"%{query}%"
+            conditions.append(
+                "(c.nickname LIKE ? OR c.user_id LIKE ? OR COALESCE(e.email, '') LIKE ?)"
+            )
+            params.extend([like, like, like])
+        owner_filter = str(owner or "all")
+        if owner_filter == "unassigned":
+            conditions.append("c.follow_up_user_id IS NULL")
+        elif owner_filter not in {"", "all"}:
+            conditions.append("c.follow_up_user_id = ?")
+            params.append(int(owner_filter))
+        if has_email is True:
+            conditions.append("e.email IS NOT NULL")
+        elif has_email is False:
+            conditions.append("e.email IS NULL")
+        conditions.append(
+            "NOT EXISTS (SELECT 1 FROM email_suppressions s "
+            "WHERE s.email_normalized = e.email_normalized)"
+        )
+        where = " AND ".join(f"({item})" for item in conditions)
+        cte = """
+            WITH primary_emails AS (
+                SELECT platform, user_id, email, email_normalized,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY platform, user_id
+                           ORDER BY is_primary DESC, id ASC
+                       ) AS rn
+                FROM creator_emails
+            )
+        """
+        from_sql = """
+            FROM creators c
+            LEFT JOIN users u ON u.id = c.follow_up_user_id
+            LEFT JOIN primary_emails e
+                ON e.platform = c.platform AND e.user_id = c.user_id AND e.rn = 1
+        """
+        total = int(
+            self._conn.execute(
+                cte + "SELECT COUNT(*) AS n " + from_sql + " WHERE " + where,
+                params,
+            ).fetchone()["n"]
+            or 0
+        )
+        page = max(1, int(page))
+        page_size = max(1, min(200, int(page_size)))
+        rows = self._conn.execute(
+            cte
+            + """
+            SELECT c.platform, c.user_id, c.nickname, c.avatar, c.fans,
+                   c.profile_url, c.follow_up_user_id,
+                   COALESCE(u.username, '') AS owner_username,
+                   e.email,
+                   (SELECT COUNT(*) FROM creator_emails ce
+                    WHERE ce.platform = c.platform AND ce.user_id = c.user_id)
+                       AS email_count,
+                   (SELECT MAX(r.sent_at) FROM email_recipients r
+                    WHERE r.creator_platform = c.platform
+                      AND r.creator_user_id = c.user_id AND r.status = 'sent')
+                       AS last_creator_sent_at,
+                   (SELECT MAX(r.sent_at) FROM email_recipients r
+                    WHERE r.email_normalized = e.email_normalized
+                      AND r.status = 'sent')
+                       AS last_email_sent_at
+            """
+            + from_sql
+            + " WHERE "
+            + where
+            + " ORDER BY COALESCE(c.fans, 0) DESC, c.platform ASC, c.user_id ASC LIMIT ? OFFSET ?",
+            [*params, page_size, (page - 1) * page_size],
+        ).fetchall()
+        now = datetime.now(timezone.utc)
+        items = []
+        for row in rows:
+            item = dict(row)
+            email_until = _cooldown_until(
+                item.get("last_email_sent_at"), cooldown_days
+            )
+            creator_until = _cooldown_until(
+                item.get("last_creator_sent_at"), creator_cooldown_days
+            )
+            until = max(
+                [value for value in (email_until, creator_until) if value],
+                default=None,
+            )
+            reason = ""
+            if until and email_until == until:
+                reason = "email"
+            elif until and creator_until == until:
+                reason = "creator"
+            item["cooldown_until"] = (
+                until.isoformat() if until and until > now else ""
+            )
+            item["cooldown_reason"] = reason if until and until > now else ""
+            items.append(item)
+        return {
+            "items": items,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
+
+    def create_email_campaign(
+        self,
+        *,
+        name: str,
+        account_id: int,
+        subject: str,
+        body: str,
+        timezone: str,
+        window_start: str,
+        window_end: str,
+        weekdays: str,
+        interval_seconds: int,
+        jitter_seconds: int,
+        daily_limit: int,
+        auto_mark_contacted: bool,
+        recipients: list[dict[str, Any]],
+        created_by: int | None,
+        scheduled_start: str | None = None,
+        schedule: bool = False,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        inserted = 0
+        skipped: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        seen_emails: set[str] = set()
+        with self.transaction():
+            account = self._conn.execute(
+                "SELECT * FROM email_accounts WHERE id = ?", (int(account_id),)
+            ).fetchone()
+            if not account:
+                raise ValueError("发件账号不存在")
+            if schedule and not bool(account["enabled"]):
+                raise ValueError("发件账号已停用")
+            cur = self._conn.execute(
+                """
+                INSERT INTO email_campaigns
+                (name, account_id, subject, body, status, timezone,
+                 window_start, window_end, weekdays, interval_seconds,
+                 jitter_seconds, daily_limit, auto_mark_contacted,
+                 created_by, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(name or "").strip()[:80],
+                    int(account_id),
+                    str(subject or "").strip()[:200],
+                    str(body or ""),
+                    str(timezone or "Asia/Shanghai")[:64],
+                    str(window_start or "09:00"),
+                    str(window_end or "18:00"),
+                    str(weekdays or "[1,2,3,4,5]"),
+                    max(1, min(3600, int(interval_seconds or 60))),
+                    max(0, min(600, int(jitter_seconds or 0))),
+                    max(1, min(500, int(daily_limit or 20))),
+                    1 if auto_mark_contacted else 0,
+                    created_by,
+                    now,
+                    now,
+                ),
+            )
+            campaign_id = int(cur.lastrowid)
+            for recipient in recipients:
+                platform = str(recipient.get("platform") or "").strip()
+                creator_user_id = str(recipient.get("user_id") or "").strip()
+                if not platform or not creator_user_id:
+                    skipped.append({"user_id": creator_user_id, "reason": "缺少达人标识"})
+                    continue
+                try:
+                    email_value = normalize_email_address(recipient.get("email"))
+                except ValueError:
+                    skipped.append({"user_id": creator_user_id, "reason": "邮箱格式不正确"})
+                    continue
+                key = (platform, creator_user_id)
+                if key in seen or email_value in seen_emails:
+                    skipped.append({"user_id": creator_user_id, "reason": "重复收件人"})
+                    continue
+                seen.add(key)
+                seen_emails.add(email_value)
+                creator = self._conn.execute(
+                    "SELECT cooperation_status, nickname FROM creators "
+                    "WHERE platform = ? AND user_id = ?",
+                    (platform, creator_user_id),
+                ).fetchone()
+                if not creator:
+                    skipped.append({"user_id": creator_user_id, "reason": "达人不存在"})
+                    continue
+                if str(creator["cooperation_status"] or "") != "not_contacted":
+                    skipped.append({"user_id": creator_user_id, "reason": "合作状态不是未联系"})
+                    continue
+                active = self._conn.execute(
+                    """
+                    SELECT c.id FROM email_recipients r
+                    JOIN email_campaigns c ON c.id = r.campaign_id
+                    WHERE r.creator_platform = ? AND r.creator_user_id = ?
+                      AND r.status IN ('pending', 'sending')
+                      AND c.status IN ('draft', 'scheduled', 'sending', 'paused')
+                    LIMIT 1
+                    """,
+                    (platform, creator_user_id),
+                ).fetchone()
+                if active:
+                    skipped.append(
+                        {
+                            "user_id": creator_user_id,
+                            "reason": f"已在未结束的发件任务 #{active['id']} 中",
+                        }
+                    )
+                    continue
+                suppressed = self._conn.execute(
+                    "SELECT 1 FROM email_suppressions WHERE email_normalized = ?",
+                    (email_value,),
+                ).fetchone()
+                if suppressed:
+                    skipped.append({"user_id": creator_user_id, "reason": "邮箱在退订名单"})
+                    continue
+                self._add_creator_email_locked(
+                    platform,
+                    creator_user_id,
+                    email_value,
+                    source="campaign",
+                    created_by=created_by,
+                )
+                self._conn.execute(
+                    """
+                    INSERT INTO email_recipients
+                    (campaign_id, creator_platform, creator_user_id, creator_nickname,
+                     email, email_normalized, status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                    """,
+                    (
+                        campaign_id,
+                        platform,
+                        creator_user_id,
+                        str(recipient.get("nickname") or creator["nickname"] or ""),
+                        email_value,
+                        email_value,
+                        now,
+                        now,
+                    ),
+                )
+                inserted += 1
+            if inserted == 0:
+                raise ValueError("没有可发送的有效收件人，未创建发件任务")
+            if schedule:
+                self._conn.execute(
+                    """
+                    UPDATE email_campaigns SET status = 'scheduled', scheduled_start = ?,
+                        updated_at = ? WHERE id = ?
+                    """,
+                    (scheduled_start, now, campaign_id),
+                )
+        return {
+            "campaign_id": campaign_id,
+            "inserted": inserted,
+            "skipped": skipped,
+        }
+
+    def update_email_campaign(self, campaign_id: int, **fields: Any) -> None:
+        allowed = {
+            "name",
+            "account_id",
+            "subject",
+            "body",
+            "timezone",
+            "window_start",
+            "window_end",
+            "weekdays",
+            "interval_seconds",
+            "jitter_seconds",
+            "daily_limit",
+            "auto_mark_contacted",
+        }
+        updates = {key: value for key, value in fields.items() if key in allowed}
+        if not updates:
+            return
+        now = utc_now()
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT status FROM email_campaigns WHERE id = ?", (int(campaign_id),)
+            ).fetchone()
+            if not row:
+                raise ValueError("发件任务不存在")
+            if row["status"] != "draft":
+                raise ValueError("只有草稿状态可以编辑")
+            updates["updated_at"] = now
+            sets = ", ".join(f"{key} = ?" for key in updates)
+            self._conn.execute(
+                f"UPDATE email_campaigns SET {sets} WHERE id = ?",
+                [*updates.values(), int(campaign_id)],
+            )
+
+    def schedule_email_campaign(
+        self,
+        campaign_id: int,
+        *,
+        scheduled_start: str | None,
+        timezone: str,
+        window_start: str,
+        window_end: str,
+        weekdays: str,
+        interval_seconds: int,
+        jitter_seconds: int,
+        daily_limit: int,
+    ) -> None:
+        now = utc_now()
+        with self.transaction():
+            row = self._conn.execute(
+                """
+                SELECT c.status, a.enabled, a.auth_error
+                FROM email_campaigns c
+                JOIN email_accounts a ON a.id = c.account_id
+                WHERE c.id = ?
+                """,
+                (int(campaign_id),),
+            ).fetchone()
+            if not row:
+                raise ValueError("发件任务或发件账号不存在")
+            if row["status"] != "draft":
+                raise ValueError("只有草稿状态可以计划发送")
+            if not bool(row["enabled"]):
+                raise ValueError("发件账号已停用")
+            if str(row["auth_error"] or "").strip():
+                raise ValueError("发件账号认证失败，请先更新密码并测试")
+            recipients = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM email_recipients "
+                "WHERE campaign_id = ? AND status = 'pending'",
+                (int(campaign_id),),
+            ).fetchone()
+            if int(recipients["n"] or 0) == 0:
+                raise ValueError("发件任务没有待发送收件人")
+            self._conn.execute(
+                """
+                UPDATE email_campaigns SET status = 'scheduled',
+                    scheduled_start = ?, timezone = ?, window_start = ?,
+                    window_end = ?, weekdays = ?, interval_seconds = ?,
+                    jitter_seconds = ?, daily_limit = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    scheduled_start,
+                    str(timezone or "Asia/Shanghai")[:64],
+                    str(window_start or "09:00"),
+                    str(window_end or "18:00"),
+                    str(weekdays or "[1,2,3,4,5]"),
+                    max(1, min(3600, int(interval_seconds or 60))),
+                    max(0, min(600, int(jitter_seconds or 0))),
+                    max(1, min(500, int(daily_limit or 20))),
+                    now,
+                    int(campaign_id),
+                ),
+            )
+
+    def cancel_email_campaign(self, campaign_id: int, reason: str = "") -> None:
+        now = utc_now()
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE email_campaigns SET status = 'cancelled', finished_at = ?, "
+                "paused_reason = ?, updated_at = ? "
+                "WHERE id = ? AND status IN ('draft', 'scheduled', 'sending', 'paused')",
+                (now, str(reason or "")[:200], now, int(campaign_id)),
+            )
+        if cur.rowcount == 0:
+            raise ValueError("当前状态不能取消")
+
+    def delete_email_campaign(self, campaign_id: int) -> None:
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT status FROM email_campaigns WHERE id = ?", (int(campaign_id),)
+            ).fetchone()
+            if not row:
+                raise ValueError("发件任务不存在")
+            if row["status"] != "draft":
+                raise ValueError("只有草稿可以删除；已计划/已发送请取消保留记录")
+            self._conn.execute(
+                "DELETE FROM email_recipients WHERE campaign_id = ?", (int(campaign_id),)
+            )
+            self._conn.execute(
+                "DELETE FROM email_campaigns WHERE id = ?", (int(campaign_id),)
+            )
+
+    def list_email_campaigns(
+        self, user_id: int, *, is_admin: bool = False
+    ) -> list[dict[str, Any]]:
+        where = "" if is_admin else "WHERE c.created_by = ?"
+        params: tuple[Any, ...] = () if is_admin else (int(user_id),)
+        rows = self._conn.execute(
+            f"""
+            SELECT c.*, a.label AS account_label, a.from_email AS account_from_email,
+                   a.scope AS account_scope,
+                   (SELECT COUNT(*) FROM email_recipients r
+                    WHERE r.campaign_id = c.id) AS recipients,
+                   (SELECT COUNT(*) FROM email_recipients r
+                    WHERE r.campaign_id = c.id AND r.status = 'sent') AS sent,
+                   (SELECT COUNT(*) FROM email_recipients r
+                    WHERE r.campaign_id = c.id AND r.status = 'failed') AS failed,
+                   (SELECT COUNT(*) FROM email_recipients r
+                    WHERE r.campaign_id = c.id AND r.status = 'skipped') AS skipped
+            FROM email_campaigns c
+            LEFT JOIN email_accounts a ON a.id = c.account_id
+            {where}
+            ORDER BY c.id DESC
+            """,
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def email_campaign_detail(self, campaign_id: int) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            """
+            SELECT c.*, a.label AS account_label, a.from_email AS account_from_email,
+                   a.scope AS account_scope, a.enabled AS account_enabled,
+                   (SELECT COUNT(*) FROM email_recipients r
+                    WHERE r.campaign_id = c.id) AS recipients,
+                   (SELECT COUNT(*) FROM email_recipients r
+                    WHERE r.campaign_id = c.id AND r.status = 'sent') AS sent,
+                   (SELECT COUNT(*) FROM email_recipients r
+                    WHERE r.campaign_id = c.id AND r.status = 'failed') AS failed,
+                   (SELECT COUNT(*) FROM email_recipients r
+                    WHERE r.campaign_id = c.id AND r.status = 'skipped') AS skipped
+            FROM email_campaigns c
+            LEFT JOIN email_accounts a ON a.id = c.account_id
+            WHERE c.id = ?
+            """,
+            (int(campaign_id),),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def email_campaign_recipients(
+        self,
+        campaign_id: int,
+        *,
+        status: str = "",
+        page: int = 1,
+        page_size: int = 50,
+    ) -> dict[str, Any]:
+        conditions = ["campaign_id = ?"]
+        params: list[Any] = [int(campaign_id)]
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        where = " AND ".join(conditions)
+        total = int(
+            self._conn.execute(
+                f"SELECT COUNT(*) AS n FROM email_recipients WHERE {where}",
+                params,
+            ).fetchone()["n"]
+            or 0
+        )
+        page = max(1, int(page))
+        page_size = max(1, min(200, int(page_size)))
+        rows = self._conn.execute(
+            f"SELECT * FROM email_recipients WHERE {where} "
+            "ORDER BY id ASC LIMIT ? OFFSET ?",
+            [*params, page_size, (page - 1) * page_size],
+        ).fetchall()
+        return {
+            "items": [dict(row) for row in rows],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
+
+    def email_suppressions(self) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM email_suppressions ORDER BY id DESC"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def add_email_suppression(
+        self,
+        email: str,
+        *,
+        reason: str = "",
+        source: str = "manual",
+        created_by: int | None = None,
+    ) -> dict[str, Any]:
+        normalized = normalize_email_address(email)
+        now = utc_now()
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO email_suppressions
+                (email, email_normalized, reason, source, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(email_normalized) DO UPDATE SET
+                    reason = excluded.reason, source = excluded.source
+                """,
+                (
+                    str(email).strip(),
+                    normalized,
+                    str(reason or "")[:200],
+                    str(source or "manual")[:40],
+                    created_by,
+                    now,
+                ),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM email_suppressions WHERE email_normalized = ?",
+                (normalized,),
+            ).fetchone()
+        return dict(row) if row else {}
+
+    def delete_email_suppression(self, suppression_id: int) -> bool:
+        with self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM email_suppressions WHERE id = ?", (int(suppression_id),)
+            )
+        return cur.rowcount > 0
+
+
+    def mark_contacted_from_email(
+        self,
+        platform: str,
+        user_id: str,
+        *,
+        note: str,
+        actor_user_id: int | None = None,
+    ) -> bool:
+        with self._conn:
+            summary = self._cooperation_summary_row_locked(platform, user_id)
+            if not summary or str(summary["cooperation_status"] or "") != "not_contacted":
+                return False
+            open_case = self._open_cooperation_case_locked(platform, user_id)
+            if not open_case:
+                return False
+            try:
+                self._update_cooperation_case_status_locked(
+                    int(open_case["id"]),
+                    "contacted",
+                    note=note,
+                    actor_user_id=actor_user_id,
+                )
+            except ValueError:
+                return False
+            self._sync_cooperation_summary_locked(platform, user_id)
+        return True
+
+    def mark_email_account_auth_failed(self, account_id: int, error: str) -> None:
+        now = utc_now()
+        with self._conn:
+            self._conn.execute(
+                "UPDATE email_accounts SET auth_failed_at = ?, auth_error = ?, "
+                "updated_at = ? WHERE id = ?",
+                (now, str(error or "")[:500], now, int(account_id)),
+            )
+
+    def clear_email_account_auth(self, account_id: int) -> None:
+        with self._conn:
+            self._conn.execute(
+                "UPDATE email_accounts SET auth_failed_at = NULL, auth_error = '' "
+                "WHERE id = ?",
+                (int(account_id),),
+            )
+
+    def pause_email_campaign(self, campaign_id: int, reason: str) -> int:
+        now = utc_now()
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE email_campaigns SET status = 'paused', paused_reason = ?, "
+                "updated_at = ? WHERE id = ? AND status IN ('scheduled', 'sending')",
+                (str(reason or "")[:200], now, int(campaign_id)),
+            )
+        return max(0, cur.rowcount)
+
+    def resume_email_campaign(self, campaign_id: int) -> int:
+        now = utc_now()
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE email_campaigns SET status = 'scheduled', paused_reason = '', "
+                "updated_at = ? WHERE id = ? AND status = 'paused'",
+                (now, int(campaign_id)),
+            )
+        return max(0, cur.rowcount)
+
+    def retry_failed_email_recipients(self, campaign_id: int) -> int:
+        now = utc_now()
+        with self._conn:
+            campaign = self._conn.execute(
+                "SELECT status FROM email_campaigns WHERE id = ?",
+                (int(campaign_id),),
+            ).fetchone()
+            if not campaign:
+                raise ValueError("发件任务不存在")
+            if str(campaign["status"]) == "cancelled":
+                raise ValueError("已取消的任务不能重试，请新建任务")
+            cur = self._conn.execute(
+                """
+                UPDATE email_recipients SET status = 'pending', attempts = 0,
+                    manual_retries = manual_retries + 1,
+                    next_attempt_at = NULL, error_code = '', error_message = '',
+                    updated_at = ?
+                WHERE campaign_id = ? AND status = 'failed' AND manual_retries < 3
+                """,
+                (now, int(campaign_id)),
+            )
+            changed = max(0, cur.rowcount)
+            if changed:
+                self._conn.execute(
+                    "UPDATE email_campaigns SET status = 'scheduled', "
+                    "finished_at = NULL, updated_at = ? "
+                    "WHERE id = ? AND status IN ('completed', 'paused')",
+                    (now, int(campaign_id)),
+                )
+        return changed
+
+    def finish_email_campaign_if_done(self, campaign_id: int) -> bool:
+        now = utc_now()
+        with self._conn:
+            remaining = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM email_recipients "
+                "WHERE campaign_id = ? AND status IN ('pending', 'sending')",
+                (int(campaign_id),),
+            ).fetchone()
+            if int(remaining["n"] or 0) > 0:
+                return False
+            cur = self._conn.execute(
+                "UPDATE email_campaigns SET status = 'completed', finished_at = ?, "
+                "updated_at = ? WHERE id = ? AND status IN ('sending', 'scheduled')",
+                (now, now, int(campaign_id)),
+            )
+        return cur.rowcount > 0
+
+    def acquire_email_worker(
+        self, owner: str, *, stale_seconds: int = 60, now: str | None = None
+    ) -> bool:
+        stamp = now or utc_now()
+        cutoff = (
+            datetime.fromisoformat(stamp) - timedelta(seconds=max(5, stale_seconds))
+        ).isoformat()
+        with self.transaction():
+            row = self._conn.execute(
+                "SELECT owner, heartbeat_at FROM email_worker_state WHERE id = 1"
+            ).fetchone()
+            if (
+                row
+                and row["owner"]
+                and row["owner"] != owner
+                and str(row["heartbeat_at"] or "") > cutoff
+            ):
+                return False
+            self._conn.execute(
+                "INSERT INTO email_worker_state (id, owner, heartbeat_at) "
+                "VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+                "owner = excluded.owner, heartbeat_at = excluded.heartbeat_at",
+                (owner, stamp),
+            )
+        return True
+
+    def renew_email_worker(self, owner: str, *, now: str | None = None) -> bool:
+        stamp = now or utc_now()
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE email_worker_state SET heartbeat_at = ? "
+                "WHERE id = 1 AND owner = ?",
+                (stamp, owner),
+            )
+        return cur.rowcount > 0
+
+
+    def record_email_worker_tick(self, owner: str, error: str = "") -> None:
+        now = utc_now()
+        with self._conn:
+            self._conn.execute(
+                "UPDATE email_worker_state SET heartbeat_at = ?, last_tick_at = ?, "
+                "last_error = ? WHERE id = 1 AND owner = ?",
+                (now, now, str(error or "")[:500], owner),
+            )
+
+    def email_worker_status(self) -> dict[str, Any]:
+        state = self._conn.execute(
+            "SELECT * FROM email_worker_state WHERE id = 1"
+        ).fetchone()
+        counts = self._conn.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM email_campaigns
+                 WHERE status IN ('scheduled', 'sending')) AS active_campaigns,
+                (SELECT COUNT(*) FROM email_recipients r
+                 JOIN email_campaigns c ON c.id = r.campaign_id
+                 WHERE r.status = 'pending'
+                   AND c.status IN ('scheduled', 'sending')) AS pending_recipients,
+                (SELECT COUNT(*) FROM email_recipients
+                 WHERE status = 'sending') AS sending_recipients,
+                (SELECT COUNT(*) FROM email_recipients r
+                 JOIN email_campaigns c ON c.id = r.campaign_id
+                 WHERE r.status = 'failed'
+                   AND c.status IN ('scheduled', 'sending')) AS failed_recipients
+            """
+        ).fetchone()
+        result = dict(state) if state else {}
+        result.update(dict(counts) if counts else {})
+        return result
+
+    def resume_paused_campaigns_for_account(self, account_id: int) -> int:
+        now = utc_now()
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE email_campaigns SET status = 'scheduled', paused_reason = '', "
+                "updated_at = ? WHERE account_id = ? AND status = 'paused'",
+                (now, int(account_id)),
+            )
+        return max(0, cur.rowcount)
+
+    def create_email_unsubscribe_token(
+        self,
+        *,
+        email: str,
+        creator_platform: str,
+        creator_user_id: str,
+        campaign_id: int,
+        recipient_id: int,
+        expires_days: int = 90,
+    ) -> str:
+        raw = secrets.token_urlsafe(32)
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        now = datetime.now(timezone.utc)
+        expires = datetime.fromtimestamp(
+            now.timestamp() + max(1, int(expires_days)) * 86400,
+            tz=timezone.utc,
+        )
+        normalized = normalize_email_address(email)
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO email_unsubscribe_tokens
+                (token_hash, email, email_normalized, creator_platform,
+                 creator_user_id, campaign_id, recipient_id, created_at, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    digest,
+                    str(email).strip(),
+                    normalized,
+                    creator_platform,
+                    creator_user_id,
+                    int(campaign_id),
+                    int(recipient_id),
+                    now.isoformat(),
+                    expires.isoformat(),
+                ),
+            )
+        return raw
+
+    def get_email_unsubscribe_token(self, raw_token: str) -> dict[str, Any] | None:
+        digest = hashlib.sha256(str(raw_token or "").encode("utf-8")).hexdigest()
+        now = datetime.now(timezone.utc)
+        row = self._conn.execute(
+            "SELECT * FROM email_unsubscribe_tokens WHERE token_hash = ?",
+            (digest,),
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            expires = datetime.fromisoformat(str(row["expires_at"]))
+        except ValueError:
+            return None
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        if expires < now:
+            return None
+        item = dict(row)
+        item["already_used"] = bool(item.get("used_at"))
+        item.pop("token_hash", None)
+        return item
+
+    def apply_email_unsubscribe(self, raw_token: str) -> dict[str, Any] | None:
+        digest = hashlib.sha256(str(raw_token or "").encode("utf-8")).hexdigest()
+        now = datetime.now(timezone.utc)
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT * FROM email_unsubscribe_tokens WHERE token_hash = ?",
+                (digest,),
+            ).fetchone()
+            if not row:
+                return None
+            try:
+                expires = datetime.fromisoformat(str(row["expires_at"]))
+            except ValueError:
+                return None
+            if expires.tzinfo is None:
+                expires = expires.replace(tzinfo=timezone.utc)
+            if expires < now:
+                return None
+            normalized = str(row["email_normalized"])
+            self._conn.execute(
+                """
+                INSERT INTO email_suppressions
+                (email, email_normalized, reason, source, created_by, created_at)
+                VALUES (?, ?, '用户退订', 'link', NULL, ?)
+                ON CONFLICT(email_normalized) DO UPDATE SET
+                    reason = excluded.reason, source = excluded.source
+                """,
+                (row["email"], normalized, now.isoformat()),
+            )
+            self._conn.execute(
+                "UPDATE email_unsubscribe_tokens SET used_at = COALESCE(used_at, ?) "
+                "WHERE id = ?",
+                (now.isoformat(), int(row["id"])),
+            )
+            affected = self._conn.execute(
+                "SELECT DISTINCT campaign_id FROM email_recipients "
+                "WHERE email_normalized = ? AND status = 'pending'",
+                (normalized,),
+            ).fetchall()
+            skipped_cur = self._conn.execute(
+                "UPDATE email_recipients SET status = 'skipped', claimed_at = NULL, "
+                "error_code = 'unsubscribed', error_message = '用户通过邮件退订', "
+                "next_attempt_at = NULL, updated_at = ? "
+                "WHERE email_normalized = ? AND status = 'pending'",
+                (now.isoformat(), normalized),
+            )
+            skipped_count = max(0, skipped_cur.rowcount)
+        for item in affected:
+            if item["campaign_id"] is not None:
+                self.finish_email_campaign_if_done(int(item["campaign_id"]))
+        return {
+            "email": row["email"],
+            "already_used": bool(row["used_at"]),
+            "skipped_recipients": skipped_count,
+        }
 
     def prune_maintenance(self, audit_retention_days: int = 365) -> dict[str, int]:
         now = utc_now()
@@ -7493,11 +9490,17 @@ class Database:
             audits = self._conn.execute(
                 "DELETE FROM audit_log WHERE ts < ?", (cutoff,)
             ).rowcount
+            tokens = self._conn.execute(
+                "DELETE FROM email_unsubscribe_tokens "
+                "WHERE expires_at < ? OR (used_at IS NOT NULL AND used_at < ?)",
+                (now, cutoff),
+            ).rowcount
         return {
             "sessions": max(0, expired) + max(0, overflow),
             "sessions_expired": max(0, expired),
             "sessions_overflow": max(0, overflow),
             "audit_log": max(0, audits),
+            "email_unsubscribe_tokens": max(0, tokens),
         }
 
     def prune_raw_and_calls(
@@ -7597,8 +9600,8 @@ class Database:
                     (utc_now(), token_hash),
                 )
         user = self._conn.execute(
-            "SELECT id, username, role, disabled, can_collect, can_edit_leads, must_change_password, "
-            "auth_source, created_at, updated_at, last_login_at "
+            "SELECT id, username, role, disabled, can_collect, can_edit_leads, can_send_email, "
+            "must_change_password, auth_source, created_at, updated_at, last_login_at "
             "FROM users WHERE id = ? AND disabled = 0",
             (row["user_id"],),
         ).fetchone()

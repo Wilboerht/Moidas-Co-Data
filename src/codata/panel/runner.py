@@ -9,6 +9,26 @@ import time
 
 from ..config import PROJECT_ROOT, Settings
 from ..db import Database
+from ..normalize import utc_now
+from ..processes import process_matches
+
+
+def _mark_start_failure(
+    db: Database, job_id: int, round_id: int, message: str
+) -> None:
+    try:
+        db.finish_job(
+            job_id,
+            round_id,
+            status="failed",
+            stage="启动失败",
+            error=message,
+            cost=db.sum_job_cost(job_id),
+            round_cost=db.sum_round_cost(round_id),
+            finished_at=utc_now(),
+        )
+    except Exception:
+        pass
 
 
 def start_round_job(
@@ -64,57 +84,18 @@ def start_round_job(
                 creationflags=creationflags,
             )
     except Exception as exc:
-        db.update_job(job_id, status="failed", stage="启动失败", error=str(exc))
+        _mark_start_failure(db, job_id, round_id, f"启动失败: {exc}")
         raise
     try:
         db.update_job(job_id, pid=process.pid)
-    except Exception:
+    except Exception as exc:
         try:
             process.kill()
         except OSError:
             pass
+        _mark_start_failure(db, job_id, round_id, f"记录进程信息失败: {exc}")
         raise
     return job_id, log_path
-
-
-def _process_command_line(pid: int) -> str:
-    if os.name == "nt":
-        try:
-            result = subprocess.run(
-                [
-                    "powershell",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    f"(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine",
-                ],
-                capture_output=True,
-                text=True,
-                errors="replace",
-                check=False,
-                timeout=10,
-            )
-        except Exception:
-            return ""
-        return result.stdout or ""
-    try:
-        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-    except OSError:
-        return ""
-    return " ".join(
-        part for part in raw.decode("utf-8", errors="replace").split("\x00") if part
-    )
-
-
-def _process_matches(pid: int, round_id: int | None, job_id: int | None) -> bool:
-    if round_id is None or job_id is None:
-        return False
-    text = _process_command_line(pid)
-    return (
-        "codata.jobs" in text
-        and f"--round-id {round_id}" in text
-        and f"--job-id {job_id}" in text
-    )
 
 
 def terminate_job_process(
@@ -122,7 +103,7 @@ def terminate_job_process(
     round_id: int | None = None,
     job_id: int | None = None,
 ) -> bool:
-    if not pid or not _process_matches(int(pid), round_id, job_id):
+    if not pid or not process_matches(int(pid), round_id, job_id):
         return False
     try:
         if os.name == "nt":

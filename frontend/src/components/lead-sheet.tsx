@@ -5,6 +5,7 @@ import { toast } from "sonner";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, ApiError } from "@/shared/api";
 import { useAuth } from "@/shared/auth-context";
+import { useUnsavedGuard } from "@/shared/use-unsaved-guard";
 import { useRound } from "@/shared/round-context";
 import { assumeHttpUrl, fmtDateTime } from "@/shared/format";
 import type { LeadOwner, LeadStatusDef, LeadVerifyResult } from "@/shared/types";
@@ -101,6 +102,17 @@ const ATTEMPT_STATUS_LABELS: Record<string, string> = {
   error: "匹配失败",
 };
 
+const IDENTITY_EVENT_LABELS: Record<string, string> = {
+  converted: "转为达人",
+  mismatch_confirmed: "确认采用抓取账号",
+  mismatch_blocked: "账号不一致已阻止",
+  verify_verified: "校验通过",
+  verify_mismatch: "校验不一致",
+  verify_not_found: "未找到账号",
+  verify_error: "校验失败",
+  migrated: "身份迁移",
+};
+
 export function LeadSheet({
   leadId,
   statuses,
@@ -175,7 +187,6 @@ export function LeadSheet({
   );
   const providerReady = Boolean(selectedProvider?.ready);
   const providerCostTokens = selectedProvider?.user_cost_tokens ?? 0;
-  const providerCostCny = selectedProvider?.user_cost_cny ?? "—";
   const needsHandleResolution =
     platform === "xhs" &&
     !accountId.trim() &&
@@ -184,6 +195,12 @@ export function LeadSheet({
   const providerTotalCostTokens =
     providerCostTokens +
     (needsHandleResolution ? (selectedProvider?.search_cost_tokens ?? 0) : 0);
+  const providerCostCny = selectedProvider
+    ? (
+        Number(selectedProvider.user_cost_cny) +
+        (needsHandleResolution ? Number(selectedProvider.search_cost_cny) : 0)
+      ).toFixed(2)
+    : "—";
   const needsUserId =
     !accountId.trim() &&
     !profileUrl.trim() &&
@@ -284,7 +301,7 @@ export function LeadSheet({
       });
     },
     onSuccess: async () => {
-      toast.success("线索已转为达人");
+      toast.success("线索已转为达人（待采用）");
       setMismatchResult(null);
       setVerifyResult(null);
       await refresh();
@@ -306,15 +323,26 @@ export function LeadSheet({
   });
 
   const verifyMutation = useMutation({
-    mutationFn: (options: { apply?: boolean; confirmMismatch?: boolean } = {}) =>
-      api.verifyLead(leadId, {
+    mutationFn: async (options: { apply?: boolean; confirmMismatch?: boolean } = {}) => {
+      if (dirty) {
+        await api.updateLead(leadId, {
+          platform,
+          nickname: nickname.trim(),
+          account_id: accountId.trim(),
+          platform_handle: platformHandle.trim(),
+          profile_url: profileUrl.trim(),
+          source_round_id: sourceRoundId === "none" ? null : Number(sourceRoundId),
+        });
+      }
+      return api.verifyLead(leadId, {
         provider,
         account_id: accountId.trim() || undefined,
         platform_handle: platformHandle.trim() || undefined,
         profile_url: profileUrl.trim() || undefined,
         apply: options.apply,
         confirm_mismatch: options.confirmMismatch,
-      }),
+      });
+    },
     onSuccess: async (result) => {
       setVerifyResult(result);
       if (result.applied) {
@@ -374,6 +402,8 @@ export function LeadSheet({
       platformHandle !== (lead?.platform_handle || "") ||
       profileUrl !== (lead?.profile_url || "") ||
       sourceRoundId !== (lead?.source_round_id ? String(lead.source_round_id) : "none"));
+  useUnsavedGuard(dirty, "有未保存的线索修改，确定离开当前页面？");
+
   const canIdentify = Boolean(
     accountId.trim() || platformHandle.trim() || profileUrl.trim(),
   );
@@ -511,9 +541,14 @@ export function LeadSheet({
                 <Skeleton className="h-32 w-full" />
               </div>
             ) : query.error || !lead ? (
-              <p className="text-sm text-destructive">
-                {query.error instanceof Error ? query.error.message : "线索加载失败"}
-              </p>
+              <div className="space-y-2">
+                <p className="text-sm text-destructive">
+                  {query.error instanceof Error ? query.error.message : "线索加载失败"}
+                </p>
+                <Button variant="outline" size="sm" onClick={() => void query.refetch()}>
+                  重试
+                </Button>
+              </div>
             ) : (
               <div className="space-y-5">
                 <form
@@ -803,7 +838,7 @@ export function LeadSheet({
                     <Select
                       value={lead.owner_user_id == null ? "none" : String(lead.owner_user_id)}
                       onValueChange={(value) => ownerMutation.mutate(value === "none" ? null : Number(value))}
-                      disabled={!editable || ownerMutation.isPending}
+                      disabled={!editable || ownerMutation.isPending || dirty}
                     >
                       <SelectTrigger id="lead-owner" className="w-full">
                         <SelectValue placeholder="未分配" />
@@ -823,7 +858,7 @@ export function LeadSheet({
                     <Select
                       value={lead.status}
                       onValueChange={(value) => statusMutation.mutate(value)}
-                      disabled={!editable || statusMutation.isPending}
+                      disabled={!editable || statusMutation.isPending || dirty}
                     >
                       <SelectTrigger id="lead-status" className="w-full">
                         <SelectValue />
@@ -882,7 +917,7 @@ export function LeadSheet({
                             variant="ghost"
                             size="sm"
                             onClick={() => matchMutation.mutate()}
-                            disabled={matchMutation.isPending}
+                            disabled={matchMutation.isPending || dirty}
                           >
                             {matchMutation.isPending ? (
                               <LoaderCircle className="animate-spin" />
@@ -935,7 +970,7 @@ export function LeadSheet({
                 </dl>
                 {lead.attempts.length > 0 ? (
                   <section className="space-y-2 border-t pt-4">
-                    <h3 className="text-sm font-semibold">核实记录</h3>
+                    <h3 className="text-sm font-semibold">匹配与校验尝试</h3>
                     <div className="divide-y border-y text-sm">
                       {lead.attempts.slice(0, 6).map((attempt) => (
                         <div key={attempt.id} className="space-y-0.5 py-2">
@@ -978,7 +1013,7 @@ export function LeadSheet({
                                 <Button
                                   size="sm"
                                   variant="outline"
-                                  disabled={busy}
+                                  disabled={busy || dirty}
                                   onClick={() =>
                                     confirmSuggestionMutation.mutate({
                                       user_id: attempt.candidate_user_id,
@@ -1007,13 +1042,13 @@ export function LeadSheet({
                 ) : null}
                 {lead.identity_events.length > 0 ? (
                   <section className="space-y-2 border-t pt-4">
-                    <h3 className="text-sm font-semibold">身份校验记录</h3>
+                    <h3 className="text-sm font-semibold">账号变更记录</h3>
                     <div className="divide-y border-y text-sm">
                       {lead.identity_events.slice(0, 6).map((event) => (
                         <div key={event.id} className="space-y-0.5 py-2">
                           <div className="flex flex-wrap items-center justify-between gap-2">
                             <span className="flex flex-wrap items-center gap-2">
-                              <span>{event.event_type}</span>
+                              <span>{IDENTITY_EVENT_LABELS[event.event_type] || event.event_type}</span>
                               <Badge variant="secondary" className="font-normal">
                                 {IDENTITY_STATUS_LABELS[event.status] || event.status}
                               </Badge>
@@ -1073,7 +1108,7 @@ export function LeadSheet({
                         size="icon"
                         aria-label="更多操作"
                         title="更多操作"
-                        disabled={busy}
+                        disabled={busy || dirty}
                       >
                         <MoreHorizontal />
                       </Button>

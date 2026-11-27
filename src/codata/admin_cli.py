@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
 import json
+import os
+import shutil
+import sqlite3
 import sys
+from datetime import datetime
+from pathlib import Path
 
 from .auth import hash_password, normalize_username, validate_password, validate_username
-from .config import load_settings
-from .db import Database
+from .config import PROJECT_ROOT, load_settings, runtime_env_path
+from .db import Database, SCHEMA_VERSION
+from .diagnostics import config_warnings, status_report
+from .email_crypto import default_key_path, key_fingerprint, load_key
 from .lead_identity import verify_lead_identity
 from .matching import backfill_matches
 from .platforms import load_registry
@@ -172,6 +180,257 @@ def _refresh_creators(
     print(f"完成：成功 {success}，失败 {failed}，预计消耗 {spent} token")
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _db_integrity(path: Path) -> tuple[bool, str, int | None]:
+    try:
+        conn = sqlite3.connect(path)
+        try:
+            result = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        finally:
+            conn.close()
+    except Exception as exc:
+        return False, str(exc), None
+    return str(result).lower() == "ok", str(result), version
+
+
+def _verify_backup(source: Path) -> dict:
+    source = Path(source).expanduser()
+    errors: list[str] = []
+    warnings: list[str] = []
+    db_path = source / "codata.sqlite"
+    manifest_path = source / "manifest.json"
+    schema_version: int | None = None
+    if not db_path.is_file():
+        errors.append("缺少 codata.sqlite")
+    else:
+        ok, detail, schema_version = _db_integrity(db_path)
+        if not ok:
+            errors.append(f"数据库完整性检查失败: {detail}")
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            errors.append(f"manifest.json 无法解析: {exc}")
+        else:
+            root = source.resolve()
+            for item in manifest.get("files") or []:
+                relative = str(item.get("path") or "")
+                if not relative:
+                    continue
+                path = (source / relative).resolve()
+                if not path.is_relative_to(root):
+                    errors.append(f"manifest 路径越界: {relative}")
+                elif not path.is_file():
+                    errors.append(f"缺少文件: {relative}")
+                elif _sha256(path) != item.get("sha256"):
+                    errors.append(f"校验和不匹配: {relative}")
+            schema_version = manifest.get("schema_version", schema_version)
+            backup_key = manifest.get("email_key_fingerprint") or ""
+            current_key = key_fingerprint() or ""
+            if backup_key and current_key and backup_key != current_key:
+                warnings.append(
+                    "备份的邮件加密密钥指纹与当前密钥不一致；恢复后需使用原密钥才能解密 SMTP 密码"
+                )
+    else:
+        warnings.append("备份没有 manifest.json，仅检查数据库完整性")
+    if schema_version is not None and schema_version > SCHEMA_VERSION:
+        errors.append(
+            f"备份 schema v{schema_version} 高于当前程序 v{SCHEMA_VERSION}"
+        )
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "warnings": warnings,
+        "schema_version": schema_version,
+        "has_manifest": manifest_path.is_file(),
+    }
+
+
+def _backup(
+    db: Database,
+    settings,
+    out_dir: str | None,
+    *,
+    project_root: Path = PROJECT_ROOT,
+    runtime_env: Path | None = None,
+) -> None:
+    base = Path(out_dir).expanduser() if out_dir else settings.output_dir / "backups"
+    if not base.is_absolute():
+        base = project_root / base
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    target = base / f"codata-{stamp}"
+    target.mkdir(parents=True, exist_ok=True)
+    staged = db.backup("manual")
+    shutil.copy2(staged, target / "codata.sqlite")
+    staged.unlink(missing_ok=True)
+    copied = ["codata.sqlite"]
+    env_path = project_root / ".env"
+    if env_path.is_file():
+        shutil.copy2(env_path, target / ".env")
+        copied.append(".env")
+    runtime = runtime_env if runtime_env is not None else runtime_env_path()
+    if runtime.is_file() and runtime.resolve() != env_path.resolve():
+        shutil.copy2(runtime, target / "runtime.env")
+        copied.append("runtime.env")
+    attachments = settings.output_dir / "cooperation_attachments"
+    if attachments.is_dir():
+        shutil.copytree(
+            attachments, target / "cooperation_attachments", dirs_exist_ok=True
+        )
+        copied.append("cooperation_attachments")
+    files = []
+    for path in sorted(target.rglob("*")):
+        if not path.is_file() or path.name == "manifest.json":
+            continue
+        files.append(
+            {
+                "path": path.relative_to(target).as_posix(),
+                "sha256": _sha256(path),
+                "bytes": path.stat().st_size,
+            }
+        )
+    manifest = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "schema_version": int(db._conn.execute("PRAGMA user_version").fetchone()[0]),
+        "email_key_fingerprint": key_fingerprint(),
+        "files": files,
+    }
+    (target / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    print(f"备份完成: {target}")
+    print(f"包含: {', '.join(copied)}")
+    report = _verify_backup(target)
+    if report["ok"]:
+        print("备份校验: 通过")
+    else:
+        for error in report["errors"]:
+            print(f"备份校验失败: {error}", file=sys.stderr)
+
+
+def _restore(
+    settings,
+    source: str,
+    *,
+    check_only: bool,
+    yes: bool,
+    project_root: Path = PROJECT_ROOT,
+    runtime_env: Path | None = None,
+) -> None:
+    source_dir = Path(source).expanduser()
+    report = _verify_backup(source_dir)
+    print(f"备份目录: {source_dir}")
+    print(
+        f"schema: {report['schema_version'] if report['schema_version'] is not None else '未知'}"
+        f" · manifest: {'有' if report['has_manifest'] else '无'}"
+    )
+    for warning in report["warnings"]:
+        print(f"提示: {warning}")
+    if not report["ok"]:
+        for error in report["errors"]:
+            print(f"校验失败: {error}", file=sys.stderr)
+        raise SystemExit("备份校验失败，已中止恢复")
+    if check_only:
+        print("备份校验通过（未写入任何数据）")
+        return
+    if not yes:
+        raise SystemExit("恢复会覆盖当前数据库、env 和合作附件；确认后加 --yes")
+    runtime_env = runtime_env if runtime_env is not None else runtime_env_path()
+    try:
+        with Database(settings.output_dir) as db:
+            print(f"已备份当前数据库: {db.backup('restore-before')}")
+    except Exception as exc:
+        print(f"提示: 当前数据库无法备份（{exc}），继续恢复")
+    target_db = settings.output_dir / "codata.sqlite"
+    for suffix in ("-wal", "-shm", "-journal"):
+        (settings.output_dir / f"codata.sqlite{suffix}").unlink(missing_ok=True)
+    try:
+        shutil.copy2(source_dir / "codata.sqlite", target_db)
+    except OSError as exc:
+        raise SystemExit(f"无法覆盖数据库（面板可能仍在运行）: {exc}") from exc
+    env_src = source_dir / ".env"
+    if env_src.is_file():
+        shutil.copy2(env_src, project_root / ".env")
+        print(f"已恢复: {project_root / '.env'}")
+    runtime_src = source_dir / "runtime.env"
+    if runtime_src.is_file():
+        runtime_env.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(runtime_src, runtime_env)
+        print(f"已恢复: {runtime_env}")
+    attachments_src = source_dir / "cooperation_attachments"
+    if attachments_src.is_dir():
+        attachments_target = settings.output_dir / "cooperation_attachments"
+        shutil.rmtree(attachments_target, ignore_errors=True)
+        shutil.copytree(attachments_src, attachments_target)
+        print(f"已恢复: {attachments_target}")
+    ok, detail, _schema = _db_integrity(target_db)
+    if not ok:
+        raise SystemExit(f"恢复后的数据库完整性检查失败: {detail}")
+    print("恢复完成；请重启面板使数据生效。")
+
+
+def _config_check(settings) -> None:
+    print(f"数据目录: {settings.output_dir}")
+    print(f"允许 Host: {', '.join(settings.allowed_hosts)}")
+    print(f"允许 Origin: {', '.join(settings.allowed_origins)}")
+    print(
+        "Cookie Secure: "
+        f"{settings.cookie_secure} · Docs: {settings.enable_docs} · "
+        f"会话 {settings.session_days} 天"
+    )
+    print(
+        "保留策略: "
+        f"审计 {settings.audit_retention_days} 天 · 日志 {settings.log_retention_days} 天 · "
+        f"原始响应 {settings.raw_retention_days} 天 · API 调用 {settings.api_call_retention_days} 天 · "
+        f"备份 {settings.backup_retention_days} 天/{settings.backup_retention_count} 份"
+    )
+    try:
+        registry = load_registry(settings)
+    except Exception as exc:
+        print(f"平台配置错误: {exc}")
+    else:
+        for code, platform in registry.platforms.items():
+            if not platform.enabled:
+                continue
+            options = [
+                f"{item.provider.id}={'ready' if item.ready else '未配置'}"
+                for item in platform.providers.values()
+                if item.enabled
+            ]
+            print(f"平台 {code}: {', '.join(options) or '无可用服务商'}")
+    key_path = default_key_path()
+    fingerprint = key_fingerprint()
+    print(
+        f"邮件加密密钥: {key_path} · "
+        f"{'已初始化 ' + (fingerprint or '') if fingerprint else '未初始化'}"
+    )
+    if fingerprint is None:
+        print("提示: 使用自动发件前运行 codata-admin email-key --init")
+    enabled = {"1", "true", "yes", "on"}
+    print(
+        "SMTP 内网地址: "
+        f"{'允许' if os.getenv('CODATA_SMTP_ALLOW_PRIVATE', '').lower() in enabled else '禁止'}"
+    )
+    print(
+        "SMTP 明文连接: "
+        f"{'允许' if os.getenv('CODATA_SMTP_ALLOW_PLAINTEXT', '').lower() in enabled else '禁止'}"
+    )
+    warnings = config_warnings(settings)
+    if warnings:
+        for warning in warnings:
+            print(f"警告: {warning}")
+    else:
+        print("配置检查: 未发现明显风险")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="codata-admin", description="Co-data 账号管理")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -189,6 +448,18 @@ def main(argv: list[str] | None = None) -> None:
     reset.add_argument("--password", help="仅用于自动化；交互使用时省略")
 
     sub.add_parser("list-users", help="列出账号")
+    sub.add_parser("config-check", help="打印生效配置与安全告警")
+    sub.add_parser("status", help="打印数据库、任务、备份和磁盘状态")
+    verify_backup = sub.add_parser("backup-verify", help="校验备份目录的完整性和校验和")
+    verify_backup.add_argument("--path", required=True, help="备份目录")
+    restore = sub.add_parser("restore", help="从备份目录恢复数据库、env 和合作附件")
+    restore.add_argument("--from", dest="source", required=True, help="备份目录")
+    restore.add_argument("--yes", action="store_true", help="确认覆盖当前数据")
+    restore.add_argument("--check-only", action="store_true", help="只校验、不恢复")
+    email_key = sub.add_parser("email-key", help="查看或初始化邮件账号加密密钥")
+    email_key.add_argument("--init", action="store_true", help="生成密钥文件")
+    backup = sub.add_parser("backup", help="备份数据库、环境文件和合作附件")
+    backup.add_argument("--out", help="备份目录，默认 data/backups")
     backups = sub.add_parser("backups-prune", help="按保留策略清理数据库备份（默认仅报告）")
     backups.add_argument("--apply", action="store_true", help="删除超出保留策略的备份")
     dedupe = sub.add_parser("leads-dedupe", help="清理重复线索并启用唯一索引")
@@ -215,6 +486,30 @@ def main(argv: list[str] | None = None) -> None:
 
     args = parser.parse_args(argv)
     settings = load_settings(require_credentials=False)
+    if args.command == "backup-verify":
+        report = _verify_backup(Path(args.path))
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        raise SystemExit(0 if report["ok"] else 1)
+    if args.command == "email-key":
+        path = default_key_path()
+        if args.init:
+            load_key(create=True)
+            print(f"已初始化邮件加密密钥: {path}")
+        fingerprint = key_fingerprint()
+        print(f"密钥文件: {path}")
+        print(f"状态: {'已初始化 ' + (fingerprint or '') if fingerprint else '未初始化'}")
+        return
+    if args.command == "restore":
+        _restore(
+            settings,
+            args.source,
+            check_only=args.check_only,
+            yes=args.yes,
+        )
+        return
+    if args.command == "config-check":
+        _config_check(settings)
+        return
     with Database(settings.output_dir) as db:
         try:
             if args.command == "create-admin":
@@ -237,6 +532,10 @@ def main(argv: list[str] | None = None) -> None:
                 )
                 db.delete_user_sessions(user["id"])
                 print(f"已重置 {username} 的密码，并注销其会话")
+            elif args.command == "status":
+                print(json.dumps(status_report(db, settings), ensure_ascii=False, indent=2))
+            elif args.command == "backup":
+                _backup(db, settings, args.out)
             elif args.command == "list-users":
                 users = db.list_users()
                 if not users:

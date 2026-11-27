@@ -17,7 +17,8 @@ from codata.identity import split_platform_identity
 from codata.lead_identity import LeadIdentityMismatch, verify_lead_identity
 from codata.leads import convert_lead
 from codata.matching import match_round_leads
-from codata.normalize import normalize_user_info
+from codata.normalize import normalize_rnote_user, normalize_user_info
+from codata.normalize_platform import normalize_user_platform
 from codata.platforms import Price
 from codata.providers import SearchResponse
 from helpers import user_payload
@@ -138,6 +139,10 @@ class LeadIdentityTests(unittest.TestCase):
             ("1871974895", ""),
         )
         self.assertEqual(
+            split_platform_identity("douyin", "MS4wLjABAAAAabcdefghijklmnop"),
+            ("MS4wLjABAAAAabcdefghijklmnop", ""),
+        )
+        self.assertEqual(
             split_platform_identity("instagram", "some_handle"),
             ("some_handle", "some_handle"),
         )
@@ -223,6 +228,100 @@ class LeadIdentityTests(unittest.TestCase):
                 for event in self.db.lead_identity_events(lead_id)
             )
         )
+
+    def test_rnote_mismatch_cannot_be_hidden_by_requested_id(self) -> None:
+        lead_id = self.db.create_lead(
+            platform="xhs",
+            nickname="张三",
+            account_id=USER_A,
+            platform_handle="handle1",
+            source_round_id=self.round_id,
+        )
+        provider = FakeProvider(profile_payload(USER_B, "李四", "other_handle"))
+        provider.normalize_user = normalize_rnote_user
+        patches = self._patched(provider=provider)
+        with patches[0], patches[1]:
+            result = verify_lead_identity(self.db, self.settings, lead_id)
+        self.assertEqual(result["status"], "mismatch")
+        self.assertEqual(result["resolved_user_id"], USER_B)
+        self.assertNotEqual(result["confidence"], "account_id")
+
+    def test_douyin_sec_uid_profile_calls_provider(self) -> None:
+        sec_uid = "MS4wLjABAAAAabcdefghijklmnop"
+        lead_id = self.db.create_lead(
+            platform="douyin",
+            nickname="抖音达人",
+            profile_url=f"https://www.douyin.com/user/{sec_uid}",
+            source_round_id=self.round_id,
+        )
+        provider = FakeProvider(
+            {"code": 200, "data": {"sec_uid": sec_uid, "nickname": "抖音达人"}}
+        )
+        provider.platform = "douyin"
+        provider.normalize_user = lambda payload, user_id: normalize_user_platform(
+            "douyin", payload, user_id
+        )
+        patches = self._patched(provider=provider)
+        with patches[0], patches[1]:
+            result = verify_lead_identity(self.db, self.settings, lead_id)
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(result["resolved_user_id"], sec_uid)
+        self.assertEqual(provider.user_calls, [sec_uid])
+
+    def test_profile_failure_preserves_successful_search_cost(self) -> None:
+        lead_id = self.db.create_lead(
+            platform="xhs",
+            nickname="张三",
+            platform_handle="handle1",
+            source_round_id=self.round_id,
+        )
+        provider = FakeProvider(
+            profile_payload(USER_A, "张三", "handle1"),
+            search_items=[
+                {
+                    "user_id": USER_A,
+                    "red_id": "handle1",
+                    "nickname": "张三",
+                }
+            ],
+            user_error=RuntimeError("profile failed"),
+            user_cost_tokens=45,
+            search_cost_tokens=45,
+        )
+        patches = self._patched(provider=provider)
+        with patches[0], patches[1]:
+            result = verify_lead_identity(self.db, self.settings, lead_id)
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["search_cost"], 45)
+        self.assertEqual(result["cost"], 45)
+        self.assertEqual(result["cost_native"], 45)
+        self.assertEqual(result["estimated_cost"], 90)
+
+    def test_confirm_mismatch_records_matched_attempt(self) -> None:
+        lead_id = self.db.create_lead(
+            platform="xhs",
+            nickname="张三",
+            account_id=USER_A,
+            platform_handle="handle1",
+            source_round_id=self.round_id,
+        )
+        patches = self._patched(profile_payload(USER_B, "李四", "other_handle"))
+        with patches[0], patches[1]:
+            result = verify_lead_identity(
+                self.db,
+                self.settings,
+                lead_id,
+                apply=True,
+                confirm_mismatch=True,
+            )
+        self.assertTrue(result["applied"])
+        attempts = [
+            attempt
+            for attempt in self.db.lead_attempts(lead_id)
+            if attempt["candidate_user_id"] == USER_B
+        ]
+        self.assertTrue(attempts)
+        self.assertEqual(attempts[0]["status"], "matched")
 
     def test_matching_uses_platform_handle(self) -> None:
         self.db.upsert_creator(normalize_user_info(user_payload("u1", "达人")))

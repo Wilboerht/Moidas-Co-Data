@@ -62,6 +62,7 @@ export interface RoundImpact {
   cost_tokens: number;
   raw_files: number;
   log_files: number;
+  live_process?: boolean;
   can_purge: boolean;
 }
 
@@ -429,6 +430,164 @@ export interface LeadMatchResult {
   examples: { lead_id: number; user_id: string; confidence: string }[];
 }
 
+
+export interface EmailAccount {
+  id: number;
+  scope: "personal" | "shared";
+  owner_user_id: number | null;
+  label: string;
+  from_name: string;
+  from_email: string;
+  reply_to: string;
+  host: string;
+  port: number;
+  security: "ssl" | "starttls" | "none" | string;
+  username: string;
+  daily_limit: number;
+  min_interval_seconds: number;
+  paused_campaigns: number;
+  enabled: boolean;
+  has_password: boolean;
+  last_test_at: string | null;
+  last_test_error: string;
+  auth_failed_at: string | null;
+  auth_error: string;
+  can_manage: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface EmailAccountInput {
+  scope?: string;
+  label?: string;
+  from_name?: string;
+  from_email: string;
+  reply_to?: string;
+  host: string;
+  port: number;
+  security?: string;
+  username: string;
+  password?: string;
+  daily_limit?: number;
+  min_interval_seconds?: number;
+  enabled?: boolean;
+}
+
+export interface CreatorEmail {
+  id: number;
+  platform: string;
+  user_id: string;
+  email: string;
+  email_normalized: string;
+  label: string;
+  source: string;
+  is_primary: number;
+  last_sent_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface EmailTarget {
+  platform: string;
+  user_id: string;
+  nickname: string;
+  avatar: string;
+  fans: number | null;
+  profile_url: string;
+  follow_up_user_id: number | null;
+  owner_username: string;
+  email: string | null;
+  email_count: number;
+  last_creator_sent_at?: string | null;
+  last_email_sent_at?: string | null;
+  cooldown_until?: string;
+  cooldown_reason?: string;
+}
+
+export interface EmailRecipient {
+  id: number;
+  campaign_id: number;
+  creator_platform: string;
+  creator_user_id: string;
+  creator_nickname: string;
+  email: string;
+  email_normalized: string;
+  status: "pending" | "sending" | "sent" | "failed" | "skipped" | string;
+  attempts: number;
+  manual_retries: number;
+  next_attempt_at: string | null;
+  last_attempt_at: string | null;
+  claimed_at: string | null;
+  sent_at: string | null;
+  message_id: string;
+  error_code: string;
+  error_message: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface EmailCampaign {
+  id: number;
+  name: string;
+  account_id: number;
+  account_label: string;
+  account_from_email: string;
+  account_scope: string;
+  subject: string;
+  body: string;
+  status: string;
+  scheduled_start: string | null;
+  timezone: string;
+  window_start: string;
+  window_end: string;
+  weekdays: number[];
+  interval_seconds: number;
+  jitter_seconds: number;
+  daily_limit: number;
+  auto_mark_contacted: boolean;
+  recipients: number;
+  sent: number;
+  failed: number;
+  skipped_count: number;
+  created_by: number | null;
+  created_at: string;
+  updated_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  paused_reason: string;
+  skipped?: { user_id: string; reason: string }[];
+}
+
+export interface EmailCampaignDetail {
+  campaign: EmailCampaign;
+  recipients: EmailRecipient[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface EmailWorkerStatus {
+  owner: string;
+  heartbeat_at: string | null;
+  last_tick_at: string | null;
+  last_error: string;
+  active_campaigns: number;
+  pending_recipients: number;
+  sending_recipients: number;
+  failed_recipients: number;
+  stale: boolean;
+  public_url_configured: boolean;
+}
+
+export interface EmailSuppression {
+  id: number;
+  email: string;
+  email_normalized: string;
+  reason: string;
+  source: string;
+  created_at: string;
+}
+
 export interface LeadOwner {
   id: number;
   username: string;
@@ -525,6 +684,7 @@ export interface Settings {
   providers: ProviderSettings[];
   platforms: PlatformSettings[];
   default_provider: string | null;
+  email_public_url?: string;
 }
 
 export interface Balance {
@@ -542,6 +702,7 @@ export interface AuthUser {
   disabled: boolean;
   can_collect: boolean;
   can_edit_leads: boolean;
+  can_send_email: boolean;
   must_change_password: boolean;
   auth_source: string;
   created_at: string;

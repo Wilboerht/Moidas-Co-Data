@@ -11,8 +11,16 @@ DOUYIN_COST = 90
 class DataFlowAPI:
     """dataflow.apifox.cn 接口封装，参数名与官方文档保持一致。"""
 
-    def __init__(self, client: DataFlowClient) -> None:
+    def __init__(
+        self,
+        client: DataFlowClient,
+        *,
+        xhs_cost: int = XHS_COST,
+        douyin_cost: int = DOUYIN_COST,
+    ) -> None:
         self.client = client
+        self.xhs_cost = int(xhs_cost)
+        self.douyin_cost = int(douyin_cost)
 
     # ---- 账户 ----
 
@@ -32,55 +40,55 @@ class DataFlowAPI:
         return self.client.get(
             "/api/xhs/v3/appsearch",
             {"keyword": keyword, "page": page, "sort_type": sort_type, "note_type": note_type, "note_time": note_time},
-            cost=XHS_COST,
+            cost=self.xhs_cost,
         )
 
     def xhs_note(self, note_id: str, channel: str = "old") -> Any:
         path = "/api/xhs/v3/notedetailv2" if channel == "new" else "/api/xhs/v3/notedetail"
-        return self.client.get(path, {"noteId": note_id}, cost=XHS_COST)
+        return self.client.get(path, {"noteId": note_id}, cost=self.xhs_cost)
 
     def xhs_note_full(self, note_id: str) -> Any:
-        return self.client.get("/api/xhs/v3/fullnotedetail", {"noteId": note_id}, cost=XHS_COST)
+        return self.client.get("/api/xhs/v3/fullnotedetail", {"noteId": note_id}, cost=self.xhs_cost)
 
     def xhs_note_video(self, note_id: str) -> Any:
-        return self.client.get("/api/xhs/v3/videonotedetail", {"noteId": note_id}, cost=XHS_COST)
+        return self.client.get("/api/xhs/v3/videonotedetail", {"noteId": note_id}, cost=self.xhs_cost)
 
     def xhs_comments(self, note_id: str, cursor: str | None = None, sort_strategy: str | None = None) -> Any:
         return self.client.get(
             "/api/xhs/v3/getcomment",
             {"noteId": note_id, "cursor": cursor, "sort_strategy": sort_strategy},
-            cost=XHS_COST,
+            cost=self.xhs_cost,
         )
 
     def xhs_sub_comments(self, note_id: str, comment_id: str, cursor: str | None = None) -> Any:
         return self.client.get(
             "/api/xhs/v3/getsubcomments",
             {"noteId": note_id, "commentId": comment_id, "cursor": cursor},
-            cost=XHS_COST,
+            cost=self.xhs_cost,
         )
 
     def xhs_user(self, user_id: str) -> Any:
-        return self.client.get("/api/xhs/v3/appuserinfo", {"userId": user_id}, cost=XHS_COST)
+        return self.client.get("/api/xhs/v3/appuserinfo", {"userId": user_id}, cost=self.xhs_cost)
 
     def xhs_user_posted(self, user_id: str, cursor: str | None = None) -> Any:
-        return self.client.get("/api/xhs/v3/appuserposted", {"userId": user_id, "cursor": cursor}, cost=XHS_COST)
+        return self.client.get("/api/xhs/v3/appuserposted", {"userId": user_id, "cursor": cursor}, cost=self.xhs_cost)
 
     def xhs_topic_feed(self, page_id: str, sort: str | None = None, cursor: str | None = None) -> Any:
         return self.client.get(
-            "/api/xhs/v3/topicfeed", {"page_id": page_id, "sort": sort, "cursor": cursor}, cost=XHS_COST
+            "/api/xhs/v3/topicfeed", {"page_id": page_id, "sort": sort, "cursor": cursor}, cost=self.xhs_cost
         )
 
     # ---- 抖音 ----
 
     def douyin_video(self, aweme_id: str) -> Any:
-        return self.client.get("/api/douyin/videodetail", {"awemeId": aweme_id}, cost=DOUYIN_COST)
+        return self.client.get("/api/douyin/videodetail", {"awemeId": aweme_id}, cost=self.douyin_cost)
 
     def douyin_comments(self, aweme_id: str, cursor: str | None = None) -> Any:
-        return self.client.get("/api/douyin/comment", {"awemeId": aweme_id, "cursor": cursor}, cost=DOUYIN_COST)
+        return self.client.get("/api/douyin/comment", {"awemeId": aweme_id, "cursor": cursor}, cost=self.douyin_cost)
 
     def douyin_sub_comments(self, aweme_id: str, comment_id: str, cursor: str | None = None) -> Any:
         return self.client.get(
-            "/api/douyin/subcomment", {"awemeId": aweme_id, "commentId": comment_id, "cursor": cursor}, cost=DOUYIN_COST
+            "/api/douyin/subcomment", {"awemeId": aweme_id, "commentId": comment_id, "cursor": cursor}, cost=self.douyin_cost
         )
 
 

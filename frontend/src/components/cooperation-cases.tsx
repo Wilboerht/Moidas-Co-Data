@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Download, ExternalLink, FileUp, LoaderCircle, Pencil, Plus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { api, downloadFile } from "@/shared/api";
 import { useAuth } from "@/shared/auth-context";
-import { fmtDateTime, safeHttpUrl } from "@/shared/format";
+import { useUnsavedGuard } from "@/shared/use-unsaved-guard";
+import { fmtDateOnly, fmtDateTime, safeHttpUrl } from "@/shared/format";
 import type {
   CooperationCase,
   CooperationCaseDetail,
@@ -12,8 +13,17 @@ import type {
   CooperationSummary,
   CooperationWork,
 } from "@/shared/types";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
@@ -79,14 +89,6 @@ function formatSize(value: number): string {
   return `${value} B`;
 }
 
-function caseStatusLabel(
-  statuses: CooperationStatusDef[],
-  code: string,
-  fallback?: string,
-): string {
-  return statuses.find((item) => item.code === code)?.label ?? fallback ?? code;
-}
-
 export function CooperationRecords({
   platform,
   userId,
@@ -111,12 +113,26 @@ export function CooperationRecords({
   );
   const [statusDialogOpen, setStatusDialogOpen] = useState(false);
   const [completeDialogOpen, setCompleteDialogOpen] = useState(false);
+  const [deletedCaseId, setDeletedCaseId] = useState<number | null>(null);
+  const [caseDraftDirty, setCaseDraftDirty] = useState(false);
+  const selectCase = (caseId: number) => {
+    if (caseId === selectedCaseId) return;
+    if (
+      caseDraftDirty &&
+      !window.confirm("当前合作记录有未保存内容，确定放弃并切换？")
+    ) {
+      return;
+    }
+    setCaseDraftDirty(false);
+    setSelectedCaseId(caseId);
+  };
 
   useEffect(() => {
-    if (!cases.some((item) => item.id === selectedCaseId)) {
-      setSelectedCaseId(activeCase?.id ?? cases[0]?.id ?? null);
-    }
-  }, [activeCase, cases, selectedCaseId]);
+    if (cases.some((item) => item.id === selectedCaseId)) return;
+    const candidates = cases.filter((item) => item.id !== deletedCaseId);
+    const next = candidates.find((item) => item.active) ?? candidates[0];
+    setSelectedCaseId(next?.id ?? null);
+  }, [cases, deletedCaseId, selectedCaseId]);
 
   const detailQuery = useQuery({
     queryKey: ["cooperation-case", selectedCaseId],
@@ -149,56 +165,66 @@ export function CooperationRecords({
     },
   });
 
+  const handleDeleted = async (deletedId: number) => {
+    setDeletedCaseId(deletedId);
+    const remaining = cases.filter((entry) => entry.id !== deletedId);
+    const next = remaining.find((entry) => entry.active) ?? remaining[0];
+    setSelectedCaseId(next?.id ?? null);
+    queryClient.removeQueries({ queryKey: ["cooperation-case", deletedId] });
+    await onChanged();
+  };
+
   const latest = cases[0];
   const nextSeq = (latest?.seq ?? 0) + 1;
   const detail = detailQuery.data;
 
   return (
     <section className="space-y-3 border-y py-4">
-      <div className="flex flex-wrap items-start justify-between gap-2">
-        <div className="space-y-1">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
           <h3 className="text-sm font-semibold">合作记录</h3>
-          <p className="text-xs text-muted-foreground">
-            每次合作独立记录状态、备注、附件和作品；同一达人最多一个进行中合作。
-          </p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <Badge variant="outline">累计 {summary.cooperation_count} 次</Badge>
-          {summary.cooperation_status ? (
+          <span className="text-xs text-muted-foreground">
+            累计 {summary.cooperation_count} 次
+          </span>
+          {cases.length === 0 && summary.cooperation_status ? (
             <CooperationStatusBadge
               status={summary.cooperation_status}
-              label={caseStatusLabel(
-                statuses,
-                summary.cooperation_status,
-                summary.cooperation_status,
-              )}
+              label={
+                statuses.find(
+                  (item) => item.code === summary.cooperation_status,
+                )?.label ?? summary.cooperation_status
+              }
             />
           ) : null}
-          {!activeCase ? (
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => createMutation.mutate()}
-              disabled={
-                createMutation.isPending ||
-                (cases.length === 0 && creatorStatus !== "adopted")
-              }
-              title={
-                cases.length === 0 && creatorStatus !== "adopted"
-                  ? "达人被采用后才能开始合作"
-                  : undefined
-              }
-            >
-              {createMutation.isPending ? (
-                <LoaderCircle className="animate-spin" />
-              ) : (
-                <Plus />
-              )}
-              {cases.length === 0 ? "开始合作" : `开启第 ${nextSeq} 次合作`}
-            </Button>
-          ) : null}
         </div>
+        {!activeCase ? (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => createMutation.mutate()}
+            disabled={
+              createMutation.isPending ||
+              (cases.length === 0 && creatorStatus !== "adopted")
+            }
+            title={
+              cases.length === 0 && creatorStatus !== "adopted"
+                ? "达人被采用后才能开始合作"
+                : undefined
+            }
+          >
+            {createMutation.isPending ? (
+              <LoaderCircle className="animate-spin" />
+            ) : (
+              <Plus />
+            )}
+            {cases.length === 0 ? "开始合作" : `开启第 ${nextSeq} 次合作`}
+          </Button>
+        ) : null}
       </div>
+
+      <p className="text-xs text-muted-foreground">
+        合作状态跨轮次；每次合作独立记录，同一达人最多一个进行中。
+      </p>
 
       {cases.length === 0 ? (
         <p className="text-sm text-muted-foreground">
@@ -208,32 +234,30 @@ export function CooperationRecords({
         </p>
       ) : (
         <>
-          <div className="flex flex-wrap gap-2">
-            {cases.map((item) => (
-              <button
-                key={item.id}
-                type="button"
-                onClick={() => setSelectedCaseId(item.id)}
-                className={
-                  item.id === selectedCaseId
-                    ? "rounded-md border border-foreground/30 bg-muted px-2.5 py-1.5 text-left"
-                    : "rounded-md border bg-background px-2.5 py-1.5 text-left hover:bg-muted/40"
-                }
-              >
-                <span className="flex items-center gap-2 text-xs">
+          {cases.length > 1 ? (
+            <div className="flex flex-wrap gap-1.5">
+              {cases.map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  aria-pressed={item.id === selectedCaseId}
+                  onClick={() => selectCase(item.id)}
+                  className={
+                    item.id === selectedCaseId
+                      ? "rounded-md border border-foreground/30 bg-muted px-2 py-1 text-xs"
+                      : "rounded-md border bg-background px-2 py-1 text-xs hover:bg-muted/40"
+                  }
+                >
                   <span className="font-medium">第 {item.seq} 次</span>
-                  <CooperationStatusBadge
-                    status={item.status}
-                    label={item.status_label}
-                  />
-                </span>
-                <span className="mt-1 block text-[11px] text-muted-foreground">
-                  {item.active ? "进行中" : "已结束"}
-                  {` · 作品 ${item.work_count} · 附件 ${item.attachment_count}`}
-                </span>
-              </button>
-            ))}
-          </div>
+                  <span className="mx-1 text-muted-foreground">·</span>
+                  <span>{item.status_label}</span>
+                  <span className="ml-1.5 text-[11px] text-muted-foreground">
+                    {item.active ? "进行中" : fmtDateOnly(item.started_at)}
+                  </span>
+                </button>
+              ))}
+            </div>
+          ) : null}
 
           {detailQuery.isLoading ? (
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -250,8 +274,10 @@ export function CooperationRecords({
               detail={detail}
               statuses={statuses}
               onRefresh={refresh}
+              onDeleted={handleDeleted}
               onOpenStatus={() => setStatusDialogOpen(true)}
               onOpenComplete={() => setCompleteDialogOpen(true)}
+              onDirtyChange={setCaseDraftDirty}
             />
           ) : null}
         </>
@@ -282,30 +308,123 @@ function CaseDetail({
   detail,
   statuses,
   onRefresh,
+  onDeleted,
   onOpenStatus,
   onOpenComplete,
+  onDirtyChange,
 }: {
   detail: CooperationCaseDetail;
   statuses: CooperationStatusDef[];
   onRefresh: (caseId?: number) => Promise<void>;
+  onDeleted: (caseId: number) => Promise<void>;
   onOpenStatus: () => void;
   onOpenComplete: () => void;
+  onDirtyChange: (dirty: boolean) => void;
 }) {
   const item = detail.case;
   const active = item.active;
   const { user } = useAuth();
   const [correctionOpen, setCorrectionOpen] = useState(false);
   const [editingWork, setEditingWork] = useState<CooperationWork | null>(null);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [summaryEditing, setSummaryEditing] = useState(false);
+  const [timelineExpanded, setTimelineExpanded] = useState(false);
+  const [noteOpen, setNoteOpen] = useState(false);
+  const [attachOpen, setAttachOpen] = useState(false);
+  const [worksOpen, setWorksOpen] = useState(false);
   const [summary, setSummary] = useState(item.summary || "");
   const [note, setNote] = useState("");
   const [work, setWork] = useState<WorkDraft>({ ...EMPTY_WORK });
   const [file, setFile] = useState<File | null>(null);
   const [category, setCategory] = useState<string>("other");
   const [description, setDescription] = useState("");
+  const workDirty = Object.values(work).some((value) => value.trim());
+  const draftsDirty = Boolean(
+    (summaryEditing && summary !== (item.summary || "")) ||
+    (noteOpen && note.trim()) ||
+    (attachOpen && (file || description.trim())) ||
+    (worksOpen && workDirty),
+  );
+
+  useEffect(() => {
+    onDirtyChange(draftsDirty);
+  }, [draftsDirty, onDirtyChange]);
+  useUnsavedGuard(draftsDirty, "合作记录有未保存内容，确定离开当前页面？");
 
   useEffect(() => {
     setSummary(item.summary || "");
   }, [item.id, item.summary]);
+
+  useEffect(() => {
+    setSummaryEditing(false);
+    setTimelineExpanded(false);
+    setNoteOpen(false);
+    setAttachOpen(false);
+    setWorksOpen(false);
+    setDeleteOpen(false);
+    setNote("");
+    setWork({ ...EMPTY_WORK });
+    setFile(null);
+    setDescription("");
+    setEditingWork(null);
+    setCorrectionOpen(false);
+  }, [item.id]);
+
+  const summaryTriggerRef = useRef<HTMLButtonElement>(null);
+  const noteTriggerRef = useRef<HTMLButtonElement>(null);
+  const attachTriggerRef = useRef<HTMLButtonElement>(null);
+  const worksTriggerRef = useRef<HTMLButtonElement>(null);
+  const worksUrlRef = useRef<HTMLInputElement>(null);
+
+  const summaryPanelId = `case-summary-panel-${item.id}`;
+  const notePanelId = `case-note-panel-${item.id}`;
+  const attachPanelId = `case-attach-panel-${item.id}`;
+  const worksPanelId = `case-works-panel-${item.id}`;
+  const timelineId = `case-timeline-${item.id}`;
+
+  const closeSummary = () => {
+    if (
+      summary !== (item.summary || "") &&
+      !window.confirm("放弃未保存的合作摘要？")
+    ) {
+      return;
+    }
+    setSummaryEditing(false);
+    setSummary(item.summary || "");
+    summaryTriggerRef.current?.focus();
+  };
+  const closeNote = () => {
+    if (note.trim() && !window.confirm("放弃未保存的合作备注？")) return;
+    setNoteOpen(false);
+    setNote("");
+    noteTriggerRef.current?.focus();
+  };
+  const closeAttach = () => {
+    if (
+      (file || description.trim()) &&
+      !window.confirm("放弃未上传的附件和说明？")
+    ) {
+      return;
+    }
+    setAttachOpen(false);
+    setFile(null);
+    setDescription("");
+    attachTriggerRef.current?.focus();
+  };
+  const closeWorks = () => {
+    if (workDirty && !window.confirm("放弃未保存的作品信息？")) return;
+    setWorksOpen(false);
+    setWork({ ...EMPTY_WORK });
+    worksTriggerRef.current?.focus();
+  };
+  const closeOnEscape =
+    (close: () => void) => (event: KeyboardEvent<HTMLElement>) => {
+      if (event.key === "Escape") close();
+    };
+  const openWorksFromHint = () => {
+    setWorksOpen(true);
+    window.requestAnimationFrame(() => worksUrlRef.current?.focus());
+  };
 
   const summaryMutation = useMutation({
     mutationFn: () =>
@@ -315,6 +434,8 @@ function CaseDetail({
         item.updated_at,
       ),
     onSuccess: async () => {
+      setSummaryEditing(false);
+      summaryTriggerRef.current?.focus();
       toast.success("合作摘要已保存");
       await onRefresh(item.id);
     },
@@ -391,18 +512,33 @@ function CaseDetail({
     },
   });
 
+  const deleteCaseMutation = useMutation({
+    mutationFn: () => api.deleteCooperationCase(item.id),
+    onSuccess: async () => {
+      setDeleteOpen(false);
+      toast.success(`第 ${item.seq} 次合作已删除`);
+      await onDeleted(item.id);
+    },
+    onError: (error) => {
+      toast.error(error instanceof Error ? error.message : "删除失败");
+    },
+  });
+
+  const visibleEvents = timelineExpanded
+    ? detail.events
+    : detail.events.slice(-3);
+  const hiddenEventCount = detail.events.length - visibleEvents.length;
+
   return (
-    <div className="space-y-4 rounded-md border bg-muted/15 p-3">
-      <div className="flex flex-wrap items-start justify-between gap-2">
-        <div>
+    <div className="rounded-md border">
+      <div className="flex flex-wrap items-start justify-between gap-2 border-b bg-muted/20 px-3 py-2">
+        <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-sm font-semibold">第 {item.seq} 次合作</span>
             <CooperationStatusBadge
               status={item.status}
               label={item.status_label}
             />
-            <Badge variant="outline">作品 {detail.works.length}</Badge>
-            <Badge variant="outline">附件 {detail.attachments.length}</Badge>
           </div>
           <p className="mt-1 text-xs text-muted-foreground">
             开始 {fmtDateTime(item.started_at)}
@@ -410,7 +546,7 @@ function CaseDetail({
             {item.closed_at ? ` · 结束 ${fmtDateTime(item.closed_at)}` : ""}
           </p>
         </div>
-        <div className="flex flex-wrap gap-2">
+        <div className="flex flex-wrap items-center gap-1.5">
           {active ? (
             <>
               <Button size="sm" variant="outline" onClick={onOpenStatus}>
@@ -420,10 +556,7 @@ function CaseDetail({
                 完成合作
               </Button>
             </>
-          ) : (
-            <Badge variant="secondary">已结束，可继续补充证据</Badge>
-          )}
-          {!active && user?.role === "admin" ? (
+          ) : user?.role === "admin" ? (
             <Button
               size="sm"
               variant="outline"
@@ -434,7 +567,7 @@ function CaseDetail({
           ) : null}
           <Button
             size="sm"
-            variant="outline"
+            variant="ghost"
             onClick={() => {
               void downloadFile(
                 `/api/cooperation-cases/${item.id}/export`,
@@ -444,294 +577,471 @@ function CaseDetail({
               });
             }}
           >
-            <Download /> 导出档案
+            <Download /> 导出
           </Button>
+          {user?.role === "admin" ? (
+            <Button
+              size="icon-sm"
+              variant="ghost"
+              className="text-muted-foreground hover:text-destructive"
+              aria-label={`删除第 ${item.seq} 次合作`}
+              title="删除本次合作"
+              onClick={() => setDeleteOpen(true)}
+            >
+              <Trash2 />
+            </Button>
+          ) : null}
         </div>
       </div>
 
-      {!active && detail.works.length === 0 ? (
-        <p className="text-xs text-amber-600">
-          该合作已完成，但还没有登记作品链接；建议补充以完善证据链。
-        </p>
-      ) : null}
+      <div className="space-y-4 p-3">
+        {item.status === "completed" && detail.works.length === 0 ? (
+          <div className="flex flex-wrap items-center gap-2 rounded border border-amber-200 bg-amber-50 px-2.5 py-1.5 text-xs text-amber-700">
+            <span>该合作已完成，但还没有登记作品链接。</span>
+            <button
+              type="button"
+              className="font-medium underline underline-offset-4"
+              aria-controls={worksPanelId}
+              onClick={openWorksFromHint}
+            >
+              去添加
+            </button>
+          </div>
+        ) : null}
 
-      <div className="space-y-2">
-        <Label htmlFor={`case-summary-${item.id}`}>合作摘要</Label>
-        <Textarea
-          id={`case-summary-${item.id}`}
-          value={summary}
-          onChange={(event) => setSummary(event.target.value)}
-          rows={3}
-          placeholder="合作方式、报价、交付约定等"
-          disabled={summaryMutation.isPending}
-        />
-        <Button
-          size="sm"
-          variant="outline"
-          onClick={() => summaryMutation.mutate()}
-          disabled={summaryMutation.isPending || summary === item.summary}
-        >
-          {summaryMutation.isPending ? <LoaderCircle className="animate-spin" /> : null}
-          保存摘要
-        </Button>
-      </div>
-
-      <div className="space-y-2">
-        <p className="text-xs font-medium text-muted-foreground">时间线</p>
-        {detail.events.length === 0 ? (
-          <p className="text-sm text-muted-foreground">暂无记录。</p>
-        ) : (
-          <ol className="space-y-2 border-l pl-3">
-            {detail.events.map((event) => (
-              <li key={event.id} className="text-xs">
-                <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                  <span className="font-medium">
-                    {EVENT_LABELS[event.event_type] ?? event.event_type}
-                  </span>
-                  {event.status_from || event.status_to ? (
-                    <span className="text-muted-foreground">
-                      {event.from_status_label} → {event.to_status_label}
-                    </span>
-                  ) : null}
-                  <span className="text-muted-foreground">
-                    {fmtDateTime(event.created_at)}
-                    {event.actor_username ? ` · ${event.actor_username}` : ""}
-                  </span>
-                </div>
-                {event.note ? (
-                  <p className="mt-0.5 whitespace-pre-wrap text-sm text-muted-foreground">
-                    {event.note}
-                  </p>
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-xs font-medium text-muted-foreground">合作摘要</p>
+            <Button
+              ref={summaryTriggerRef}
+              size="xs"
+              variant="ghost"
+              aria-expanded={summaryEditing}
+              aria-controls={summaryPanelId}
+              onClick={() => {
+                if (summaryEditing) closeSummary();
+                else setSummaryEditing(true);
+              }}
+            >
+              {summaryEditing ? (
+                "取消"
+              ) : (
+                <>
+                  <Pencil />
+                  {item.summary ? "编辑" : "添加摘要"}
+                </>
+              )}
+            </Button>
+          </div>
+          {summaryEditing ? (
+            <div
+              id={summaryPanelId}
+              className="space-y-2"
+              onKeyDown={closeOnEscape(closeSummary)}
+            >
+              <Textarea
+                id={`case-summary-${item.id}`}
+                value={summary}
+                onChange={(event) => setSummary(event.target.value)}
+                rows={3}
+                placeholder="合作方式、报价、交付约定等"
+                disabled={summaryMutation.isPending}
+                autoFocus
+              />
+              <Button
+                size="sm"
+                onClick={() => summaryMutation.mutate()}
+                disabled={
+                  summaryMutation.isPending || summary === item.summary
+                }
+              >
+                {summaryMutation.isPending ? (
+                  <LoaderCircle className="animate-spin" />
                 ) : null}
-              </li>
-            ))}
-          </ol>
-        )}
-      </div>
-
-      <div className="space-y-2">
-        <Label htmlFor={`case-note-${item.id}`}>追加记录</Label>
-        <div className="flex items-start gap-2">
-          <Textarea
-            id={`case-note-${item.id}`}
-            value={note}
-            onChange={(event) => setNote(event.target.value)}
-            rows={2}
-            placeholder="补充沟通、交付、结算等说明"
-          />
-          <Button
-            size="sm"
-            onClick={() => noteMutation.mutate()}
-            disabled={noteMutation.isPending || !note.trim()}
-          >
-            {noteMutation.isPending ? <LoaderCircle className="animate-spin" /> : null}
-            添加
-          </Button>
+                保存
+              </Button>
+            </div>
+          ) : (
+            <p className="whitespace-pre-wrap text-sm">
+              {item.summary || (
+                <span className="text-muted-foreground">暂无摘要。</span>
+              )}
+            </p>
+          )}
         </div>
-      </div>
 
-      <div className="space-y-2">
-        <p className="text-xs font-medium text-muted-foreground">附件</p>
-        {detail.attachments.length === 0 ? (
-          <p className="text-sm text-muted-foreground">暂无附件。</p>
-        ) : (
-          <ul className="space-y-1.5">
-            {detail.attachments.map((attachment) => (
-              <li
-                key={attachment.id}
-                className="flex flex-wrap items-center justify-between gap-2 rounded border bg-background px-2 py-1.5 text-xs"
+        <div className="space-y-2">
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-xs font-medium text-muted-foreground">
+              时间线{detail.events.length > 0 ? ` · ${detail.events.length}` : ""}
+            </p>
+            <Button
+              ref={noteTriggerRef}
+              size="xs"
+              variant="ghost"
+              aria-expanded={noteOpen}
+              aria-controls={notePanelId}
+              onClick={() => {
+                if (noteOpen) closeNote();
+                else setNoteOpen(true);
+              }}
+            >
+              {noteOpen ? (
+                "取消"
+              ) : (
+                <>
+                  <Plus /> 添加记录
+                </>
+              )}
+            </Button>
+          </div>
+          {noteOpen ? (
+            <div
+              id={notePanelId}
+              className="flex items-start gap-2"
+              onKeyDown={closeOnEscape(closeNote)}
+            >
+              <Textarea
+                id={`case-note-${item.id}`}
+                value={note}
+                onChange={(event) => setNote(event.target.value)}
+                rows={2}
+                placeholder="补充沟通、交付、结算等说明"
+                autoFocus
+              />
+              <Button
+                size="sm"
+                onClick={() => noteMutation.mutate()}
+                disabled={noteMutation.isPending || !note.trim()}
               >
-                <div className="min-w-0">
-                  <a
-                    href={attachment.download_url}
-                    className="inline-flex max-w-full items-center gap-1 font-medium underline underline-offset-4"
-                  >
-                    <span className="truncate">{attachment.original_name}</span>
-                    <ExternalLink className="size-3 shrink-0" />
-                  </a>
-                  <span className="ml-1 text-muted-foreground">
-                    {attachment.category_label} · {formatSize(attachment.size_bytes)}
-                    {attachment.description ? ` · ${attachment.description}` : ""}
-                  </span>
-                  <p className="mt-0.5 text-muted-foreground">
-                    {fmtDateTime(attachment.created_at)}
-                    {attachment.uploaded_by_username
-                      ? ` · ${attachment.uploaded_by_username}`
-                      : ""}
-                  </p>
-                </div>
+                {noteMutation.isPending ? (
+                  <LoaderCircle className="animate-spin" />
+                ) : null}
+                添加
+              </Button>
+            </div>
+          ) : null}
+          {detail.events.length === 0 ? (
+            <p className="text-sm text-muted-foreground">暂无记录。</p>
+          ) : (
+            <>
+              <ol id={timelineId} className="space-y-2 border-l pl-3">
+                {visibleEvents.map((event) => {
+                  const showTransition =
+                    event.event_type !== "created" &&
+                    Boolean(event.status_from || event.status_to);
+                  return (
+                    <li key={event.id} className="text-xs">
+                      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+                        <span className="font-medium">
+                          {EVENT_LABELS[event.event_type] ?? event.event_type}
+                        </span>
+                        {showTransition ? (
+                          <span className="text-muted-foreground">
+                            {event.from_status_label} → {event.to_status_label}
+                          </span>
+                        ) : null}
+                        <span className="text-muted-foreground">
+                          {fmtDateTime(event.created_at)}
+                          {event.actor_username
+                            ? ` · ${event.actor_username}`
+                            : ""}
+                        </span>
+                      </div>
+                      {event.note ? (
+                        <p className="mt-0.5 whitespace-pre-wrap text-muted-foreground">
+                          {event.note}
+                        </p>
+                      ) : null}
+                    </li>
+                  );
+                })}
+              </ol>
+              {detail.events.length > 3 ? (
                 <Button
-                  size="icon"
+                  size="xs"
                   variant="ghost"
-                  className="size-7"
-                  aria-label="删除附件"
-                  onClick={() =>
-                    deleteAttachmentMutation.mutate(attachment.id)
-                  }
-                  disabled={deleteAttachmentMutation.isPending}
+                  className="text-muted-foreground"
+                  aria-expanded={timelineExpanded}
+                  aria-controls={timelineId}
+                  onClick={() => setTimelineExpanded((value) => !value)}
                 >
-                  <Trash2 className="size-3.5" />
+                  {timelineExpanded
+                    ? "收起较早记录"
+                    : `展开较早的 ${hiddenEventCount} 条`}
                 </Button>
-              </li>
-            ))}
-          </ul>
-        )}
-        <div className="grid gap-2 rounded border bg-background p-2 sm:grid-cols-[1fr_160px]">
-          <Input
-            type="file"
-            onChange={(event) => setFile(event.target.files?.[0] ?? null)}
-            className="text-xs"
-          />
-          <Select value={category} onValueChange={setCategory}>
-            <SelectTrigger className="h-8">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {ATTACHMENT_CATEGORIES.map((item) => (
-                <SelectItem key={item.value} value={item.value}>
-                  {item.label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          <Input
-            value={description}
-            onChange={(event) => setDescription(event.target.value)}
-            placeholder="附件说明（可选）"
-            className="text-xs sm:col-span-2"
-          />
-          <Button
-            size="sm"
-            variant="outline"
-            className="w-fit"
-            onClick={() => uploadMutation.mutate()}
-            disabled={uploadMutation.isPending || !file}
-          >
-            {uploadMutation.isPending ? (
-              <LoaderCircle className="animate-spin" />
-            ) : (
-              <FileUp />
-            )}
-            上传附件
-          </Button>
+              ) : null}
+            </>
+          )}
         </div>
-      </div>
 
-      <div className="space-y-2">
-        <p className="text-xs font-medium text-muted-foreground">作品链接</p>
-        {detail.works.length === 0 ? (
-          <p className="text-sm text-muted-foreground">暂未登记作品。</p>
-        ) : (
-          <ul className="space-y-1.5">
-            {detail.works.map((workItem) => (
-              <li
-                key={workItem.id}
-                className="flex flex-wrap items-start justify-between gap-2 rounded border bg-background px-2 py-1.5 text-xs"
+        <div className="space-y-2">
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-xs font-medium text-muted-foreground">
+              附件 · {detail.attachments.length}
+            </p>
+            <Button
+              ref={attachTriggerRef}
+              size="xs"
+              variant="ghost"
+              aria-expanded={attachOpen}
+              aria-controls={attachPanelId}
+              onClick={() => {
+                if (attachOpen) closeAttach();
+                else setAttachOpen(true);
+              }}
+            >
+              {attachOpen ? (
+                "取消"
+              ) : (
+                <>
+                  <Plus /> 上传附件
+                </>
+              )}
+            </Button>
+          </div>
+          {attachOpen ? (
+            <div
+              id={attachPanelId}
+              className="grid gap-2 rounded border bg-background p-2 sm:grid-cols-[1fr_160px]"
+              onKeyDown={closeOnEscape(closeAttach)}
+            >
+              <Input
+                type="file"
+                aria-label="选择附件文件"
+                onChange={(event) => setFile(event.target.files?.[0] ?? null)}
+                className="text-xs"
+                autoFocus
+              />
+              <Select value={category} onValueChange={setCategory}>
+                <SelectTrigger className="h-8">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {ATTACHMENT_CATEGORIES.map((item) => (
+                    <SelectItem key={item.value} value={item.value}>
+                      {item.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Input
+                value={description}
+                onChange={(event) => setDescription(event.target.value)}
+                placeholder="附件说明（可选）"
+                className="text-xs sm:col-span-2"
+              />
+              <Button
+                size="sm"
+                variant="outline"
+                className="w-fit"
+                onClick={() => uploadMutation.mutate()}
+                disabled={uploadMutation.isPending || !file}
               >
-                <div className="min-w-0">
-                  {safeHttpUrl(workItem.url) ? (
+                {uploadMutation.isPending ? (
+                  <LoaderCircle className="animate-spin" />
+                ) : (
+                  <FileUp />
+                )}
+                上传附件
+              </Button>
+            </div>
+          ) : null}
+          {detail.attachments.length === 0 ? (
+            <p className="text-sm text-muted-foreground">暂无附件。</p>
+          ) : (
+            <ul className="space-y-1.5">
+              {detail.attachments.map((attachment) => (
+                <li
+                  key={attachment.id}
+                  className="flex flex-wrap items-center justify-between gap-2 rounded border bg-background px-2 py-1.5 text-xs"
+                >
+                  <div className="min-w-0">
                     <a
-                      href={safeHttpUrl(workItem.url)}
-                      target="_blank"
-                      rel="noreferrer"
+                      href={attachment.download_url}
                       className="inline-flex max-w-full items-center gap-1 font-medium underline underline-offset-4"
                     >
-                      <span className="truncate">
-                        {workItem.title || workItem.url}
-                      </span>
+                      <span className="truncate">{attachment.original_name}</span>
                       <ExternalLink className="size-3 shrink-0" />
                     </a>
-                  ) : (
-                    <span>{workItem.title || workItem.url}</span>
-                  )}
-                  <p className="mt-0.5 text-muted-foreground">
-                    {workItem.platform || "未填平台"}
-                    {workItem.published_at ? ` · ${workItem.published_at}` : ""}
-                    {workItem.note ? ` · ${workItem.note}` : ""}
-                  </p>
-                </div>
-                <div className="flex items-center gap-1">
-                  <Button
-                    size="icon"
-                    variant="ghost"
-                    className="size-7"
-                    aria-label="编辑作品"
-                    onClick={() => setEditingWork(workItem)}
-                  >
-                    <Pencil className="size-3.5" />
-                  </Button>
-                  <Button
-                    size="icon"
-                    variant="ghost"
-                    className="size-7"
-                    aria-label="删除作品"
-                    onClick={() => deleteWorkMutation.mutate(workItem.id)}
-                    disabled={deleteWorkMutation.isPending}
-                  >
-                    <Trash2 className="size-3.5" />
-                  </Button>
-                </div>
-              </li>
-            ))}
-          </ul>
-        )}
-        <div className="grid gap-2 rounded border bg-background p-2 sm:grid-cols-2">
-          <Input
-            value={work.url}
-            onChange={(event) => setWork({ ...work, url: event.target.value })}
-            placeholder="作品链接（http/https）"
-            className="text-xs sm:col-span-2"
-          />
-          <Input
-            value={work.title}
-            onChange={(event) => setWork({ ...work, title: event.target.value })}
-            placeholder="作品标题（可选）"
-            className="text-xs"
-          />
-          <Input
-            value={work.platform}
-            onChange={(event) =>
-              setWork({ ...work, platform: event.target.value })
-            }
-            placeholder="平台（可选）"
-            className="text-xs"
-          />
-          <Input
-            value={work.published_at}
-            onChange={(event) =>
-              setWork({ ...work, published_at: event.target.value })
-            }
-            placeholder="发布时间（可选）"
-            className="text-xs"
-          />
-          <Input
-            value={work.note}
-            onChange={(event) => setWork({ ...work, note: event.target.value })}
-            placeholder="备注（可选）"
-            className="text-xs"
-          />
-          <Button
-            size="sm"
-            variant="outline"
-            className="w-fit"
-            onClick={() => addWorkMutation.mutate()}
-            disabled={addWorkMutation.isPending || !work.url.trim()}
-          >
-            {addWorkMutation.isPending ? (
-              <LoaderCircle className="animate-spin" />
-            ) : (
-              <Plus />
-            )}
-            添加作品
-          </Button>
+                    <span className="ml-1 text-muted-foreground">
+                      {attachment.category_label} · {formatSize(attachment.size_bytes)}
+                      {attachment.description ? ` · ${attachment.description}` : ""}
+                    </span>
+                    <p className="mt-0.5 text-muted-foreground">
+                      {fmtDateTime(attachment.created_at)}
+                      {attachment.uploaded_by_username
+                        ? ` · ${attachment.uploaded_by_username}`
+                        : ""}
+                    </p>
+                  </div>
+                  {user?.role === "admin" || attachment.uploaded_by === user?.id ? (
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      className="size-7"
+                      aria-label="删除附件"
+                      onClick={() => {
+                        if (window.confirm(`确定删除附件「${attachment.original_name}」？此操作不可撤销。`)) {
+                          deleteAttachmentMutation.mutate(attachment.id);
+                        }
+                      }}
+                      disabled={deleteAttachmentMutation.isPending}
+                    >
+                      <Trash2 className="size-3.5" />
+                    </Button>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+
+        <div className="space-y-2">
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-xs font-medium text-muted-foreground">
+              作品链接 · {detail.works.length}
+            </p>
+            <Button
+              ref={worksTriggerRef}
+              size="xs"
+              variant="ghost"
+              aria-expanded={worksOpen}
+              aria-controls={worksPanelId}
+              onClick={() => {
+                if (worksOpen) closeWorks();
+                else setWorksOpen(true);
+              }}
+            >
+              {worksOpen ? (
+                "取消"
+              ) : (
+                <>
+                  <Plus /> 添加作品
+                </>
+              )}
+            </Button>
+          </div>
+          {worksOpen ? (
+            <div
+              id={worksPanelId}
+              className="grid gap-2 rounded border bg-background p-2 sm:grid-cols-2"
+              onKeyDown={closeOnEscape(closeWorks)}
+            >
+              <Input
+                ref={worksUrlRef}
+                value={work.url}
+                onChange={(event) => setWork({ ...work, url: event.target.value })}
+                placeholder="作品链接（http/https）"
+                className="text-xs sm:col-span-2"
+                autoFocus
+              />
+              <Input
+                value={work.title}
+                onChange={(event) => setWork({ ...work, title: event.target.value })}
+                placeholder="作品标题（可选）"
+                className="text-xs"
+              />
+              <Input
+                value={work.platform}
+                onChange={(event) =>
+                  setWork({ ...work, platform: event.target.value })
+                }
+                placeholder="平台（可选）"
+                className="text-xs"
+              />
+              <Input
+                value={work.published_at}
+                onChange={(event) =>
+                  setWork({ ...work, published_at: event.target.value })
+                }
+                placeholder="发布时间（可选）"
+                className="text-xs"
+              />
+              <Input
+                value={work.note}
+                onChange={(event) => setWork({ ...work, note: event.target.value })}
+                placeholder="备注（可选）"
+                className="text-xs"
+              />
+              <Button
+                size="sm"
+                variant="outline"
+                className="w-fit"
+                onClick={() => addWorkMutation.mutate()}
+                disabled={addWorkMutation.isPending || !work.url.trim()}
+              >
+                {addWorkMutation.isPending ? (
+                  <LoaderCircle className="animate-spin" />
+                ) : (
+                  <Plus />
+                )}
+                添加作品
+              </Button>
+            </div>
+          ) : null}
+          {detail.works.length === 0 ? (
+            <p className="text-sm text-muted-foreground">暂未登记作品。</p>
+          ) : (
+            <ul className="space-y-1.5">
+              {detail.works.map((workItem) => (
+                <li
+                  key={workItem.id}
+                  className="flex flex-wrap items-start justify-between gap-2 rounded border bg-background px-2 py-1.5 text-xs"
+                >
+                  <div className="min-w-0">
+                    {safeHttpUrl(workItem.url) ? (
+                      <a
+                        href={safeHttpUrl(workItem.url)}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex max-w-full items-center gap-1 font-medium underline underline-offset-4"
+                      >
+                        <span className="truncate">
+                          {workItem.title || workItem.url}
+                        </span>
+                        <ExternalLink className="size-3 shrink-0" />
+                      </a>
+                    ) : (
+                      <span>{workItem.title || workItem.url}</span>
+                    )}
+                    <p className="mt-0.5 text-muted-foreground">
+                      {workItem.platform || "未填平台"}
+                      {workItem.published_at ? ` · ${workItem.published_at}` : ""}
+                      {workItem.note ? ` · ${workItem.note}` : ""}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-1">
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      className="size-7"
+                      aria-label="编辑作品"
+                      onClick={() => setEditingWork(workItem)}
+                    >
+                      <Pencil className="size-3.5" />
+                    </Button>
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      className="size-7"
+                      aria-label="删除作品"
+                      onClick={() => {
+                        if (window.confirm(`确定删除作品「${workItem.title || workItem.url}」？`)) {
+                          deleteWorkMutation.mutate(workItem.id);
+                        }
+                      }}
+                      disabled={deleteWorkMutation.isPending}
+                    >
+                      <Trash2 className="size-3.5" />
+                    </Button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       </div>
-
-      {!active ? (
-        <p className="text-[11px] text-muted-foreground">
-          已完成或已取消的合作仍可补充备注、附件和作品；状态如有误，请联系管理员更正。
-        </p>
-      ) : null}
 
       {correctionOpen ? (
         <CorrectionDialog
@@ -755,6 +1065,39 @@ function CaseDetail({
             await onRefresh(item.id);
           }}
         />
+      ) : null}
+
+      {deleteOpen ? (
+        <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>删除第 {item.seq} 次合作？</AlertDialogTitle>
+              <AlertDialogDescription>
+                将永久删除这次合作及其 {detail.events.length} 条时间线记录、
+                {detail.works.length} 条作品和 {detail.attachments.length} 个附件文件。
+                删除后达人合作累计会重新计算；删除前会自动备份数据库，此操作不可撤销。
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel disabled={deleteCaseMutation.isPending}>
+                取消
+              </AlertDialogCancel>
+              <AlertDialogAction
+                variant="destructive"
+                disabled={deleteCaseMutation.isPending}
+                onClick={(event) => {
+                  event.preventDefault();
+                  deleteCaseMutation.mutate();
+                }}
+              >
+                {deleteCaseMutation.isPending ? (
+                  <LoaderCircle className="animate-spin" />
+                ) : null}
+                确认删除
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
       ) : null}
     </div>
   );

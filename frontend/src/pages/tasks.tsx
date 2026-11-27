@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { ChevronRight, Plus, RotateCw } from "lucide-react";
 import { api } from "@/shared/api";
@@ -10,6 +10,7 @@ import type { Round } from "@/shared/types";
 import { EmptyState, ErrorState, Page, PageHeader, Section } from "@/components/page";
 import { StatusBadge } from "@/components/status-badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -42,6 +43,9 @@ export function TasksPage() {
   const canCollect = user?.role === "admin" || Boolean(user?.can_collect);
   const isAdmin = user?.role === "admin";
   const [showArchived, setShowArchived] = useState(false);
+  const [params, setParams] = useSearchParams();
+  const roundParam = Number(params.get("round")) || null;
+  const [search, setSearch] = useState("");
 
   const tasksQuery = useQuery({
     queryKey: ["task-list", showArchived],
@@ -60,7 +64,7 @@ export function TasksPage() {
   if (tasksQuery.isLoading) {
     return (
       <Page>
-        <PageHeader title="采集任务" />
+        <PageHeader title="采集轮次" />
         <Skeleton className="h-64 w-full" />
       </Page>
     );
@@ -69,23 +73,36 @@ export function TasksPage() {
   if (tasksQuery.error) {
     return (
       <Page>
-        <PageHeader title="采集任务" />
-        <ErrorState message={tasksQuery.error instanceof Error ? tasksQuery.error.message : "加载采集记录失败"} />
+        <PageHeader title="采集轮次" />
+        <ErrorState
+          message={tasksQuery.error instanceof Error ? tasksQuery.error.message : "加载采集轮次失败"}
+          action={
+            <Button variant="outline" size="sm" onClick={refresh}>
+              重试
+            </Button>
+          }
+        />
       </Page>
     );
   }
 
   const tasks = (tasksQuery.data ?? []) as TaskRow[];
   const activeCount = tasks.filter((item) => isActive(item.job?.status)).length;
+  const keyword = search.trim().toLowerCase();
+  const filteredTasks = tasks.filter((item) => {
+    if (roundParam !== null && item.id !== roundParam) return false;
+    if (!keyword) return true;
+    return `${item.name} ${item.keywords ?? ""}`.toLowerCase().includes(keyword);
+  });
 
   return (
     <Page>
       <PageHeader
-        title="采集任务"
+        title="采集轮次"
         description={
-          tasks.length === 0
-            ? "按创建时间倒序展示所有采集记录。"
-            : `共 ${tasks.length} 条采集记录${activeCount > 0 ? ` · ${activeCount} 条进行中，每 2.5 秒自动刷新` : ""}`
+          filteredTasks.length === 0
+            ? "按创建时间倒序展示所有采集轮次。"
+            : `共 ${filteredTasks.length} 条采集轮次${activeCount > 0 ? ` · ${activeCount} 条进行中，每 2.5 秒自动刷新` : ""}`
         }
         actions={
           <>
@@ -113,9 +130,32 @@ export function TasksPage() {
         }
       />
 
+      <div className="flex flex-wrap items-center gap-2">
+        <Input
+          value={search}
+          onChange={(event) => setSearch(event.target.value)}
+          placeholder="搜索轮次名称或关键词"
+          aria-label="搜索采集轮次"
+          className="h-8 w-full max-w-xs"
+        />
+        {roundParam !== null ? (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              const next = new URLSearchParams(params);
+              next.delete("round");
+              setParams(next, { replace: true });
+            }}
+          >
+            仅看轮次 #{roundParam} · 清除
+          </Button>
+        ) : null}
+      </div>
+
       {tasks.length === 0 ? (
         <EmptyState
-          title="还没有采集记录"
+          title="还没有采集轮次"
           description="新建一轮采集后，每轮采集的状态、花费和结果都会记录在这里。"
           actions={
             canCollect ? (
@@ -125,10 +165,31 @@ export function TasksPage() {
             ) : undefined
           }
         />
+      ) : filteredTasks.length === 0 ? (
+        <EmptyState
+          title="当前筛选没有匹配的采集轮次"
+          description="调整搜索词，或清除轮次筛选后再试。"
+          actions={
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                setSearch("");
+                if (roundParam !== null) {
+                  const next = new URLSearchParams(params);
+                  next.delete("round");
+                  setParams(next, { replace: true });
+                }
+              }}
+            >
+              清除筛选
+            </Button>
+          }
+        />
       ) : (
         <Section
-          title="采集记录"
-          description="点击任务名称查看运行状态、日志和接口调用详情；花费按 token 计。"
+          title="采集轮次"
+          description="点击轮次名称查看运行状态、日志和接口调用详情；花费按 token 计。"
           contentClassName="px-0"
         >
           <Table className="min-w-[950px] table-fixed">
@@ -145,7 +206,7 @@ export function TasksPage() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {tasks.map((item) => {
+              {filteredTasks.map((item) => {
                 const job = item.job;
                 const archived = Boolean(item.archived);
                 const status = archived ? "archived" : job?.status ?? item.status;
